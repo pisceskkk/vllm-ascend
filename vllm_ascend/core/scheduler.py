@@ -151,6 +151,12 @@ class AscendScheduler(Scheduler):
                 # `request.num_prompt_tokens` to consider the resumed
                 # requests, which have output tokens.
                 num_new_tokens = request.num_tokens - num_computed_tokens
+                if (self.enable_dcpp and self.attn_estimator is not None
+                        and num_new_tokens > self.dcpp_length_threshold):
+                    logger.debug(f"Enable DCPP for req {request.request_id}: "
+                                 f"tokens={num_new_tokens}, "
+                                 f"threshold={self.dcpp_length_threshold}")
+                    request.is_dcpp = True
                 max_tokens_in_kvcache = (self.kv_cache_config.num_blocks *
                                          self.block_size)
                 prompt_limit = min(prompt_limit, max_tokens_in_kvcache)
@@ -250,11 +256,15 @@ class AscendScheduler(Scheduler):
         if len(self.scheduled_req_ids) == 0:
             req_index = 0
             while req_index < len(self.running) and token_budget > 0:
+                dcpp_equitable_tokens = None
                 request = self.running[req_index]
                 if request.request_id in self.scheduled_req_ids:
                     # This request has already been scheduled.
                     req_index += 1
                     continue
+
+                if request.num_tokens - request.num_computed_tokens < request.dcpp_scheduled_chunk:
+                    request.is_dcpp = False
 
                 num_new_tokens = (request.num_tokens_with_spec -
                                   request.num_computed_tokens)
@@ -273,6 +283,27 @@ class AscendScheduler(Scheduler):
                         not in scheduled_loras):
                     # Scheduling would exceed max_loras, skip.
                     num_new_tokens = 0
+
+                if self.enable_dcpp and request.is_dcpp and self.attn_estimator is not None:
+                    # Shorten length to reduce long kv history effect
+                    # Target execution time is num_new_tokens execution time without history
+                    dcpp_equitable_tokens = num_new_tokens
+                    target_tokens = self.scheduler_config.long_prefill_token_threshold \
+                        if self.scheduler_config.long_prefill_token_threshold > 0 else token_budget
+                    num_new_tokens, dcpp_scheduled_chunk = self.attn_estimator.compute_chunk_size_with_overhead(
+                                                                            request.num_computed_tokens,
+                                                                            request.num_tokens,
+                                                                            target_tokens,
+                                                                            self.cache_config.block_size)
+                    # NOTE: Prevent short tail effect
+                    floor = self.dcpp_min_chunk if self.dcpp_min_chunk and self.dcpp_min_chunk > 0 else 0
+                    num_new_tokens = min(num_new_tokens, dcpp_equitable_tokens)
+                    num_new_tokens = min(request.num_tokens - request.num_computed_tokens,
+                                         max(floor, num_new_tokens))
+                    request.dcpp_scheduled_chunk = dcpp_scheduled_chunk
+                    logger.debug(
+                        "DCPP adjusted chunk from %d to %d (hist=%d, total=%d)",
+                        dcpp_equitable_tokens, num_new_tokens, request.num_computed_tokens, request.num_tokens)
 
                 if num_new_tokens == 0:
                     # The request cannot be scheduled because one of the following
@@ -326,7 +357,7 @@ class AscendScheduler(Scheduler):
                 else:
                     req_to_new_blocks[request.request_id] = new_blocks
                 num_scheduled_tokens[request.request_id] = num_new_tokens
-                token_budget -= num_new_tokens
+                token_budget -= (num_new_tokens if dcpp_equitable_tokens is None else dcpp_equitable_tokens)
                 req_index += 1
 
                 # Speculative decode related.
