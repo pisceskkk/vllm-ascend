@@ -34,8 +34,7 @@ def compute_expected_slot_mapping(req_indices: np.ndarray,
                                    dcp_rank: int,
                                    pcp_rank: int,
                                    cp_kv_cache_interleave_size: int) -> np.ndarray:
-    """
-    Compute expected slot mapping based on the algorithm in BlockTable.compute_slot_mapping.
+    """Compute expected slot mapping based on the algorithm in BlockTable.compute_slot_mapping.
     
     This function replicates the logic of compute_slot_mapping to generate
     expected values for test verification.
@@ -109,8 +108,7 @@ def compute_expected_slot_mapping(req_indices: np.ndarray,
 )
 def test_compute_slot_mapping_various_configs(dcp_size: int, pcp_size: int,
                                                interleave_size: int):
-    """
-    Test compute_slot_mapping with various dcp_size, pcp_size, and interleave_size.
+    """Test compute_slot_mapping with various dcp_size, pcp_size, and interleave_size.
     
     This test verifies that the slot mapping is correctly computed for different
     parallel configurations and interleave sizes.
@@ -220,8 +218,7 @@ def test_compute_slot_mapping_various_configs(dcp_size: int, pcp_size: int,
 )
 def test_compute_slot_mapping_different_block_sizes(block_size: int,
                                                      interleave_size: int):
-    """
-    Test compute_slot_mapping with different block sizes and interleave sizes.
+    """Test compute_slot_mapping with different block sizes and interleave sizes.
     
     This test ensures the function works correctly with various block size
     configurations.
@@ -304,9 +301,10 @@ def test_compute_slot_mapping_different_block_sizes(block_size: int,
 
 
 def test_compute_slot_mapping_edge_cases():
-    """
-    Test compute_slot_mapping with edge cases such as empty requests,
-    single token, and boundary positions.
+    """Test compute_slot_mapping with edge cases such as single token and boundary positions.
+    
+    This test covers edge cases like single token, block boundaries, and
+    multiple tokens spanning multiple blocks.
     """
     block_size = 16
     max_num_reqs = 4
@@ -388,9 +386,10 @@ def test_compute_slot_mapping_edge_cases():
 
 
 def test_compute_slot_mapping_interleave_patterns():
-    """
-    Test slot mapping with different interleave patterns to ensure correct
-    token distribution across ranks.
+    """Test slot mapping with different interleave patterns to ensure correct token distribution across ranks.
+    
+    This test verifies that tokens are correctly distributed across ranks
+    based on the interleave pattern, and non-local tokens are properly masked.
     """
     block_size = 16
     max_num_reqs = 4
