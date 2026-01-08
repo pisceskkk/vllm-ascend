@@ -198,8 +198,8 @@ class MtpProposer(EagleProposer):
                     max_seq_len=0)
                 if self.pcp_size * self.dcp_size > 1:
                     # update long_seq related params and flatten block_table
-                    common_attn_metadata.prefill_context_parallel_metadata = \
-                        self.runner.pcp_manager.long_seq_metadata
+                    common_attn_metadata.context_parallel_metadata = \
+                        self.runner.cp_manager.cp_metadata
                     common_attn_metadata.block_table_tensor = \
                         self.runner.input_batch.block_table[0].get_device_tensor()[
                             :num_reqs * self.decode_threshold]
@@ -299,10 +299,10 @@ class MtpProposer(EagleProposer):
 
         req_scheduled_tokens = scheduler_output.num_scheduled_tokens
         if self.pcp_size * self.dcp_size > 1:
-            long_seq_metadata = self.runner.long_seq_metadata
-            input_ids_pcp_full = self.runner.pcp_manager.input_ids_pcp_full.gpu
-            query_start_loc_pcp_full = self.runner.pcp_manager.query_start_loc_pcp_full.gpu
-            query_start_loc_pcp_full_cpu = self.runner.pcp_manager.query_start_loc_pcp_full.cpu
+            cp_metadata = self.runner.cp_metadata
+            input_ids_pcp_full = self.runner.cp_manager.input_ids_pcp_full.gpu
+            query_start_loc_pcp_full = self.runner.cp_manager.query_start_loc_pcp_full.gpu
+            query_start_loc_pcp_full_cpu = self.runner.cp_manager.query_start_loc_pcp_full.cpu
             num_reqs = self.runner.input_batch.num_reqs
             ori_query_lens = query_start_loc_pcp_full_cpu[1:num_reqs+1] - \
                 query_start_loc_pcp_full_cpu[:num_reqs]
@@ -310,7 +310,7 @@ class MtpProposer(EagleProposer):
                                 > self.decode_threshold).sum().item()
             num_decode_reqs = num_reqs - num_prefill_reqs
         else:
-            long_seq_metadata = None
+            cp_metadata = None
             num_prefill_reqs = 0
             num_decode_reqs = 0
         if spec_decode_metadata is None:
@@ -366,7 +366,7 @@ class MtpProposer(EagleProposer):
             common_attn_metadata=common_attn_metadata,
             sampling_metadata=sampling_metadata,
             req_scheduled_tokens=req_scheduled_tokens,
-            long_seq_metadata=long_seq_metadata,
+            cp_metadata=cp_metadata,
             num_prefill_reqs=num_prefill_reqs,
             num_decode_reqs=num_decode_reqs,
             scheduler_output=scheduler_output,
@@ -537,7 +537,7 @@ class MtpProposer(EagleProposer):
         mm_embed_inputs: Optional[tuple[list[torch.Tensor],
                                         torch.Tensor]] = None,
         req_scheduled_tokens=None,
-        long_seq_metadata=None,
+        cp_metadata=None,
         num_prefill_reqs=0,
         num_decode_reqs=0,
         scheduler_output: SchedulerOutput = None,
@@ -564,8 +564,8 @@ class MtpProposer(EagleProposer):
 
         # update pcp related params
         if self.pcp_size * self.dcp_size > 1:
-            assert long_seq_metadata is not None
-            common_attn_metadata.prefill_context_parallel_metadata = long_seq_metadata
+            assert cp_metadata is not None
+            common_attn_metadata.context_parallel_metadata = cp_metadata
             ori_last_token_indices = last_token_indices.clone()
             query_lens_d = self.runner.query_lens[:num_decode_reqs]
         if self.pcp_size > 1:
@@ -757,7 +757,7 @@ class MtpProposer(EagleProposer):
                 hidden_states = hidden_states[:num_tokens]
                 hidden_states = get_pcp_group().all_gather(hidden_states, 0)
                 hidden_states = torch.index_select(
-                    hidden_states, 0, self.runner.pcp_manager.
+                    hidden_states, 0, self.runner.cp_manager.
                     pcp_allgather_restore_idx.gpu[:hidden_states.shape[0]])
 
             sample_hidden_states = hidden_states[last_token_indices]
@@ -803,13 +803,13 @@ class MtpProposer(EagleProposer):
                     # (_generate_pcp_mtp_input), and use updated slot_indices
                     # to get corresponding slot_mapping in each step.
                     num_reject_tokens = torch.tensor(
-                        self.runner.pcp_manager.cu_num_tokens_pcp_full,
+                        self.runner.cp_manager.cu_num_tokens_pcp_full,
                         dtype=torch.int32).to(
                             self.device) - ori_last_token_indices - 1
                     num_accept_tokens = \
                         query_lens_d.to(self.device) - num_reject_tokens
                     ori_seq_len = attn_metadata_i.seq_lens
-                    mtp_slot_mapping = self.runner.pcp_manager.mtp_slot_pad
+                    mtp_slot_mapping = self.runner.cp_manager.mtp_slot_pad
 
                     # slot_mapping index base offset:
                     # scheduled tokens + pre-allocated mtp tokens + accepted tokens
@@ -895,7 +895,7 @@ class MtpProposer(EagleProposer):
             self.hidden_states[:hidden_states.shape[0]] = hidden_states
             if self.pcp_size * self.dcp_size > 1:
                 # update local seq_len and batch_seq_mask
-                num_computed_tokens_of_pcp_dcp = self.runner.pcp_manager._get_cp_local_seq_lens(
+                num_computed_tokens_of_pcp_dcp = self.runner.cp_manager._get_cp_local_seq_lens(
                     ori_seq_len + step + 1,
                     self.pcp_size,
                     self.dcp_size,

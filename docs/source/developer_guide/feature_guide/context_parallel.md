@@ -74,7 +74,7 @@ We employ a head-tail style for splitting and concatenation: specifically, the s
 The first part is merged with the last part, the second part with the second last part, and so on, thereby assigning computationally balanced chunks to each devices.
 Additionally, since allgather aggregation of KV or Q results in interleaved chunks from different requests, we compute `pcp_allgather_restore_idx` to quickly restore the original order.
 
-These logics are implemented in the function `_update_tokens_for_pcp`.
+These logics are implemented in the function `CPManager.update_tokens_for_pcp`.
 
 ![PCP-Partition](../../assets/cp/head-tail-style.png)
 

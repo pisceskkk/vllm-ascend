@@ -275,7 +275,7 @@ class TestAscendMLAMetadataBuilder(TestBase):
         common_metadata.positions = torch.Tensor([1, 2, 3, 4, 5, 6]).int()
         block_table = torch.Tensor([[1, 0], [2, 0], [3, 0], [4, 0]]).int()
         common_metadata.block_table_tensor = block_table
-        common_metadata.prefill_context_parallel_metadata = None
+        common_metadata.context_parallel_metadata = None
         mock_get_cos_and_sin_mla.return_value = (torch.tensor([6, 6]),
                                                  torch.Tensor([6, 6]))
         metadata = builder.build(0, common_metadata)

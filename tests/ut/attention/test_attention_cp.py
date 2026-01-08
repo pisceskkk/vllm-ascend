@@ -65,14 +65,14 @@ class TestAscendAttentionCPImpl(TestBase):
 
         attn_metadata = MagicMock()
         attn_metadata.prefill = MagicMock()
-        attn_metadata.prefill.pcp_metadata.q_head_idx = torch.tensor([0])
-        attn_metadata.prefill.pcp_metadata.q_tail_idx = torch.tensor([1])
-        attn_metadata.prefill.pcp_metadata.q_full_idx = torch.tensor([0, 1])
-        attn_metadata.prefill.pcp_metadata.kv_with_q_head_mask_idx = torch.tensor(
+        attn_metadata.prefill.cp_metadata.q_head_idx = torch.tensor([0])
+        attn_metadata.prefill.cp_metadata.q_tail_idx = torch.tensor([1])
+        attn_metadata.prefill.cp_metadata.q_full_idx = torch.tensor([0, 1])
+        attn_metadata.prefill.cp_metadata.kv_with_q_head_mask_idx = torch.tensor(
             [0])
-        attn_metadata.prefill.pcp_metadata.kv_with_q_tail_nomask_idx = torch.tensor(
+        attn_metadata.prefill.cp_metadata.kv_with_q_tail_nomask_idx = torch.tensor(
             [0])
-        attn_metadata.prefill.pcp_metadata.kv_with_q_tail_mask_idx = torch.tensor(
+        attn_metadata.prefill.cp_metadata.kv_with_q_tail_mask_idx = torch.tensor(
             [0])
 
         output, attn_lse = self.impl._forward_prefill_cp(
@@ -130,7 +130,7 @@ class TestAscendAttentionCPImpl(TestBase):
         attn_metadata = MagicMock()
         attn_metadata.prefill = MagicMock()
         attn_metadata.prefill.chunked_context = MagicMock()
-        attn_metadata.prefill.chunked_context.cp_kv_recover_idx_for_chunk = torch.tensor(
+        attn_metadata.prefill.chunked_context.pcp_allgather_restore_idx_prefill = torch.tensor(
             [1, 2, 3, 0])
         output = self.impl._prefill_query_all_gather(attn_metadata, query)
 
@@ -336,11 +336,11 @@ class TestUpdateNpuAttnOutLse(TestBase):
         attn_metadata.num_actual_tokens = self.q_total_tokens
 
         prefill_metadata = AscendMetadataForPrefill()
-        pcp_metadata = AscendMetadataForPrefill.AscendPCPMetadata()
-        pcp_metadata.attn_mask_seqlens = self.kv_seqlens_mask_cumsum
-        pcp_metadata.head_attn_nomask_seqlens = self.kv_seqlens_nomask_cumsum
-        pcp_metadata.tail_attn_nomask_seqlens = self.kv_seqlens_nomask_cumsum
-        prefill_metadata.pcp_metadata = pcp_metadata
+        cp_metadata = AscendMetadataForPrefill.AscendPCPMetadata()
+        cp_metadata.attn_mask_seqlens = self.kv_seqlens_mask_cumsum
+        cp_metadata.head_attn_nomask_seqlens = self.kv_seqlens_nomask_cumsum
+        cp_metadata.tail_attn_nomask_seqlens = self.kv_seqlens_nomask_cumsum
+        prefill_metadata.cp_metadata = cp_metadata
 
         prefill_metadata.actual_seq_lengths_q = torch.tensor(
             self.q_seqlens_cumsum)

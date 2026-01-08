@@ -107,7 +107,7 @@ class AscendMLAPrefillMetadata:
                               | CPChunkedContextMetadata] = None
     sin: torch.Tensor = None
     cos: torch.Tensor = None
-    pcp_metadata: Optional[AscendPCPMetadata] = None
+    cp_metadata: Optional[AscendPCPMetadata] = None
 
 
 @dataclass

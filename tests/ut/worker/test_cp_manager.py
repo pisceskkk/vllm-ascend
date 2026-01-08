@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_ascend.worker.pcp_utils import PCPManager
+from vllm_ascend.worker.cp_utils import CPManager
 
 
 @pytest.mark.parametrize(
@@ -39,7 +39,7 @@ def test_generate_pcp_metadata_basic(pcp_size, dcp_size, num_reqs, query_lens,
     vllm_config.parallel_config.cp_kv_cache_interleave_size = 64
     vllm_config.speculative_config.num_speculative_tokens = 0
 
-    pcp_manager = PCPManager(pcp_world_size=pcp_size,
+    cp_manager = CPManager(pcp_world_size=pcp_size,
                              pcp_rank=0,
                              dcp_world_size=dcp_size,
                              dcp_rank=0,
@@ -70,7 +70,7 @@ def test_generate_pcp_metadata_basic(pcp_size, dcp_size, num_reqs, query_lens,
     input_batch.num_tokens = torch.tensor(num_tokens)
 
     query_lens = torch.tensor(query_lens)
-    result = pcp_manager.generate_pcp_metadata(total_tokens, query_lens, None,
+    result = cp_manager.generate_cp_metadata(total_tokens, query_lens, None,
                                                input_batch)
 
     if not expect_not_none:
@@ -86,13 +86,13 @@ def test_generate_pcp_metadata_basic(pcp_size, dcp_size, num_reqs, query_lens,
 
             has_prefill_requests = (num_reqs - num_decodes) > 0
             if has_prefill_requests:
-                assert hasattr(result, 'q_head_idx_tensor')
-                assert hasattr(result, 'q_tail_idx_tensor')
+                assert hasattr(result, 'q_head_idx')
+                assert hasattr(result, 'q_tail_idx')
                 assert hasattr(result, 'q_full_idx')
-                assert hasattr(result, 'kv_with_q_head_nomask_idx_tensor')
-                assert hasattr(result, 'kv_with_q_head_mask_idx_tensor')
-                assert hasattr(result, 'kv_with_q_tail_nomask_idx_tensor')
-                assert hasattr(result, 'kv_with_q_tail_mask_idx_tensor')
+                assert hasattr(result, 'kv_with_q_head_nomask_idx')
+                assert hasattr(result, 'kv_with_q_head_mask_idx')
+                assert hasattr(result, 'kv_with_q_tail_nomask_idx')
+                assert hasattr(result, 'kv_with_q_tail_mask_idx')
                 assert hasattr(result, 'attn_mask_seqlens')
                 assert hasattr(result, 'head_attn_nomask_seqlens')
                 assert hasattr(result, 'tail_attn_nomask_seqlens')
@@ -135,7 +135,7 @@ def test_update_tokens_for_pcp_basic(tokens, num_reqs, num_computed_tokens,
     vllm_config.model_config = MagicMock()
     vllm_config.speculative_config.num_speculative_tokens = 0
 
-    pcp_manager = PCPManager(pcp_world_size=pcp_size,
+    cp_manager = CPManager(pcp_world_size=pcp_size,
                              pcp_rank=0,
                              dcp_world_size=1,
                              dcp_rank=0,
@@ -150,7 +150,7 @@ def test_update_tokens_for_pcp_basic(tokens, num_reqs, num_computed_tokens,
                                                    dtype=np.int32)
     input_batch.num_prompt_tokens = np.array(num_prompt_tokens, dtype=np.int32)
     arange_np = np.arange(10000)
-    pcp_tokens_result, positions_result = pcp_manager.update_tokens_for_pcp(
+    pcp_tokens_result, positions_result = cp_manager.update_tokens_for_pcp(
         np.array(tokens), arange_np, num_reqs, 1)
 
     assert np.array_equal(pcp_tokens_result, expected_pcp_tokens), \
@@ -200,7 +200,7 @@ def test_get_cp_local_seq_lens(
     vllm_config = MagicMock()
     vllm_config.model_config = MagicMock()
     vllm_config.speculative_config.num_speculative_tokens = 0
-    pcp_manager = PCPManager(pcp_world_size=pcp_world_size,
+    cp_manager = CPManager(pcp_world_size=pcp_world_size,
                              pcp_rank=0,
                              dcp_world_size=dcp_world_size,
                              dcp_rank=0,
@@ -209,7 +209,7 @@ def test_get_cp_local_seq_lens(
                              device="cpu",
                              vllm_config=vllm_config,
                              pin_memory=False)
-    ret = pcp_manager._get_cp_local_seq_lens(seq_lens, pcp_world_size,
+    ret = cp_manager._get_cp_local_seq_lens(seq_lens, pcp_world_size,
                                              dcp_world_size,
                                              cp_kv_cache_interleave_size)
     assert torch.equal(ret, target)
@@ -265,7 +265,7 @@ def test_get_cp_local_seq_lens(
         ),
     ])
 # yapf: enable
-def test_generate_pcp_mtp_input(
+def test_generate_cp_mtp_input(
     req_ids,
     num_computed_tokens,
     token_ids_tensor_list,
@@ -283,7 +283,7 @@ def test_generate_pcp_mtp_input(
     vllm_config.speculative_config.num_speculative_tokens = 1
     vllm_config.scheduler_config.max_num_seqs = max_num_reqs
     vllm_config.scheduler_config.max_num_batched_tokens = max_model_len
-    pcp_manager = PCPManager(pcp_world_size=2,
+    cp_manager = CPManager(pcp_world_size=2,
                              pcp_rank=0,
                              dcp_world_size=1,
                              dcp_rank=0,
@@ -312,11 +312,11 @@ def test_generate_pcp_mtp_input(
     for i, token_ids_tensor in enumerate(token_ids_tensor_list):
         token_ids_cpu_tensor[i][:token_ids_tensor.size(0)] = token_ids_tensor
 
-    pcp_manager.generate_pcp_mtp_input(num_reqs, total_num_scheduled_tokens,
+    cp_manager.generate_cp_mtp_input(num_reqs, total_num_scheduled_tokens,
                                        num_scheduled_tokens, False,
                                        input_batch, arange_np)
     assert torch.equal(
-        pcp_manager.input_ids_pcp_full.cpu[:total_num_scheduled_tokens],
+        cp_manager.input_ids_pcp_full.cpu[:total_num_scheduled_tokens],
         target_input_ids_pcp_full)
-    assert torch.equal(pcp_manager.query_start_loc_pcp_full.cpu[:num_reqs + 1],
+    assert torch.equal(cp_manager.query_start_loc_pcp_full.cpu[:num_reqs + 1],
                        target_query_start_loc_pcp_full)

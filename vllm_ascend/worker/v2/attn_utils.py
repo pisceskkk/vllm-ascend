@@ -30,7 +30,7 @@ from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec, KVCacheConfig
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
-                                         AscendPrefillContextParallelMetadata)
+                                         AscendContextParallelMetadata)
 
 _ATTENTION_MASK_BUILDER = None
 
@@ -64,7 +64,7 @@ def build_attn_metadata(
     attn_state: Any | None = None,
     graph_pad_size: int = -1,
     num_input_tokens: int = 0,
-    prefill_context_parallel_metadata: AscendPrefillContextParallelMetadata
+    context_parallel_metadata: AscendContextParallelMetadata
     | None = None,
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
@@ -97,7 +97,7 @@ def build_attn_metadata(
             attn_state=attn_state,
             graph_pad_size=graph_pad_size,
             num_input_tokens=num_input_tokens,
-            prefill_context_parallel_metadata=prefill_context_parallel_metadata,
+            context_parallel_metadata=context_parallel_metadata,
             max_seq_len=max_seq_len)
 
         attn_metadata_builder = attn_metadata_builders[i]

@@ -278,10 +278,10 @@ class EagleProposer(VllmEagleProposer):
 
         req_scheduled_tokens = scheduler_output.num_scheduled_tokens
         if self.pcp_size > 1:
-            long_seq_metadata = self.runner.long_seq_metadata
-            input_ids_pcp_full = self.runner.pcp_manager.input_ids_pcp_full.gpu
-            query_start_loc_pcp_full = self.runner.pcp_manager.query_start_loc_pcp_full.gpu
-            query_start_loc_pcp_full_cpu = self.runner.pcp_manager.query_start_loc_pcp_full.cpu
+            cp_metadata = self.runner.cp_metadata
+            input_ids_pcp_full = self.runner.cp_manager.input_ids_pcp_full.gpu
+            query_start_loc_pcp_full = self.runner.cp_manager.query_start_loc_pcp_full.gpu
+            query_start_loc_pcp_full_cpu = self.runner.cp_manager.query_start_loc_pcp_full.cpu
             num_reqs = self.runner.input_batch.num_reqs
             ori_query_lens = query_start_loc_pcp_full_cpu[1:num_reqs+1] - \
                 query_start_loc_pcp_full_cpu[:num_reqs]
@@ -289,7 +289,7 @@ class EagleProposer(VllmEagleProposer):
                                 > self.decode_threshold).sum().item()
             num_decode_reqs = num_reqs - num_prefill_reqs
         else:
-            long_seq_metadata = None
+            cp_metadata = None
             num_prefill_reqs = 0
             num_decode_reqs = 0
         if spec_decode_metadata is None:
@@ -355,7 +355,7 @@ class EagleProposer(VllmEagleProposer):
             common_attn_metadata=common_attn_metadata,
             sampling_metadata=sampling_metadata,
             req_scheduled_tokens=req_scheduled_tokens,
-            long_seq_metadata=long_seq_metadata,
+            cp_metadata=cp_metadata,
             num_prefill_reqs=num_prefill_reqs,
             num_decode_reqs=num_decode_reqs,
             scheduler_output=scheduler_output,
@@ -380,7 +380,7 @@ class EagleProposer(VllmEagleProposer):
         mm_embed_inputs: Optional[tuple[list[torch.Tensor],
                                         torch.Tensor]] = None,
         req_scheduled_tokens=None,
-        long_seq_metadata=None,
+        cp_metadata=None,
         num_prefill_reqs=0,
         num_decode_reqs=0,
         scheduler_output: SchedulerOutput = None,

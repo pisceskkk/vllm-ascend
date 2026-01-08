@@ -60,7 +60,7 @@ class AscendMetadataForPrefill:
         chunk_seq_mask_filtered_indices: torch.Tensor
         chunked_req_mask: Optional[list[bool]] = None
         local_context_lens_allranks: Optional[list[list[int]]] = None
-        cp_kv_recover_idx_for_chunk: Optional[list[int]] = None
+        pcp_allgather_restore_idx_prefill: Optional[list[int]] = None
         kv_inverse_idx_for_chunk: Optional[list[int]] = None
         batch_chunk_seq_mask: Optional[list[bool]] = None
         local_total_toks: Optional[int] = None
@@ -82,27 +82,26 @@ class AscendMetadataForDecode:
 
 
 @dataclass
-# class AscendCommonLongSequenceMetadata:
-class AscendPrefillContextParallelMetadata:
+class AscendContextParallelMetadata:
     pcp_allgather_restore_idx: torch.Tensor = None
 
-    cp_kv_recover_idx_for_chunk: torch.Tensor = None
+    pcp_allgather_restore_idx_prefill: torch.Tensor = None
 
     num_actual_tokens_pcp_padded: int = 0
 
     num_computed_tokens_of_pcp_dcp: Optional[list[list[list[int]]]] = None
 
-    q_head_idx_tensor: torch.Tensor = None
+    q_head_idx: torch.Tensor = None
 
-    q_tail_idx_tensor: torch.Tensor = None
+    q_tail_idx: torch.Tensor = None
 
-    kv_with_q_head_nomask_idx_tensor: torch.Tensor = None
+    kv_with_q_head_nomask_idx: torch.Tensor = None
 
-    kv_with_q_head_mask_idx_tensor: torch.Tensor = None
+    kv_with_q_head_mask_idx: torch.Tensor = None
 
-    kv_with_q_tail_nomask_idx_tensor: torch.Tensor = None
+    kv_with_q_tail_nomask_idx: torch.Tensor = None
 
-    kv_with_q_tail_mask_idx_tensor: torch.Tensor = None
+    kv_with_q_tail_mask_idx: torch.Tensor = None
 
     attn_mask_seqlens: torch.Tensor = None
 
@@ -114,11 +113,11 @@ class AscendPrefillContextParallelMetadata:
 
     pcp_prefill_mask: torch.Tensor = None
 
-    # original query_lens before pcp split
     query_lens_pcp_full_cpu: torch.Tensor = None
+    """original query_lens before pcp split"""
 
-    # original max_query_len before pcp split
     max_query_len_pcp_full: int = 0
+    """original max_query_len before pcp split"""
 
 
 @dataclass
@@ -153,8 +152,8 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # padding tokens. It is used to handle some padding operations.
     num_input_tokens: int = 0
 
-    prefill_context_parallel_metadata: Optional[
-        AscendPrefillContextParallelMetadata] = None
+    context_parallel_metadata: Optional[
+        AscendContextParallelMetadata] = None
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int,
@@ -182,8 +181,8 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             attn_state=self.attn_state,
             graph_pad_size=-1,  # It should be -1 when not run in fullgraph mode.
             num_input_tokens=num_actual_tokens,
-            prefill_context_parallel_metadata=self.
-            prefill_context_parallel_metadata,
+            context_parallel_metadata=self.
+            context_parallel_metadata,
             max_seq_len=self.max_seq_len)
 
 
@@ -232,11 +231,11 @@ def split_decodes_and_prefills(
         num_decode_tokens: The number of tokens in the decode requests.
         num_prefill_tokens: The number of tokens in the prefill requests.
     """
-    long_seq_metadata = common_attn_metadata.prefill_context_parallel_metadata
-    query_lens_pcp_full = long_seq_metadata.query_lens_pcp_full_cpu \
-        if long_seq_metadata else None
-    max_query_len_pcp_full = long_seq_metadata.max_query_len_pcp_full \
-        if long_seq_metadata else 0
+    cp_metadata = common_attn_metadata.context_parallel_metadata
+    query_lens_pcp_full = cp_metadata.query_lens_pcp_full_cpu \
+        if cp_metadata else None
+    max_query_len_pcp_full = cp_metadata.max_query_len_pcp_full \
+        if cp_metadata else 0
     max_query_len = common_attn_metadata.max_query_len \
         if max_query_len_pcp_full == 0 else max_query_len_pcp_full
     num_reqs = common_attn_metadata.num_reqs

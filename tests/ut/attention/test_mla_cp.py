@@ -350,8 +350,8 @@ class TestAscendMLAImpl(TestBase):
         attn_metadata.num_decode_tokens = 0
         attn_metadata.num_actual_tokens = 2
         attn_metadata.num_actual_tokens_pcp_padded = 4
-        attn_metadata.prefill.pcp_metadata = MagicMock()
-        attn_metadata.prefill.pcp_metadata.pcp_allgather_restore_idx = torch.arange(
+        attn_metadata.prefill.cp_metadata = MagicMock()
+        attn_metadata.prefill.cp_metadata.pcp_allgather_restore_idx = torch.arange(
             4)
         attn_metadata.slot_mapping = torch.arange(4)
         attn_metadata.prefill.cos = torch.randn(2, 64)
@@ -971,22 +971,22 @@ class TestAscendMLAImpl(TestBase):
                     rank, pcp_size, nums_tokens_per_rank)
                 attn_metadata = MagicMock()
                 attn_metadata.prefill = MagicMock()
-                attn_metadata.prefill.pcp_metadata.q_head_idx = q_head_idx
-                attn_metadata.prefill.pcp_metadata.q_tail_idx = q_tail_idx
-                attn_metadata.prefill.pcp_metadata.q_full_idx = torch.cat([
-                    attn_metadata.prefill.pcp_metadata.q_head_idx,
-                    attn_metadata.prefill.pcp_metadata.q_tail_idx
+                attn_metadata.prefill.cp_metadata.q_head_idx = q_head_idx
+                attn_metadata.prefill.cp_metadata.q_tail_idx = q_tail_idx
+                attn_metadata.prefill.cp_metadata.q_full_idx = torch.cat([
+                    attn_metadata.prefill.cp_metadata.q_head_idx,
+                    attn_metadata.prefill.cp_metadata.q_tail_idx
                 ])
-                attn_metadata.prefill.pcp_metadata.kv_with_q_head_nomask_idx = kv_with_q_head_nomask_idx
+                attn_metadata.prefill.cp_metadata.kv_with_q_head_nomask_idx = kv_with_q_head_nomask_idx
 
-                attn_metadata.prefill.pcp_metadata.kv_with_q_head_mask_idx = kv_with_q_head_mask_idx
-                attn_metadata.prefill.pcp_metadata.kv_with_q_tail_nomask_idx = kv_with_q_tail_nomask_idx
-                attn_metadata.prefill.pcp_metadata.kv_with_q_tail_mask_idx = kv_with_q_tail_mask_idx
-                attn_metadata.prefill.pcp_metadata.attn_mask_seqlens = torch.tensor(
+                attn_metadata.prefill.cp_metadata.kv_with_q_head_mask_idx = kv_with_q_head_mask_idx
+                attn_metadata.prefill.cp_metadata.kv_with_q_tail_nomask_idx = kv_with_q_tail_nomask_idx
+                attn_metadata.prefill.cp_metadata.kv_with_q_tail_mask_idx = kv_with_q_tail_mask_idx
+                attn_metadata.prefill.cp_metadata.attn_mask_seqlens = torch.tensor(
                     [chunk_seqlens, chunk_seqlens], dtype=torch.int32)
-                attn_metadata.prefill.pcp_metadata.head_attn_nomask_seqlens = kv_with_q_head_nomask_seqlens
-                attn_metadata.prefill.pcp_metadata.tail_attn_nomask_seqlens = kv_with_q_tail_nomask_seqlens
-                attn_metadata.prefill.pcp_metadata.pcp_prefill_mask = torch.triu(
+                attn_metadata.prefill.cp_metadata.head_attn_nomask_seqlens = kv_with_q_head_nomask_seqlens
+                attn_metadata.prefill.cp_metadata.tail_attn_nomask_seqlens = kv_with_q_tail_nomask_seqlens
+                attn_metadata.prefill.cp_metadata.pcp_prefill_mask = torch.triu(
                     torch.ones(10, 10, dtype=torch.float16), 1)
 
                 output = self.impl._forward_prefill(q_nope, q_pe, k_nope, k_pe,
