@@ -165,10 +165,10 @@ class AscendAttentionCPMetadataBuilder(AscendAttentionMetadataBuilder):
                     (len(local_context_lens_allranks)),
                     dtype=torch.int32,
                     device=self.device)
-                cp_kv_recover_idx_for_chunk = common_long_seq_metadata.cp_kv_recover_idx_for_chunk
+                pcp_allgather_restore_idx_prefill = common_long_seq_metadata.pcp_allgather_restore_idx_prefill
                 kv_inverse_idx_for_chunk = torch.argsort(
-                    cp_kv_recover_idx_for_chunk.to(torch.float32)
-                ) if cp_kv_recover_idx_for_chunk is not None else None
+                    pcp_allgather_restore_idx_prefill.to(torch.float32)
+                ) if pcp_allgather_restore_idx_prefill is not None else None
 
                 batch_chunk_seq_mask = (
                     local_context_lens_allranks[:, self.pcp_rank,
@@ -185,7 +185,7 @@ class AscendAttentionCPMetadataBuilder(AscendAttentionMetadataBuilder):
                         chunked_req_mask=chunked_req_mask,
                         starts=local_chunk_starts,
                         local_context_lens_allranks=local_context_lens_allranks,
-                        cp_kv_recover_idx_for_chunk=cp_kv_recover_idx_for_chunk,
+                        pcp_allgather_restore_idx_prefill=pcp_allgather_restore_idx_prefill,
                         kv_inverse_idx_for_chunk=kv_inverse_idx_for_chunk,
                         batch_chunk_seq_mask=batch_chunk_seq_mask,
                         chunk_seq_mask_filtered_indices=chunk_seq_mask_filtered_indices,
@@ -609,7 +609,7 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
             prefill_query = get_pcp_group().all_gather(prefill_query, 0)
             prefill_query = torch.index_select(
                 prefill_query, 0, attn_metadata.prefill.chunked_context.
-                cp_kv_recover_idx_for_chunk)
+                pcp_allgather_restore_idx_prefill)
         if self.dcp_size > 1:
             prefill_query = get_dcp_group().all_gather(prefill_query, 1)
         return prefill_query

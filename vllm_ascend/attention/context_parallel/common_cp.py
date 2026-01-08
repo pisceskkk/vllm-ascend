@@ -67,7 +67,7 @@ class AscendMetadataForPrefill:
         chunk_seq_mask_filtered_indices: torch.Tensor
         chunked_req_mask: Optional[list[bool]] = None
         local_context_lens_allranks: Optional[list[list[int]]] = None
-        cp_kv_recover_idx_for_chunk: Optional[list[int]] = None
+        pcp_allgather_restore_idx_prefill: Optional[torch.Tensor] = None
         kv_inverse_idx_for_chunk: Optional[list[int]] = None
         batch_chunk_seq_mask: Optional[list[bool]] = None
         local_total_toks: Optional[int] = None

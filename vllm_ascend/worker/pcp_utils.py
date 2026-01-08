@@ -75,6 +75,13 @@ class PCPManager:
             device=device,
             pin_memory=pin_memory,
         )
+        # this resotre idx is used for prefill
+        self.pcp_allgather_restore_idx_prefill = CpuGpuBuffer(
+            max_buffer_num_tokens,
+            dtype=torch.int64,
+            device=device,
+            pin_memory=pin_memory,
+        )
         self.pcp_padded_slot_mapping = torch.full(
             (max_buffer_num_tokens, ),
             fill_value=-1,
@@ -90,16 +97,14 @@ class PCPManager:
             device="cpu",
             dtype=torch.bool,
         )
-        self.num_actual_tokens_pcp_padded = 0
         self.pcp_unpad_mask_cpu = self.pcp_unpad_mask_cpu_tensor.numpy()
-        self.cp_kv_recover_idx_for_chunk: List[List[int]] = [
-            [] for _ in range(self.pcp_size)
-        ]
+
+        self.num_actual_tokens_pcp_padded = 0
         self.full_indices = list(
             range(self.max_num_tokens * self.pcp_size *
                   self.dcp_size + self.pcp_size *
                   self.dcp_size * self.max_num_reqs))
-        if self.speculative_config and self.pcp_size * self.dcp_size > 1:
+        if self.speculative_config:
             self.input_ids_pcp_full = CpuGpuBuffer(self.max_num_tokens,
                                                    dtype=torch.int32,
                                                    device=device,
@@ -292,10 +297,17 @@ class PCPManager:
             for rank_i in range(self.pcp_size)
         ]
         all_positions = np.concatenate(all_positions_lst)
-        self.pcp_allgather_restore_idx.np[:all_positions.shape[0]] = (
-            all_positions.argsort())
-        self.pcp_allgather_restore_idx.copy_to_gpu(all_positions.shape[0])
+        restore_idx = all_positions.argsort()
+        idx_len = restore_idx.shape[0]
+        self.pcp_allgather_restore_idx.np[:idx_len] = (
+            restore_idx)
+        self.pcp_allgather_restore_idx.copy_to_gpu(idx_len)
 
+        # Build the restore index for prefill tokens afther allgather.
+        prefill_restore_idx = restore_idx[num_decode_tokens*self.pcp_size:].argsort().argsort()
+        self.num_prefill_tokens = prefill_restore_idx.shape[0]
+        self.pcp_allgather_restore_idx_prefill.np[:self.num_prefill_tokens] = prefill_restore_idx
+        self.pcp_allgather_restore_idx_prefill.copy_to_gpu(self.num_prefill_tokens)
         return (
             pcp_tokens[:num_reqs],
             positions,
@@ -460,47 +472,6 @@ class PCPManager:
         dcp_local_seq_lens = (base + remainder).reshape(
             [-1, pcp_size, dcp_size])
         return dcp_local_seq_lens
-
-    def generate_kv_idx(self, scheduler_output, input_batch):
-        if not self.pcp_size > 1:
-            return
-        self.cp_kv_recover_idx_for_chunk = [[]
-                                            for _ in range(self.pcp_size)
-                                            ]
-
-        for i, req_id in enumerate(input_batch.req_ids):
-            num_scheduled_token = scheduler_output.num_scheduled_tokens[req_id]
-            is_prefill = num_scheduled_token > self.decode_threshold
-            if is_prefill:
-                num_cp_padded_scheduled_tokens = cdiv(
-                    num_scheduled_token,
-                    2 * self.pcp_size) * (2 * self.pcp_size)
-                chunk_size = num_cp_padded_scheduled_tokens // (
-                    2 * self.pcp_size)
-                num_added_recover_tokens = len(
-                    self.cp_kv_recover_idx_for_chunk[0]) * self.pcp_size
-                for rank in range(self.pcp_size):
-                    self.cp_kv_recover_idx_for_chunk[rank].extend(
-                        self.full_indices[rank * chunk_size +
-                                          num_added_recover_tokens:(rank + 1) *
-                                          chunk_size +
-                                          num_added_recover_tokens])
-                    self.cp_kv_recover_idx_for_chunk[rank].extend(
-                        self.full_indices[num_cp_padded_scheduled_tokens -
-                                          (rank + 1) * chunk_size +
-                                          num_added_recover_tokens:
-                                          num_cp_padded_scheduled_tokens -
-                                          rank * chunk_size +
-                                          num_added_recover_tokens])
-
-        cp_kv_recover_idx_for_chunk = torch.from_numpy(
-            np.concatenate(
-                self.cp_kv_recover_idx_for_chunk)).to(device=self.device)
-        cp_kv_recover_idx_for_chunk.copy_(torch.tensor(
-            np.array(self.cp_kv_recover_idx_for_chunk).flatten().tolist()),
-                                          non_blocking=True)
-        self.cp_kv_recover_idx_for_chunk = cp_kv_recover_idx_for_chunk.to(
-            torch.float32).argsort().to(torch.int32)
 
     def generate_pcp_metadata(self, total_num_scheduled_tokens, query_lens,
                               input_batch):
@@ -670,7 +641,7 @@ class PCPManager:
                 }
                 long_seq_metadata.pcp_allgather_restore_idx = self.pcp_allgather_restore_idx.gpu[:
                                                                                                  num_actual_tokens_pcp_padded]
-                long_seq_metadata.cp_kv_recover_idx_for_chunk = self.cp_kv_recover_idx_for_chunk
+                long_seq_metadata.pcp_allgather_restore_idx_prefill = self.pcp_allgather_restore_idx_prefill.gpu[:self.num_prefill_tokens]
                 long_seq_metadata.q_head_idx_tensor = self.q_head_idx_tensor
                 long_seq_metadata.q_tail_idx_tensor = self.q_tail_idx_tensor
                 long_seq_metadata.q_full_idx = self.q_full_idx

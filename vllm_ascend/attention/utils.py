@@ -44,7 +44,7 @@ class AscendPrefillContextParallelMetadata:
     """
     pcp_allgather_restore_idx: torch.Tensor = None
 
-    cp_kv_recover_idx_for_chunk: torch.Tensor = None
+    pcp_allgather_restore_idx_prefill: torch.Tensor = None
 
     num_actual_tokens_pcp_padded: int = 0
 
