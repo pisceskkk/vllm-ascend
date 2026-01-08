@@ -484,270 +484,203 @@ class PCPManager:
         num_prefills = num_reqs - num_decodes
         num_actual_tokens_pcp_padded = total_num_scheduled_tokens * self.pcp_size
         self.num_actual_tokens_pcp_padded = num_actual_tokens_pcp_padded
-        long_seq_metadata = None
-        if self.pcp_size * self.dcp_size > 1:
-            decode_context_lens = input_batch.num_tokens[:num_decodes]
-            prefill_context_lens = input_batch.num_computed_tokens_cpu[
-                num_decodes:num_reqs]
-            context_lens = np.concatenate(
-                [decode_context_lens, prefill_context_lens])
-            num_computed_tokens_of_pcp_dcp = torch.zeros(
-                [
-                    num_reqs * self.decode_threshold, self.pcp_size,
-                    self.dcp_size
-                ],
-                dtype=torch.int32,
-            )
-            # For pcp + spec decode, we flatten seq_lens
-            # to avoid irregular attn_mask shape.
-            # Same as block_table, we flatten decode seq_lens to query_lens,
-            # and keep prefill seq_lens unchanged.
-            for decode_idx in range(self.decode_threshold):
-                num_computed_tokens_of_pcp_dcp[
-                    self.decode_threshold - 1 - decode_idx::self.decode_threshold] = \
-                    self._get_cp_local_seq_lens(
-                        torch.tensor(context_lens) - decode_idx,
-                        self.pcp_size,
-                        self.dcp_size,
-                        self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
-                    )
-            if self.decode_threshold > 1:
-                num_computed_tokens_of_pcp_dcp_list = []
-                if num_decodes:
-                    num_decodes_flatten = \
-                        query_lens[:num_decodes].sum().item()
-                    if query_lens[:num_decodes].min().item(
-                    ) == self.decode_threshold:
-                        decode_flatten_idx = list(range(num_decodes_flatten))
-                    else:
-                        decode_flatten_idx = []
-                        for req_id in range(num_decodes):
-                            offset = (req_id + 1) * self.decode_threshold
-                            decode_flatten_idx += \
-                                list(range(offset - query_lens[req_id], offset))
-                    num_computed_tokens_of_pcp_dcp_list.append(
-                        num_computed_tokens_of_pcp_dcp[decode_flatten_idx])
-                if num_prefills:
-                    num_computed_tokens_of_pcp_dcp_list.append(
-                        num_computed_tokens_of_pcp_dcp[
-                            (num_decodes + 1) * self.decode_threshold -
-                            1::self.decode_threshold])
-                num_computed_tokens_of_pcp_dcp = torch.cat(
-                    num_computed_tokens_of_pcp_dcp_list, dim=0)
-            long_seq_metadata = AscendPrefillContextParallelMetadata(
-                num_actual_tokens_pcp_padded=num_actual_tokens_pcp_padded,
-                num_computed_tokens_of_pcp_dcp=num_computed_tokens_of_pcp_dcp.
-                numpy())
-            if self.pcp_size > 1:
-                q_head_idx, q_tail_idx = [], []
-                kv_with_q_head_nomask_idx, kv_with_q_head_mask_idx = [], []
-                kv_with_q_tail_nomask_idx, kv_with_q_tail_mask_idx = [], []
-                split_with_q_head_nomask_idx_reqs = []
-                split_kv_with_q_tail_nomask_idx_reqs = []
-                chunk_seqlens = []
-                kv_with_q_head_nomask_seqlens, kv_with_q_tail_nomask_seqlens = [], []
-                q_req_offset = 0
-                kv_req_offset = 0
-                q_head_chunk_id = self.pcp_rank
-                q_tail_chunk_id = self.pcp_size * 2 - 1 - self.pcp_rank
-                for i, seq_len in enumerate(query_lens):
-                    if i < num_decodes:
-                        continue
-                    chunk_len = seq_len // 2
-                    chunk_seqlens.append(chunk_len)
-                    q_head_idx.extend(
-                        list(range(q_req_offset, q_req_offset + chunk_len)))
-                    kv_with_q_head_nomask_idx.extend(
-                        list(
-                            range(kv_req_offset, kv_req_offset +
-                                  chunk_len * q_head_chunk_id)))
-                    kv_with_q_head_mask_idx.extend(
-                        list(
-                            range(
-                                kv_req_offset + chunk_len * q_head_chunk_id,
-                                kv_req_offset + chunk_len *
-                                (q_head_chunk_id + 1))))
-                    kv_with_q_head_nomask_seqlens.append(chunk_len *
-                                                         q_head_chunk_id)
-                    split_with_q_head_nomask_idx_reqs.append(
-                        list(
-                            range(kv_req_offset, kv_req_offset +
-                                  chunk_len * q_head_chunk_id)))
-                    q_tail_idx.extend(
-                        list(
-                            range(q_req_offset + chunk_len,
-                                  q_req_offset + chunk_len * 2)))
-                    kv_with_q_tail_nomask_idx.extend(
-                        list(
-                            range(kv_req_offset, kv_req_offset +
-                                  chunk_len * q_tail_chunk_id)))
-                    kv_with_q_tail_mask_idx.extend(
-                        list(
-                            range(
-                                kv_req_offset + chunk_len * q_tail_chunk_id,
-                                kv_req_offset + chunk_len *
-                                (q_tail_chunk_id + 1))))
-                    kv_with_q_tail_nomask_seqlens.append(chunk_len *
-                                                         q_tail_chunk_id)
-                    split_kv_with_q_tail_nomask_idx_reqs.append(
-                        list(
-                            range(kv_req_offset, kv_req_offset +
-                                  chunk_len * q_tail_chunk_id)))
-                    q_req_offset += seq_len
-                    kv_req_offset += seq_len * self.pcp_size
 
-                q_head_idx_tensor = self._list_to_tensor(
-                    q_head_idx, self.device)
-                q_tail_idx_tensor = self._list_to_tensor(
-                    q_tail_idx, self.device)
-                self.q_head_idx_tensor = q_head_idx_tensor
-                self.q_tail_idx_tensor = q_tail_idx_tensor
+        decode_context_lens = input_batch.num_tokens[:num_decodes]
+        prefill_context_lens = input_batch.num_computed_tokens_cpu[
+            num_decodes:num_reqs]
+        context_lens = np.concatenate(
+            [decode_context_lens, prefill_context_lens])
+        num_computed_tokens_of_pcp_dcp = torch.zeros(
+            [
+                num_reqs * self.decode_threshold, self.pcp_size,
+                self.dcp_size
+            ],
+            dtype=torch.int32,
+        )
+        # For pcp + spec decode, we flatten seq_lens
+        # to avoid irregular attn_mask shape.
+        # Same as block_table, we flatten decode seq_lens to query_lens,
+        # and keep prefill seq_lens unchanged.
+        for decode_idx in range(self.decode_threshold):
+            num_computed_tokens_of_pcp_dcp[
+                self.decode_threshold - 1 - decode_idx::self.decode_threshold] = \
+                self._get_cp_local_seq_lens(
+                    torch.tensor(context_lens) - decode_idx,
+                    self.pcp_size,
+                    self.dcp_size,
+                    self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
+                )
+        if self.decode_threshold > 1:
+            num_computed_tokens_of_pcp_dcp_list = []
+            if num_decodes:
+                num_decodes_flatten = \
+                    query_lens[:num_decodes].sum().item()
+                if query_lens[:num_decodes].min().item(
+                ) == self.decode_threshold:
+                    decode_flatten_idx = list(range(num_decodes_flatten))
+                else:
+                    decode_flatten_idx = []
+                    for req_id in range(num_decodes):
+                        offset = (req_id + 1) * self.decode_threshold
+                        decode_flatten_idx += \
+                            list(range(offset - query_lens[req_id], offset))
+                num_computed_tokens_of_pcp_dcp_list.append(
+                    num_computed_tokens_of_pcp_dcp[decode_flatten_idx])
+            if num_prefills:
+                num_computed_tokens_of_pcp_dcp_list.append(
+                    num_computed_tokens_of_pcp_dcp[
+                        (num_decodes + 1) * self.decode_threshold -
+                        1::self.decode_threshold])
+            num_computed_tokens_of_pcp_dcp = torch.cat(
+                num_computed_tokens_of_pcp_dcp_list, dim=0)
+        long_seq_metadata = AscendPrefillContextParallelMetadata(
+            num_actual_tokens_pcp_padded=num_actual_tokens_pcp_padded,
+            num_computed_tokens_of_pcp_dcp=num_computed_tokens_of_pcp_dcp.
+            numpy())
+        if self.pcp_size > 1:
+            query_lens_cu = torch.cumsum(query_lens_new.gpu[num_decodes:num_reqs])
+            q_head_idx, q_tail_idx = get_pcp_query_indices(query_lens_cu)
+            (kv_with_q_head_nomask_idx, kv_with_q_head_mask_idx,
+             kv_with_q_tail_nomask_idx, kv_with_q_tail_mask_idx) = (
+                 get_pcp_kv_indices(
+                     query_lens_cu,
+                     self.pcp_rank,
+                     self.pcp_size
+                 )
+             )
+            chunk_seqlens = query_lens[num_decodes:num_reqs] // 2
+            kv_with_q_head_nomask_seqlens = chunk_seqlens * self.pcp_rank
+            kv_with_q_tail_nomask_seqlens = chunk_seqlens * (self.pcp_size * 2 - 1 - self.pcp_rank)
 
-                q_full_idx = torch.cat([q_head_idx_tensor, q_tail_idx_tensor])
-                q_full_idx = q_full_idx.to(torch.float32).argsort().to(
-                    torch.int32)
-                self.q_full_idx = q_full_idx
+            q_full_idx = torch.cat([q_head_idx, q_tail_idx])
+            q_full_idx = q_full_idx.to(torch.float32).argsort().to(
+                torch.int32)
 
-                self.kv_idx_names = {
-                    'kv_with_q_head_nomask_idx_tensor':
-                    kv_with_q_head_nomask_idx,
-                    'kv_with_q_head_mask_idx_tensor': kv_with_q_head_mask_idx,
-                    'kv_with_q_tail_nomask_idx_tensor':
-                    kv_with_q_tail_nomask_idx,
-                    'kv_with_q_tail_mask_idx_tensor': kv_with_q_tail_mask_idx
-                }
-                for key, value in self.kv_idx_names.items():
-                    tensor_npu = self._list_to_tensor(value, self.device)
-                    self.kv_idx_names[key] = tensor_npu
-
-                attn_mask_seqlens = torch.tensor(
-                    [chunk_seqlens, chunk_seqlens], dtype=torch.int32)
-                head_attn_nomask_seqlens = torch.tensor(
-                    [chunk_seqlens, kv_with_q_head_nomask_seqlens],
-                    dtype=torch.int32)
-                tail_attn_nomask_seqlens = torch.tensor(
-                    [chunk_seqlens, kv_with_q_tail_nomask_seqlens],
-                    dtype=torch.int32)
-                if self.vllm_config.model_config.use_mla:
-                    split_q_head_nomask_idx_tensor_list, split_q_tail_nomask_idx_tensor_list, head_attn_nomask_seqlens_list, tail_attn_nomask_seqlens_list = self._split_nomask_idx_tensor_list(
-                        split_with_q_head_nomask_idx_reqs,
-                        split_kv_with_q_tail_nomask_idx_reqs,
-                        head_attn_nomask_seqlens, chunk_seqlens)
-
-                self.extra_long_seq_kwargs = {
-                    'attn_mask_seqlens': attn_mask_seqlens,
-                    'head_attn_nomask_seqlens': head_attn_nomask_seqlens,
-                    'tail_attn_nomask_seqlens': tail_attn_nomask_seqlens
-                }
-                long_seq_metadata.pcp_allgather_restore_idx = self.pcp_allgather_restore_idx.gpu[:
-                                                                                                 num_actual_tokens_pcp_padded]
-                long_seq_metadata.pcp_allgather_restore_idx_prefill = self.pcp_allgather_restore_idx_prefill.gpu[:self.num_prefill_tokens]
-                long_seq_metadata.q_head_idx_tensor = self.q_head_idx_tensor
-                long_seq_metadata.q_tail_idx_tensor = self.q_tail_idx_tensor
-                long_seq_metadata.q_full_idx = self.q_full_idx
-                long_seq_metadata.kv_with_q_head_nomask_idx_tensor = self.kv_idx_names[
-                    'kv_with_q_head_nomask_idx_tensor']
-                long_seq_metadata.kv_with_q_head_mask_idx_tensor = self.kv_idx_names[
-                    'kv_with_q_head_mask_idx_tensor']
-                long_seq_metadata.kv_with_q_tail_nomask_idx_tensor = self.kv_idx_names[
-                    'kv_with_q_tail_nomask_idx_tensor']
-                long_seq_metadata.kv_with_q_tail_mask_idx_tensor = self.kv_idx_names[
-                    'kv_with_q_tail_mask_idx_tensor']
-                long_seq_metadata.attn_mask_seqlens = self.extra_long_seq_kwargs[
-                    'attn_mask_seqlens']
-                long_seq_metadata.head_attn_nomask_seqlens = self.extra_long_seq_kwargs[
-                    'head_attn_nomask_seqlens']
-                long_seq_metadata.tail_attn_nomask_seqlens = self.extra_long_seq_kwargs[
-                    'tail_attn_nomask_seqlens']
-                if self.vllm_config.model_config.use_mla:
-                    long_seq_metadata.kv_with_q_head_nomask_idx_tensor = split_q_head_nomask_idx_tensor_list
-                    long_seq_metadata.kv_with_q_tail_nomask_idx_tensor = split_q_tail_nomask_idx_tensor_list
-                    long_seq_metadata.head_attn_nomask_seqlens = head_attn_nomask_seqlens_list
-                    long_seq_metadata.tail_attn_nomask_seqlens = tail_attn_nomask_seqlens_list
+            attn_mask_seqlens = torch.stack([chunk_seqlens, chunk_seqlens])
+            head_attn_nomask_seqlens = torch.stack([chunk_seqlens, kv_with_q_head_nomask_seqlens])
+            tail_attn_nomask_seqlens = torch.stack([chunk_seqlens, kv_with_q_tail_nomask_seqlens])
+            long_seq_metadata.pcp_allgather_restore_idx = self.pcp_allgather_restore_idx.gpu[:
+                                                                                   num_actual_tokens_pcp_padded]
+            long_seq_metadata.pcp_allgather_restore_idx_prefill = self.pcp_allgather_restore_idx_prefill.gpu[:self.num_prefill_tokens]
+            long_seq_metadata.q_head_idx_tensor = q_head_idx
+            long_seq_metadata.q_tail_idx_tensor = q_tail_idx
+            long_seq_metadata.q_full_idx = q_full_idx
+            long_seq_metadata.kv_with_q_head_nomask_idx_tensor = kv_with_q_head_nomask_idx
+            long_seq_metadata.kv_with_q_head_mask_idx_tensor = kv_with_q_head_mask_idx
+            long_seq_metadata.kv_with_q_tail_nomask_idx_tensor = kv_with_q_tail_nomask_idx
+            long_seq_metadata.kv_with_q_tail_mask_idx_tensor = kv_with_q_tail_mask_idx
+            long_seq_metadata.attn_mask_seqlens = attn_mask_seqlens
+            long_seq_metadata.head_attn_nomask_seqlens = head_attn_nomask_seqlens
+            long_seq_metadata.tail_attn_nomask_seqlens = tail_attn_nomask_seqlens
+            if self.vllm_config.model_config.use_mla:
+                long_seq_metadata.kv_with_q_head_nomask_idx_tensor, long_seq_metadata.head_attn_nomask_seqlens = split_indices(kv_with_q_head_nomask_idx, kv_with_q_head_nomask_seqlens)
+                long_seq_metadata.kv_with_q_tail_nomask_idx_tensor, long_seq_metadata.tail_attn_nomask_seqlens = split_indices(kv_with_q_tail_nomask_idx, kv_with_q_head_nomask_seqlens)
         self.long_seq_metadata = long_seq_metadata
         return long_seq_metadata
 
-    def _list_to_tensor(self, lst, device, dtype=torch.int32):
-        tensor_npu = torch.zeros(len(lst), dtype=dtype, device=device)
-        tensor_npu.copy_(torch.tensor(lst, dtype=dtype), non_blocking=True)
-        return tensor_npu
+def get_pcp_part_indices(
+    cu_num_tokens: torch.Tensor,
+    M: int,
+    N: int,
+):
+    """
+    When using PCP, we need to split the KV and select local shards for nomask and mask.
+    This function helps get the indices of the selected shards.
+    Args:
+        cu_num_tokens: cumulative number of tokens.
+        M: the number of shards to select.
+        N: the number of shards to split.
+    """
+    starts = cu_num_tokens[:-1]  # [0, 4, 8]
+    ends = cu_num_tokens[1:]  # [4, 8, 16]
+    # nomask part
+    select_len = (ends - starts) * (M - 1) // N  # [2, 2, 4], M=3, N=4
+    select_num_tokens = cu_num_tokens[-1] * (M - 1) // N # 8
+    seq_ids = torch.repeat_interleave(torch.arange(len(select_len)), select_len)  # [0,0,1,1,2,2,2,2]
 
-    def _split_nomask_idx_tensor_list(self, split_with_q_head_nomask_idx_reqs,
-                                      split_kv_with_q_tail_nomask_idx_reqs,
-                                      head_attn_nomask_seqlens, chunk_seqlens):
-        split_q_head_nomask_idx_tensor_list, split_q_tail_nomask_idx_tensor_list= [], []
-        head_attn_nomask_seqlens_list, tail_attn_nomask_seqlens_list = [], []
-        if split_with_q_head_nomask_idx_reqs:
-            #In long-sequence scenarios, the computational cost and latency
-            #of the _npu_ring_mla operator are not proportional, so we split
-            #long sequences into shorter ones to improve performance.
-            split_size = 16 * 1024
-            if self.pcp_rank == 0:
-                split_q_head_nomask_idx_list = [
-                    self.kv_idx_names['kv_with_q_head_nomask_idx_tensor']
-                ]
-            else:
-                split_q_head_nomask_idx_list, split_q_head_nomask_lens_list = self._split_multi_batch_kv_idx(
-                    split_with_q_head_nomask_idx_reqs, split_size)
-            split_q_tail_nomask_idx_list, split_q_tail_nomask_lens_list = self._split_multi_batch_kv_idx(
-                split_kv_with_q_tail_nomask_idx_reqs, split_size)
+    start_loc = torch.cat([[0], torch.cumsum(select_len, 0)[:-1]])  # [0,2,4,8]
+    local_offsets = torch.arange(select_num_tokens) - start_loc[seq_ids]  # [0,1,0,1,0,1,2,3]
+    nomask_indices = starts[seq_ids] + local_offsets # [0,1,4,5,8,9,10,11]
 
-            for q_head_nomask_idx in split_q_head_nomask_idx_list:
-                split_q_head_nomask_idx_tensor_list.append(
-                    self._list_to_tensor(q_head_nomask_idx, self.device))
+    # mask part
+    starts += select_len # [2,6,12]
+    select_len = (ends - starts) // N  # [1, 1, 2], M=3, N=4
+    select_num_tokens = cu_num_tokens[-1] // N # 4
+    seq_ids = torch.repeat_interleave(torch.arange(len(select_len)), select_len)  # [0,1,2,2]
 
-            for q_tail_nomask_idx in split_q_tail_nomask_idx_list:
-                split_q_tail_nomask_idx_tensor_list.append(
-                    self._list_to_tensor(q_tail_nomask_idx, self.device))
+    start_loc = torch.cat([[0], torch.cumsum(select_len, 0)[:-1]])  # [0,1,2,4]
+    local_offsets = torch.arange(select_num_tokens) - start_loc[seq_ids]  # [0,0,0,1]
+    mask_indices = starts[seq_ids] + local_offsets # [2,6,12,13]
+    return nomask_indices, mask_indices
 
-            if self.pcp_rank == 0:
-                head_attn_nomask_seqlens_list = [head_attn_nomask_seqlens]
-            else:
-                for q_head_nomask_lens in split_q_head_nomask_lens_list:
-                    head_attn_nomask_seqlens_list.append(
-                        torch.tensor([chunk_seqlens, q_head_nomask_lens],
-                                     dtype=torch.int32))
-            for q_tail_nomask_lens in split_q_tail_nomask_lens_list:
-                tail_attn_nomask_seqlens_list.append(
-                    torch.tensor([chunk_seqlens, q_tail_nomask_lens],
-                                 dtype=torch.int32))
-        return split_q_head_nomask_idx_tensor_list, split_q_tail_nomask_idx_tensor_list, head_attn_nomask_seqlens_list, tail_attn_nomask_seqlens_list
 
-    def _split_multi_batch_kv_idx(
-        self,
-        kv_nomask_idx_multi_batch,
-        split_size,
-    ):
-        batch_lengths = [len(batch) for batch in kv_nomask_idx_multi_batch]
-        max_batch_length = max(batch_lengths) if batch_lengths else 0
-        time = (max_batch_length + split_size - 1) // split_size
-        split_kv_idx_3d = []
-        split_kv_len_2d = []
-        merged_split_kv_idx_3d = []
+def get_pcp_query_indices(cu_num_tokens: torch.Tensor):
+    starts = cu_num_tokens[:-1]  # [0, 2, 4]
+    ends = cu_num_tokens[1:]  # [2, 4, 8]
+    select_len = (ends - starts) // 2  # [1, 1, 2]
+    select_num_tokens = cu_num_tokens[-1] // 2
 
-        for single_batch in kv_nomask_idx_multi_batch:
-            current_batch_split = []
-            current_batch_len = []
-            for t in range(time):
-                start = t * split_size
-                current_segment = single_batch[start:start + split_size]
-                current_batch_split.append(current_segment)
-                current_batch_len.append(len(current_segment))
+    seq_ids = torch.repeat_interleave(torch.arange(len(select_len)), select_len)  # [0,1,2,2]
 
-            split_kv_idx_3d.append(current_batch_split)
-            split_kv_len_2d.append(current_batch_len)
+    start_loc = torch.cat([[0], torch.cumsum(select_len, 0)[:-1]])  # [0,1,2]
+    local_offsets = torch.arange(select_num_tokens) - start_loc[seq_ids]  # [0,0,0,1]
 
-        for time_idx in range(time):
-            current_time_merged = []
-            for batch in split_kv_idx_3d:
-                current_time_merged.extend(batch[time_idx])
-            merged_split_kv_idx_3d.append(current_time_merged)
+    head_indices = starts[seq_ids] + local_offsets
 
-        def reshape_kv_len_to_time_first(split_kv_len_2d):
-            if not split_kv_len_2d or not split_kv_len_2d[0]:
-                return []
-            return [[batch_len[time_idx] for batch_len in split_kv_len_2d]
-                    for time_idx in range(len(split_kv_len_2d[0]))]
+    start_loc = ends - select_len
+    tail_indices = start_loc[seq_ids] + local_offsets
 
-        merged_split_kv_len_2d = reshape_kv_len_to_time_first(split_kv_len_2d)
-        return merged_split_kv_idx_3d, merged_split_kv_len_2d
+    return head_indices, tail_indices
+
+
+def get_pcp_kv_indices(
+    cu_num_tokens: torch.Tensor,
+    pcp_rank: int,
+    pcp_size: int,
+):
+    kv_head_nomask_indices, kv_head_mask_indices = get_pcp_part_indices(
+        cu_num_tokens,
+        pcp_rank + 1,
+        2 * pcp_size,
+    )
+    kv_tail_nomask_indices, kv_tail_mask_indices = get_pcp_part_indices(
+        cu_num_tokens,
+        2 * pcp_size - pcp_rank,
+        2 * pcp_size,
+    )
+    return (
+        kv_head_nomask_indices, kv_head_mask_indices,
+        kv_tail_nomask_indices, kv_tail_mask_indices
+    )
+    
+def split_indices(
+    indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    chunk_size: int = 16*1024,
+):
+    num_chunks = cdiv(seq_lens.max(), split_size)
+    if num_chunks <= 1:
+        return [indices], [seq_lens]
+    cu_seq_lens = torch.cumsum(seq_lens, 0)
+    seq_starts = torch.cat(
+        [torch.tensor([0]), cu_seq_lens[:-1]]
+    )
+    seq_ends = cu_seq_lens[1:]
+    chunk_starts = min(
+        seq_starts.unsqueeze(0) + torch.arange(num_chunks).unsqueeze(1) * chunk_size,
+        seq_ends
+    )
+    chunk_ends = torch.cat(
+        [chunk_starts[1:], seq_ends.unsqueeze(0)]
+    )
+    chunk_lens = chunk_ends - chunk_starts
+    # TODO(qcs): compare the performance between this impl and index_select
+    chunked_indices = [
+        torch.cat([
+            indices[chunk_starts[cidx, ridx]:chunk_ends[cidx, ridx]]
+            for ridx in range(chunk_starts.shape[1])
+        ])
+        for cidx in range(chunk_starts.shape[0])
+    ]
+    return chunked_indices, chunk_lens
+
