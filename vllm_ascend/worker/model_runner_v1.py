@@ -186,15 +186,8 @@ class ExecuteModelState(NamedTuple):
 class NPUModelRunner(GPUModelRunner):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        # TODO(qcs): These manual pad and unpad for GPUModelRunner are
-        # used to expand some buffers, which need to be reverted after
-        # the following PR is merged:
-        # https://github.com/vllm-project/vllm/pull/28988
-        max_pcp_pad_tokens = vllm_config.parallel_config.prefill_context_parallel_size * 2 * vllm_config.scheduler_config.max_num_seqs
-        vllm_config.scheduler_config.max_num_batched_tokens += max_pcp_pad_tokens
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
-        vllm_config.scheduler_config.max_num_batched_tokens -= max_pcp_pad_tokens
         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.dp_size = vllm_config.parallel_config.data_parallel_size
@@ -216,22 +209,25 @@ class NPUModelRunner(GPUModelRunner):
         if self.pcp_size * self.dcp_size > 1:
             max_buffer_num_tokens = (self.max_num_tokens +
                                      self.max_num_reqs * 2 * self.pcp_size)
+            # TODO(zhenwenqi) after https://github.com/vllm-project/vllm/pull/28988 is merged, we can delete the following buff expansions
+            self.input_ids = self._make_buffer(max_buffer_num_tokens,
+                                               dtype=torch.int32)
+            self.positions = self._make_buffer(max_buffer_num_tokens,
+                                               dtype=torch.int64)
+            self.arange_np = np.arange(
+                max(self.max_num_reqs + 1, self.max_model_len, max_buffer_num_tokens),
+                dtype=np.int64,
+            )
             self.pcp_manager = PCPManager(
                 self.pcp_size,
                 self.pcp_rank,
                 self.dcp_size,
                 self.dcp_rank,
-                max_buffer_num_tokens,
-                self.max_num_reqs,
                 self.device,
                 self.vllm_config,
                 self.pin_memory,
+                self.arange_np,
             )
-            # TODO(zhenwenqi) after https://github.com/vllm-project/vllm/pull/28988 is merged, we can delete this
-            self.input_ids = self._make_buffer(max_buffer_num_tokens,
-                                               dtype=torch.int32)
-            self.positions = self._make_buffer(max_buffer_num_tokens,
-                                               dtype=torch.int64)
         self.sampler = AscendSampler()
         self.attn_state = None
 
@@ -544,8 +540,7 @@ class NPUModelRunner(GPUModelRunner):
             self.pcp_manager.generate_pcp_mtp_input(
                 num_reqs, total_num_scheduled_tokens,
                 scheduler_output.num_scheduled_tokens, with_prefill,
-                self.input_batch, self.arange_np, req_indices, positions_np,
-                cu_num_tokens)
+                self.input_batch, req_indices, positions_np, cu_num_tokens)
 
         if self.pcp_size > 1:
             if not self.vllm_config.model_config.use_mla:
@@ -554,7 +549,6 @@ class NPUModelRunner(GPUModelRunner):
             num_scheduled_tokens[:
                                  num_reqs], position_pcp = self.pcp_manager.update_tokens_for_pcp(
                                      num_scheduled_tokens[:num_reqs],
-                                     self.arange_np,
                                      self.input_batch.num_reqs,
                                      self.reorder_batch_threshold,
                                  )
