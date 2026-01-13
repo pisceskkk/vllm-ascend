@@ -537,13 +537,13 @@ class PCPManager:
             num_actual_tokens_pcp_padded=num_actual_tokens_pcp_padded,
             num_computed_tokens_of_pcp_dcp=num_computed_tokens_of_pcp_dcp.
             numpy())
-        if self.pcp_size > 1:
-            query_lens_cu = torch.cumsum(query_lens_new.gpu[num_decodes:num_reqs])
-            q_head_idx, q_tail_idx = get_pcp_query_indices(query_lens_cu)
+        if self.pcp_size > 1 and num_prefills:
+            prefill_query_lens = query_lens_new[num_decodes:num_reqs].to(self.device)
+            q_head_idx, q_tail_idx = get_pcp_query_indices(prefill_query_lens)
             (kv_with_q_head_nomask_idx, kv_with_q_head_mask_idx,
              kv_with_q_tail_nomask_idx, kv_with_q_tail_mask_idx) = (
                  get_pcp_kv_indices(
-                     query_lens_cu,
+                     prefill_query_lens,
                      self.pcp_rank,
                      self.pcp_size
                  )
@@ -579,7 +579,7 @@ class PCPManager:
         return long_seq_metadata
 
 def get_pcp_part_indices(
-    cu_num_tokens: torch.Tensor,
+    num_tokens: torch.Tensor,
     M: int,
     N: int,
 ):
@@ -591,39 +591,48 @@ def get_pcp_part_indices(
         M: the number of shards to select.
         N: the number of shards to split.
     """
-    starts = cu_num_tokens[:-1]  # [0, 4, 8]
-    ends = cu_num_tokens[1:]  # [4, 8, 16]
+    device = num_tokens.device
+    pad_zero = torch.zeros(1).to(num_tokens)
+
+    ends = torch.cumsum(num_tokens, 0)
+    starts = ends.clone().roll(1, 0)
+    starts[0] = pad_zero
     # nomask part
     select_len = (ends - starts) * (M - 1) // N  # [2, 2, 4], M=3, N=4
-    select_num_tokens = cu_num_tokens[-1] * (M - 1) // N # 8
-    seq_ids = torch.repeat_interleave(torch.arange(len(select_len)), select_len)  # [0,0,1,1,2,2,2,2]
+    select_num_tokens = num_tokens[-1] * (M - 1) // N # 8
+    seq_ids = torch.repeat_interleave(torch.arange(len(select_len), device=device), select_len)  # [0,0,1,1,2,2,2,2]
 
-    start_loc = torch.cat([[0], torch.cumsum(select_len, 0)[:-1]])  # [0,2,4,8]
-    local_offsets = torch.arange(select_num_tokens) - start_loc[seq_ids]  # [0,1,0,1,0,1,2,3]
+    start_loc = torch.cat([pad_zero, torch.cumsum(select_len, 0)[:-1]])  # [0,2,4,8]
+    local_offsets = torch.arange(select_num_tokens, device=device) - start_loc[seq_ids]  # [0,1,0,1,0,1,2,3]
     nomask_indices = starts[seq_ids] + local_offsets # [0,1,4,5,8,9,10,11]
 
     # mask part
     starts += select_len # [2,6,12]
     select_len = (ends - starts) // N  # [1, 1, 2], M=3, N=4
-    select_num_tokens = cu_num_tokens[-1] // N # 4
-    seq_ids = torch.repeat_interleave(torch.arange(len(select_len)), select_len)  # [0,1,2,2]
+    select_num_tokens = num_tokens[-1] // N # 4
+    seq_ids = torch.repeat_interleave(torch.arange(len(select_len), device=device), select_len)  # [0,1,2,2]
 
-    start_loc = torch.cat([[0], torch.cumsum(select_len, 0)[:-1]])  # [0,1,2,4]
-    local_offsets = torch.arange(select_num_tokens) - start_loc[seq_ids]  # [0,0,0,1]
+    start_loc = torch.cat([pad_zero, torch.cumsum(select_len, 0)[:-1]])  # [0,1,2,4]
+    local_offsets = torch.arange(select_num_tokens, device=device) - start_loc[seq_ids]  # [0,0,0,1]
     mask_indices = starts[seq_ids] + local_offsets # [2,6,12,13]
     return nomask_indices, mask_indices
 
 
-def get_pcp_query_indices(cu_num_tokens: torch.Tensor):
-    starts = cu_num_tokens[:-1]  # [0, 2, 4]
-    ends = cu_num_tokens[1:]  # [2, 4, 8]
+def get_pcp_query_indices(num_tokens: torch.Tensor):
+    device = num_tokens.device
+    pad_zero = torch.zeros(1).to(num_tokens)
+
+    ends = torch.cumsum(num_tokens, 0)
+    starts = ends.clone().roll(1, 0)
+    starts[0] = pad_zero
     select_len = (ends - starts) // 2  # [1, 1, 2]
-    select_num_tokens = cu_num_tokens[-1] // 2
+    select_num_tokens = ends[-1] // 2
 
-    seq_ids = torch.repeat_interleave(torch.arange(len(select_len)), select_len)  # [0,1,2,2]
+    seq_ids = torch.repeat_interleave(torch.arange(len(select_len), device=device), select_len)  # [0,1,2,2]
 
-    start_loc = torch.cat([[0], torch.cumsum(select_len, 0)[:-1]])  # [0,1,2]
-    local_offsets = torch.arange(select_num_tokens) - start_loc[seq_ids]  # [0,0,0,1]
+    start_loc = torch.cat([pad_zero, torch.cumsum(select_len, 0)[:-1]])  # [0,1,2]
+    print(f"{num_tokens=}, {select_num_tokens=}, {seq_ids=}, {start_loc=}")
+    local_offsets = torch.arange(select_num_tokens, device=device) - start_loc[seq_ids]  # [0,0,0,1]
 
     head_indices = starts[seq_ids] + local_offsets
 
@@ -634,17 +643,17 @@ def get_pcp_query_indices(cu_num_tokens: torch.Tensor):
 
 
 def get_pcp_kv_indices(
-    cu_num_tokens: torch.Tensor,
+    num_tokens: torch.Tensor,
     pcp_rank: int,
     pcp_size: int,
 ):
     kv_head_nomask_indices, kv_head_mask_indices = get_pcp_part_indices(
-        cu_num_tokens,
+        num_tokens,
         pcp_rank + 1,
         2 * pcp_size,
     )
     kv_tail_nomask_indices, kv_tail_mask_indices = get_pcp_part_indices(
-        cu_num_tokens,
+        num_tokens,
         2 * pcp_size - pcp_rank,
         2 * pcp_size,
     )
