@@ -351,14 +351,29 @@ class NPUPlatform(Platform):
             vllm_config.scheduler_config.enable_chunked_prefill = True
             vllm_config.scheduler_config.SLO_limits_for_dynamic_batch = ascend_config.SLO_limits_for_dynamic_batch
 
+        cp_size = parallel_config.decode_context_parallel_size * parallel_config.prefill_context_parallel_size
         if vllm_config.kv_transfer_config is not None and \
             cache_config.block_size != parallel_config.cp_kv_cache_interleave_size and \
-            parallel_config.decode_context_parallel_size * parallel_config.prefill_context_parallel_size > 1:
+            cp_size > 1:
             raise AssertionError(
                 f"cp_kv_cache_interleave_size({parallel_config.cp_kv_cache_interleave_size}) "
                 f"and block_size({cache_config.block_size}) "
                 "needs to be equal if use pcp or dcp > 1 in P/D disaggregate and kv pool scenario."
             )
+
+        use_sparse = hasattr(vllm_config.model_config.hf_text_config, "index_topk")
+        if (
+            use_sparse and
+            cp_size > 1 and
+            parallel_config.cp_kv_cache_interleave_size != cache_config.block_size
+        ):
+            logger.warning_once(
+                "The current SFA's PCP&DCP implementation requires"
+                f"cp_kv_cache_interleave_size({parallel_config.cp_kv_cache_interleave_size})"
+                f" == block_size({cache_config.block_size}). "
+                f"Override cp_kv_cache_interleave_size to {cache_config.block_size}."
+            )
+            vllm_config.parallel_config.cp_kv_cache_interleave_size = cache_config.block_size
 
         # NOTE: vllm sets `speculative_config.enforce_eager` as True if using
         # deepseek_v32 with mtp. Since we support graph mode, we simply ignore
