@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as dist
@@ -29,6 +29,9 @@ class AscendPCPMetadata:
     block_table_cp: torch.Tensor = None
     valid_block_ids: torch.Tensor = None
     prefill_q_cum_seqlens: torch.Tensor = None
+    pcp_fa_query_idx: torch.Tensor = None
+    pcp_padded_tokens_fla: int = 0
+    pcp_enter_fa_restore_idx: torch.Tensor = None
 
 
 @dataclass
@@ -77,6 +80,7 @@ class AscendMetadataForPrefill:
 
     """ Prefill Specific Metadata for Ascend"""
     pcp_metadata: AscendPCPMetadata | None = None
+    pcp_allgather_restore_idx: list[int] | None = None
     chunked_context: ChunkedContextMetadata | None = None
     block_tables: torch.Tensor = None
     actual_seq_lengths_q: torch.Tensor = None
