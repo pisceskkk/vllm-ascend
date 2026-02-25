@@ -150,8 +150,10 @@ class AscendAttentionCPMetadataBuilder(AscendAttentionMetadataBuilder):
             query_lens = query_lens[num_decode_tokens:]
             context_lens_cpu = num_computed_tokens_cpu[num_decodes:num_reqs]
             max_context_len_cpu = context_lens_cpu.max().item()
-            pcp_size = get_pcp_group().world_size
+            attn_mask_seqlens = common_long_seq_metadata.attn_mask_seqlens
             if self.chunked_prefill_enabled and max_context_len_cpu > 0:
+                if self.pcp_size > 1:
+                    query_lens = attn_mask_seqlens[0] * 2
                 local_context_lens_allranks = (
                     torch.tensor(num_computed_tokens_of_pcp_dcp)[num_decodes:num_reqs]
                     .to(self.device)
@@ -168,7 +170,7 @@ class AscendAttentionCPMetadataBuilder(AscendAttentionMetadataBuilder):
                 # when only using dcp.
                 if self.pcp_size > 1:
                     kv_inverse_idx_for_chunk = torch.argsort(
-                        common_long_seq_metadata.pcp_allgather_restore_idx[pcp_size * num_decode_tokens :].to(
+                        common_long_seq_metadata.pcp_allgather_restore_idx[self.pcp_size * num_decode_tokens :].to(
                             torch.float32
                         )
                     )
@@ -185,7 +187,7 @@ class AscendAttentionCPMetadataBuilder(AscendAttentionMetadataBuilder):
                     self.device
                 )
                 chunked_context_metadata = AscendMetadataForPrefill.ChunkedContextMetadata(
-                    actual_chunk_seq_lengths=torch.cumsum(query_lens * pcp_size, dim=0),
+                    actual_chunk_seq_lengths=torch.cumsum(query_lens * self.pcp_size, dim=0),
                     actual_seq_lengths_kv=actual_seq_lengths_kv,
                     chunked_req_mask=chunked_req_mask,
                     starts=local_chunk_starts,
@@ -196,10 +198,9 @@ class AscendAttentionCPMetadataBuilder(AscendAttentionMetadataBuilder):
                     chunk_seq_mask_filtered_indices=chunk_seq_mask_filtered_indices,
                     local_total_toks=local_total_toks.item(),
                 )
-            attn_mask_seqlens = common_long_seq_metadata.attn_mask_seqlens
             head_attn_nomask_seqlens = common_long_seq_metadata.head_attn_nomask_seqlens
             tail_attn_nomask_seqlens = common_long_seq_metadata.tail_attn_nomask_seqlens
-            if pcp_size > 1:
+            if self.pcp_size > 1:
                 attn_mask_seqlens = torch.cumsum(attn_mask_seqlens[0], dim=0).tolist()
                 head_attn_nomask_seqlens = torch.cumsum(head_attn_nomask_seqlens[1], dim=0).tolist()
                 tail_attn_nomask_seqlens = torch.cumsum(tail_attn_nomask_seqlens[1], dim=0).tolist()
@@ -223,7 +224,7 @@ class AscendAttentionCPMetadataBuilder(AscendAttentionMetadataBuilder):
 
             prefill_metadata = AscendMetadataForPrefill(
                 pcp_metadata=pcp_metadata,
-                pcp_allgather_restore_idx=common_long_seq_metadata.pcp_allgather_restore_idx
+                pcp_exit_fa_scatter_idx=common_long_seq_metadata.pcp_exit_fa_scatter_idx
                 if common_long_seq_metadata is not None
                 else None,
                 chunked_context=chunked_context_metadata,
@@ -545,7 +546,7 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
         assert self.value_cache is not None
 
         if self.dcp_size > 1:
-            query = get_dcp_group().all_gather(query, 1)
+            query = get_dcp_group().all_gather(query.contiguous(), 1)
             num_heads = self.num_heads * self.dcp_size
         else:
             num_heads = self.num_heads
@@ -937,13 +938,13 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
 
             # qkv init
             num_actual_tokens_pcp_padded = attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size
-            prefill_query = query[num_decode_tokens:num_actual_tokens_pcp_padded].contiguous()
             key = key[self.pcp_size * num_decode_tokens :].contiguous()
             value = value[self.pcp_size * num_decode_tokens :].contiguous()
             if attn_metadata.use_hybrid_attn:
                 assert attn_metadata.prefill.pcp_metadata is not None
                 fa_query_idx = attn_metadata.prefill.pcp_metadata.pcp_fa_query_idx
                 prefill_query = torch.index_select(query[self.pcp_size * num_decode_tokens :], 0, fa_query_idx)
+                prefill_query = query[:fa_query_idx.shape[0]]
             else:
                 prefill_query = query[num_decode_tokens:num_actual_tokens_pcp_padded]
 
@@ -999,7 +1000,7 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
                     attn_metadata,
                 )
 
-            if attn_metadata.prefill is not None and attn_metadata.prefill.chunked_context is not None:
+            if has_chunked_context:
                 # update the output of current chunk with context part
                 torch.npu.current_stream().wait_stream(cp_chunkedprefill_comm_stream())
                 global_context_output = global_context_output.permute([2, 0, 1]).contiguous()
@@ -1008,11 +1009,11 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
                     attn_output_prefill, attn_lse_prefill, context_output, context_lse, prefill_query, attn_metadata
                 )
 
-            if attn_metadata.use_hybrid_attn:
+            if attn_metadata.use_hybrid_attn and self.pcp_size > 1:
                 # layer_idx != num_layers - 1
-                pcp_allgather_restore_idx = attn_metadata.prefill.pcp_allgather_restore_idx
+                pcp_exit_fa_scatter_idx = attn_metadata.prefill.pcp_exit_fa_scatter_idx
                 attn_output_prefill = get_pcp_group().all_gather(attn_output_prefill.contiguous(), dim=0)
-                attn_output_prefill = torch.index_select(attn_output_prefill, 0, pcp_allgather_restore_idx)
+                attn_output_prefill = torch.index_select(attn_output_prefill, 0, pcp_exit_fa_scatter_idx)
                 fla_padding = attn_output_prefill.shape[0] + num_decode_tokens - output.shape[0]
                 output = F.pad(output, pad=(0, 0, 0, 0, 0, fla_padding), mode="constant", value=0)
 
