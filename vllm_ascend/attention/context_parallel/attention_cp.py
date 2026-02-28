@@ -131,7 +131,7 @@ class AscendAttentionCPMetadataBuilder(AscendAttentionMetadataBuilder):
             if long_seq_metadata
             else None
         )
-        use_hybrid_attn = long_seq_metadata.pcp_use_hybrid_attn if long_seq_metadata else False
+        use_hybrid_attn = long_seq_metadata.use_hybrid_attn if long_seq_metadata else False
         if num_actual_tokens_pcp_padded is None:
             num_actual_tokens_pcp_padded = num_actual_tokens
 
