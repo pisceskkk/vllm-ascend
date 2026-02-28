@@ -399,13 +399,25 @@ class PCPManager:
             # decode reorder idx
             enter_fa_decode_restore_idx = None
             if self.num_decode_reqs > 0:
-                # [0,1,2], [4,4,4] -> [0,0,0,0,1,1,1,1,2,2,2,2]
-                num_decode_pcp_size = np.ones(self.num_decode_reqs, dtype=np.int64) * self.pcp_world_size
-                decode_reqs_offset = np.repeat(np.arange(self.num_decode_reqs, dtype=np.int64), num_decode_pcp_size)
-                decode_ranks_offset = (
-                    self._get_cumsum_and_arange(num_decode_pcp_size, arange_np)[1] * max_scheduled_tokens
+                # For MTP speculative decoding, each decode request may have
+                # multiple tokens (decode_threshold > 1). We need to create
+                # restore entries for ALL decode tokens, not just 1 per request.
+                # Layout after restore: grouped by (request, rank, token),
+                # matching the non-hybrid pcp_allgather_restore_idx layout.
+                decode_tokens_per_req = num_scheduled_tokens[:self.num_decode_reqs]
+                num_entries_per_group = np.repeat(decode_tokens_per_req, self.pcp_world_size)
+                req_starts = np.zeros(self.num_decode_reqs, dtype=np.int64)
+                if self.num_decode_reqs > 1:
+                    req_starts[1:] = np.cumsum(decode_tokens_per_req[:-1])
+                rank_offsets = np.tile(
+                    np.arange(self.pcp_world_size, dtype=np.int64) * max_scheduled_tokens,
+                    self.num_decode_reqs,
                 )
-                enter_fa_decode_restore_idx = np.add(decode_reqs_offset, decode_ranks_offset)
+                req_offsets = np.repeat(req_starts, self.pcp_world_size)
+                group_base = req_offsets + rank_offsets
+                _, token_arange = self._get_cumsum_and_arange(num_entries_per_group, arange_np)
+                group_starts = np.repeat(group_base, num_entries_per_group)
+                enter_fa_decode_restore_idx = group_starts + token_arange
 
             if enter_fa_decode_restore_idx is not None and enter_fa_prefill_restore_idx is not None:
                 pcp_enter_fa_restore_idx = torch.from_numpy(
