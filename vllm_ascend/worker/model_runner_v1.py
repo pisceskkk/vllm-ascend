@@ -1235,7 +1235,7 @@ class NPUModelRunner(GPUModelRunner):
 
                 (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded
-                    if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
+                    if not (self.use_cp and self.pcp_manager.use_hybrid_attn)
                     else total_num_scheduled_tokens,
                     num_tokens_padded=num_tokens_padded,
                     num_reqs=num_reqs,
@@ -1259,7 +1259,7 @@ class NPUModelRunner(GPUModelRunner):
             ) = self._preprocess(
                 scheduler_output,
                 num_tokens_padded
-                if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
+                if not (self.use_cp and self.pcp_manager.use_hybrid_attn)
                 else total_num_scheduled_tokens,
                 intermediate_tensors,
             )
@@ -1929,9 +1929,9 @@ class NPUModelRunner(GPUModelRunner):
 
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
 
-        def _get_pcp_metadata(block_table_tensor):
+        def _get_pcp_metadata():
             if not self.use_cp:
-                return None, block_table_tensor
+                return None
             return self.pcp_manager.generate_pcp_metadata(
                 num_tokens,
                 self.query_lens,
@@ -1983,12 +1983,13 @@ class NPUModelRunner(GPUModelRunner):
                     num_tokens_padded,
                     slot_mapping,
                 )
+                blk_table_tensor = self.pcp_manager.flatten_block_table(blk_table_tensor, num_reqs_padded)
             if self.model_config.enable_return_routed_experts and kv_cache_gid == 0:
                 self.cpu_slot_mapping = slot_mapping.cpu().numpy()
             return blk_table_tensor, slot_mapping
 
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
-        self.long_seq_metadata, block_table_gid_0 = _get_pcp_metadata(block_table_gid_0)
+        self.long_seq_metadata = _get_pcp_metadata()
 
         cm_base = AscendCommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],

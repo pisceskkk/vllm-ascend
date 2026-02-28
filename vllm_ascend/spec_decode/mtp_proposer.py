@@ -223,7 +223,7 @@ class MtpProposer(EagleProposer):
             num_tokens_d = query_lens_d.sum().item()
             input_ids_d = self.input_ids[:num_tokens_d]
             input_ids_p = self.input_ids[num_tokens_d:num_tokens]
-            if self.runner.pcp_manager.pcp_use_hybrid_attn:
+            if self.runner.pcp_manager.use_hybrid_attn:
                 # For hybrid attention (qwen3_next), decode hidden states
                 # are NOT duplicated by pcp_size after restoration.
                 num_tokens_d_padded = num_tokens_d
@@ -271,7 +271,6 @@ class MtpProposer(EagleProposer):
 
         assert self.runner is not None
 
-        # Note(qcs): We may need to refactor these check logics.
         if self.use_cuda_graph and num_scheduled_tokens <= self.runner.cudagraph_batch_sizes[-1]:
             num_input_tokens = self.runner.cudagraph_dispatcher._bs_to_padded_graph_size[num_scheduled_tokens]
         else:
