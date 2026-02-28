@@ -207,3 +207,53 @@ class TestEnterFaDecodeRestoreIdx:
         #                       req1_t0_r0, req1_t1_r0, req1_t0_r1, req1_t1_r1]
         assert logits_indices[0] == 3  # index 3 = req0_t1_r1
         assert logits_indices[1] == 7  # index 7 = req1_t1_r1
+
+    def test_restore_idx_slice_size_mtp(self):
+        """
+        Verify that the pcp_enter_fa_restore_idx slice size in
+        generate_pcp_metadata is correct for MTP decode (multiple
+        tokens per decode request).
+        """
+        pcp_size = 2
+        num_decode_reqs = 2
+        num_decode_tokens = 4  # 2 tokens per req
+        num_scheduled_tokens = np.array([2, 2], dtype=np.int64)
+        max_scheduled_tokens = 4
+
+        # Compute restore idx
+        idx = compute_enter_fa_decode_restore_idx(
+            num_decode_reqs, num_scheduled_tokens, pcp_size, max_scheduled_tokens
+        )
+
+        # Build pcp_unpad_mask for decode tokens
+        # For each decode token, pcp_size entries: [True, False] repeated
+        pcp_unpad_mask = np.zeros(num_decode_tokens * pcp_size, dtype=bool)
+        pcp_unpad_mask.reshape([-1, pcp_size])[:, 0] = True
+
+        # The slice formula should match the actual idx size
+        slice_size = sum(pcp_unpad_mask) + num_decode_tokens * (pcp_size - 1)
+        assert slice_size == len(idx), (
+            f"Slice size {slice_size} != actual idx size {len(idx)}. "
+            f"Using num_decode_tokens={num_decode_tokens} "
+            f"(not num_decode_reqs={num_decode_reqs})"
+        )
+
+    def test_restore_idx_slice_size_non_mtp(self):
+        """
+        Verify slice size is also correct for non-MTP (1 token per request).
+        """
+        pcp_size = 2
+        num_decode_reqs = 3
+        num_decode_tokens = 3  # 1 token per req = same as num_reqs
+        num_scheduled_tokens = np.array([1, 1, 1], dtype=np.int64)
+        max_scheduled_tokens = 3
+
+        idx = compute_enter_fa_decode_restore_idx(
+            num_decode_reqs, num_scheduled_tokens, pcp_size, max_scheduled_tokens
+        )
+
+        pcp_unpad_mask = np.zeros(num_decode_tokens * pcp_size, dtype=bool)
+        pcp_unpad_mask.reshape([-1, pcp_size])[:, 0] = True
+
+        slice_size = sum(pcp_unpad_mask) + num_decode_tokens * (pcp_size - 1)
+        assert slice_size == len(idx)

@@ -507,6 +507,10 @@ class PCPManager:
                 restore_idx,
             )
         else:
+            # Slice to actual token count before all_gather to remove
+            # any CUDA Graph padding (same as non-hybrid path).
+            num_actual_local = self.num_actual_tokens_pcp_padded // self.pcp_world_size
+            hidden_states = hidden_states[:num_actual_local]
             if self.pcp_padded_tokens_fla > 0:
                 hidden_states = F.pad(
                     hidden_states, pad=(0, 0, 0, self.pcp_padded_tokens_fla), mode="constant", value=0
@@ -815,12 +819,6 @@ class PCPManager:
     ):
         from vllm_ascend.attention.utils import AscendPrefillContextParallelMetadata
 
-        query_lens_new = (
-            self.query_lens_pcp_full.cpu[:num_reqs]
-            if self.pcp_world_size > 1 and self.speculative_config
-            else query_lens
-        )
-        num_decodes = (query_lens_new <= self.decode_threshold).sum().item()
         num_actual_tokens_pcp_padded = total_num_scheduled_tokens * self.pcp_world_size
         self.num_actual_tokens_pcp_padded = num_actual_tokens_pcp_padded
         long_seq_metadata = None
@@ -983,15 +981,19 @@ class PCPManager:
                 long_seq_metadata.pcp_allgather_restore_idx = self.pcp_allgather_restore_idx.gpu[
                     :num_actual_tokens_pcp_padded
                 ]
+                # For MTP speculative decoding, num_decode_tokens may be > num_decodes
+                # (multiple tokens per decode request). Use num_decode_tokens
+                # instead of num_decodes to correctly size the index slices.
+                num_decode_tokens = self.num_decode_tokens
                 if self.use_hybrid_attn:
                     long_seq_metadata.pcp_exit_fa_scatter_idx = self.pcp_exit_fa_scatter_idx.gpu[
-                        : sum(num_scheduled_tokens) - num_decodes
+                        : sum(num_scheduled_tokens) - num_decode_tokens
                     ]
                 long_seq_metadata.pcp_fa_query_idx = self.pcp_fa_query_idx[
-                    : num_actual_tokens_pcp_padded // self.pcp_world_size - num_decodes
+                    : num_actual_tokens_pcp_padded // self.pcp_world_size - num_decode_tokens
                 ]
                 long_seq_metadata.pcp_enter_fa_restore_idx = self.pcp_enter_fa_restore_idx[
-                    : sum(pcp_unpad_mask) + num_decodes * (self.pcp_world_size - 1)
+                    : sum(pcp_unpad_mask) + num_decode_tokens * (self.pcp_world_size - 1)
                 ]
 
                 long_seq_metadata.q_head_idx_tensor = self.q_head_idx_tensor
