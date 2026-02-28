@@ -233,10 +233,23 @@ class MtpProposer(EagleProposer):
             input_ids_d = self.input_ids[:num_tokens_d]
             input_ids_p = self.input_ids[num_tokens_d:num_tokens]
             if self.runner.pcp_manager.use_hybrid_attn:
-                # For hybrid attention (qwen3_next), decode hidden states
-                # are NOT duplicated by pcp_size after restoration.
-                num_tokens_d_padded = num_tokens_d
-                target_hidden_states_d = target_hidden_states[:num_tokens_d]
+                # For hybrid attention (qwen3_next), after the restore index
+                # fix, decode hidden states are now duplicated by pcp_size
+                # (same layout as non-hybrid). Use the same un-duplication
+                # logic to extract rank0's tokens for each request.
+                num_tokens_d_padded = num_tokens_d * self.pcp_size
+                target_hidden_states_d_padded = target_hidden_states[:num_tokens_d_padded]
+                if num_tokens_d:
+                    mask_start_loc = torch.cat(
+                        [torch.tensor([0], dtype=torch.int32), torch.cumsum(query_lens_d * self.pcp_size, dim=0)[:-1]]
+                    )
+                    mask_len = query_lens_d
+                    mask = []
+                    for req_id in range(num_decode_reqs):
+                        mask += list(range(mask_start_loc[req_id], mask_start_loc[req_id] + mask_len[req_id]))
+                    target_hidden_states_d = target_hidden_states_d_padded[mask]
+                else:
+                    target_hidden_states_d = target_hidden_states_d_padded
             else:
                 num_tokens_d_padded = num_tokens_d * self.pcp_size
                 target_hidden_states_d_padded = target_hidden_states[:num_tokens_d_padded]

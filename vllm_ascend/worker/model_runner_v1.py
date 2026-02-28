@@ -765,7 +765,10 @@ class NPUModelRunner(GPUModelRunner):
                     tokens_original_tensor = torch.tensor(tokens_original, dtype=torch.int32)
                     num_prefill_reqs = (tokens_original_tensor > self.decode_threshold).sum().item()
                     num_decode_reqs = num_reqs - num_prefill_reqs
-                    decode_pads = self.pcp_manager.pcp_pads_logits_hybrid_attn[:num_decode_reqs]
+                    # For MTP with decode_threshold > 1, each decode request
+                    # has multiple tokens, each duplicated by pcp_size in the
+                    # restored hidden states. Scale pads by tokens per request.
+                    decode_pads = tokens_original_tensor[:num_decode_reqs] * (self.pcp_size - 1)
                     pad_len = tokens_original_tensor.shape[0] - num_decode_reqs
                     tokens_logits = tokens_original_tensor + nn.functional.pad(decode_pads, (0, pad_len), value=0)
                     logits_indices = torch.cumsum(tokens_logits, dim=0) - 1
