@@ -100,11 +100,14 @@ def causal_conv1d_fn(
     """
     forward_context = get_forward_context()
     num_decodes = 0
-    attn_metadata = forward_context.attn_metadata
-    if attn_metadata is not None and isinstance(attn_metadata, dict):
-        attn_metadata = next(iter(attn_metadata.values()), None)
-    if attn_metadata is not None:
-        num_decodes = attn_metadata.num_decodes
+    if metadata is not None and hasattr(metadata, "num_decodes"):
+        num_decodes = metadata.num_decodes
+    else:
+        attn_metadata = forward_context.attn_metadata
+        if attn_metadata is not None and isinstance(attn_metadata, dict):
+            attn_metadata = next(iter(attn_metadata.values()), None)
+        if attn_metadata is not None:
+            num_decodes = attn_metadata.num_decodes
 
     if activation not in [None, "silu", "swish"]:
         raise NotImplementedError("activation must be None, silu, or swish")
