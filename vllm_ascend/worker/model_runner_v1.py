@@ -625,7 +625,7 @@ class NPUModelRunner(GPUModelRunner):
                 position_pcp[:total_num_scheduled_tokens],
                 out=positions_np,
             )
-        if self.pcp_size > 1 and self.pcp_manager.pcp_use_hybrid_attn:
+        if self.pcp_size > 1 and self.pcp_manager.use_hybrid_attn:
             assert self.pcp_manager.num_scheduled_tokens_padded is not None
             self.query_lens = torch.from_numpy(self.pcp_manager.num_scheduled_tokens_padded)
         else:
@@ -1937,7 +1937,6 @@ class NPUModelRunner(GPUModelRunner):
                 self.query_lens,
                 self.input_batch,
                 num_scheduled_tokens_np,
-                block_table_tensor,
                 num_reqs_padded,
                 num_reqs,
             )
@@ -1947,7 +1946,7 @@ class NPUModelRunner(GPUModelRunner):
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
             if self.pcp_size > 1:
                 total_num_pcp_pads = sum(self.pcp_manager.num_pcp_pads_cpu[:num_reqs])
-                if self.pcp_manager.pcp_use_hybrid_attn:
+                if self.pcp_manager.use_hybrid_attn:
                     num_scheduled_tokens_padded = self.pcp_manager.num_scheduled_tokens_padded
                     assert num_scheduled_tokens_padded is not None
                     maybe_pcp_full_tokens = sum(num_scheduled_tokens_padded) * self.pcp_size - total_num_pcp_pads

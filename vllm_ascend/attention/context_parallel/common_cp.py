@@ -25,7 +25,7 @@ class AscendPCPMetadata:
     head_attn_nomask_seqlens: torch.Tensor = None
     tail_attn_nomask_seqlens: torch.Tensor = None
     q_full_idx: torch.Tensor = None
-    pcp_use_hybrid_attn: bool = False
+    use_hybrid_attn: bool = False
     pcp_unpad_mask: torch.Tensor = None
     pcp_allgather_restore_idx: list[int] | None = None
     pcp_fa_query_idx: torch.Tensor = None

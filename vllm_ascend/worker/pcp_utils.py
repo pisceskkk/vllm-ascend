@@ -459,7 +459,7 @@ class PCPManager:
         num_reqs: int,
         tokens_original: list[int] | None = None,
     ):
-        if not self.pcp_use_hybrid_attn or tokens_original is None:
+        if not self.use_hybrid_attn or tokens_original is None:
             logits_indices = (
                 torch.from_numpy(cu_num_tokens) * self.pcp_world_size
                 - self.num_pcp_pads_cpu_tensor[: self.num_reqs]
@@ -478,7 +478,7 @@ class PCPManager:
     def get_padded_slot_mapping(self, num_tokens: int, num_tokens_padded: int, slot_mapping: torch.Tensor):
         # After pcp allgather and restore, there are padded tokens in kv,
         # so we need pad slotmapping for alignment.
-        if self.pcp_use_hybrid_attn:
+        if self.use_hybrid_attn:
             assert self.num_scheduled_tokens_padded is not None
             num_tokens = self.num_scheduled_tokens_padded.sum()
         pcp_padded_slot_mapping = (
@@ -489,7 +489,7 @@ class PCPManager:
         cp_unpad_mask = self.pcp_unpad_mask_cpu_tensor[: num_tokens * self.pcp_world_size]
         pcp_padded_slot_mapping.fill_(-1)
         pcp_padded_slot_mapping[: num_tokens * self.pcp_world_size][cp_unpad_mask] = slot_mapping
-        if self.pcp_use_hybrid_attn:
+        if self.use_hybrid_attn:
             return pcp_padded_slot_mapping.clone()
         else:
             return pcp_padded_slot_mapping
@@ -822,7 +822,7 @@ class PCPManager:
     ):
         from vllm_ascend.attention.utils import AscendPrefillContextParallelMetadata
 
-        if self.pcp_world_size > 1 and self.pcp_use_hybrid_attn:
+        if self.pcp_world_size > 1 and self.use_hybrid_attn:
             assert self.num_scheduled_tokens_padded is not None
             total_num_scheduled_tokens = self.num_scheduled_tokens_padded.sum()
         query_lens_new = (

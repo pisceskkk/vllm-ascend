@@ -212,7 +212,7 @@ class AscendAttentionCPMetadataBuilder(AscendAttentionMetadataBuilder):
                 head_attn_nomask_seqlens=head_attn_nomask_seqlens,
                 tail_attn_nomask_seqlens=tail_attn_nomask_seqlens,
                 q_full_idx=common_long_seq_metadata.q_full_idx,
-                pcp_use_hybrid_attn=common_long_seq_metadata.pcp_use_hybrid_attn,
+                use_hybrid_attn=common_long_seq_metadata.use_hybrid_attn,
                 pcp_unpad_mask=common_long_seq_metadata.pcp_unpad_mask,
                 pcp_allgather_restore_idx=common_long_seq_metadata.pcp_allgather_restore_idx,
                 pcp_fa_query_idx=common_long_seq_metadata.pcp_fa_query_idx,
@@ -777,7 +777,7 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
             if has_prefill:
                 if self.pcp_size > 1:
                     assert attn_metadata.prefill is not None and attn_metadata.prefill.pcp_metadata is not None
-                    if not attn_metadata.prefill.pcp_metadata.pcp_use_hybrid_attn:
+                    if not attn_metadata.prefill.pcp_metadata.use_hybrid_attn:
                         kv = torch.cat([key, value], dim=-1)
                         num_actual_tokens_pcp_padded = attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size
                         all_kv = get_pcp_group().all_gather(kv[:num_actual_tokens_pcp_padded].contiguous(), dim=0)
@@ -909,12 +909,12 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
         has_decode = attn_metadata.num_decodes > 0
         has_prefill = attn_metadata.num_prefills > 0
         num_decode_tokens = attn_metadata.num_decode_tokens
-        pcp_use_hybrid_attn = False
+        use_hybrid_attn = False
         if has_prefill:
             assert attn_metadata.prefill is not None and attn_metadata.prefill.pcp_metadata is not None
-            pcp_use_hybrid_attn = attn_metadata.prefill.pcp_metadata.pcp_use_hybrid_attn
+            use_hybrid_attn = attn_metadata.prefill.pcp_metadata.use_hybrid_attn
         if has_decode:
-            if pcp_use_hybrid_attn:
+            if use_hybrid_attn:
                 decode_query = query[: num_decode_tokens * self.pcp_size : self.pcp_size].contiguous()
             else:
                 decode_query = query[:num_decode_tokens].contiguous()
@@ -934,7 +934,7 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
 
             # qkv init
             num_actual_tokens_pcp_padded = attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size
-            if pcp_use_hybrid_attn:
+            if use_hybrid_attn:
                 prefill_query = query[self.pcp_size * num_decode_tokens :]
                 assert attn_metadata.prefill is not None and attn_metadata.prefill.pcp_metadata is not None
                 fa_query_idx = attn_metadata.prefill.pcp_metadata.pcp_fa_query_idx
@@ -1005,7 +1005,7 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
                     attn_output_prefill, attn_lse_prefill, context_output, context_lse, prefill_query, attn_metadata
                 )
 
-            if self.pcp_size > 1 and pcp_use_hybrid_attn:
+            if self.pcp_size > 1 and use_hybrid_attn:
                 # layer_idx != num_layers - 1
                 assert attn_metadata.prefill.pcp_metadata is not None
                 pcp_exit_fa_scatter_idx = attn_metadata.prefill.pcp_exit_fa_scatter_idx
