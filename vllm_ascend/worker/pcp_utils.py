@@ -326,7 +326,7 @@ class PCPManager:
             self.total_pcp_padding_tokens_fla = 0
             # have prefills
             if self.num_reqs - self.num_decode_reqs > 0:
-                prefill_tokens_tensor = torch.Tensor(num_scheduled_tokens[self.num_decode_tokens :])
+                prefill_tokens_tensor = torch.Tensor(num_scheduled_tokens[self.num_decode_reqs :])
                 # [num_prefill_reqs, pcp_world_size, 1] [[3,2]] [[2,2,2,1],[2,1,1,1]]
                 num_prefill_tokens_allranks = (
                     self._get_cp_local_seq_lens(prefill_tokens_tensor, self.pcp_world_size, 1, 1).long().numpy()
@@ -425,7 +425,7 @@ class PCPManager:
                     self.num_decode_reqs * self.pcp_world_size :
                 ]
                 # [0] | [0,7]
-                ori_tokens_start_loc = np.roll(np.cumsum(num_scheduled_tokens[self.num_decode_tokens :]), 1)
+                ori_tokens_start_loc = np.roll(np.cumsum(num_scheduled_tokens[self.num_decode_reqs :]), 1)
                 ori_tokens_start_loc[0] = 0
                 # [0,1,2] [3,4] | [0,1,7,8] [2,3,9] [4,5,10] [6,11]
                 exit_fa_scatter_indices = positions_linear[self.num_decode_reqs :] + np.repeat(
@@ -750,13 +750,30 @@ class PCPManager:
             # Same as block_table, we flatten decode seq_lens to query_lens,
             # and keep prefill seq_lens unchanged.
             for decode_idx in range(self.decode_threshold):
-                num_computed_tokens_of_pcp_dcp[self.decode_threshold - 1 - decode_idx :: self.decode_threshold] = (
-                    self._get_cp_local_seq_lens(
+                if self.pcp_use_hybrid_attn:
+                    # For hybrid attention (e.g. qwen3_next), the KV cache is
+                    # fully replicated across PCP ranks via all-gather before
+                    # reshape_and_cache. So each PCP rank has the full context,
+                    # not a split portion. Use pcp_world_size=1 to avoid
+                    # splitting, then expand to all PCP ranks.
+                    local_seq_lens = self._get_cp_local_seq_lens(
+                        torch.tensor(context_lens) - decode_idx,
+                        1,
+                        self.dcp_world_size,
+                        self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
+                    )
+                    local_seq_lens = local_seq_lens.expand(
+                        -1, self.pcp_world_size, -1
+                    ).contiguous()
+                else:
+                    local_seq_lens = self._get_cp_local_seq_lens(
                         torch.tensor(context_lens) - decode_idx,
                         self.pcp_world_size,
                         self.dcp_world_size,
                         self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
                     )
+                num_computed_tokens_of_pcp_dcp[self.decode_threshold - 1 - decode_idx :: self.decode_threshold] = (
+                    local_seq_lens
                 )
             ori_query_lens_cpu = None
             if self.decode_threshold > 1:
