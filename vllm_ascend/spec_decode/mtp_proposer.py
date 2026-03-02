@@ -221,22 +221,28 @@ class MtpProposer(EagleProposer):
             # prefill input_ids: add padding and pcp split
             # prefill target_hidden_states: pcp split
             num_tokens_d = query_lens_d.sum().item()
-            num_tokens_d_padded = num_tokens_d * self.pcp_size
             input_ids_d = self.input_ids[:num_tokens_d]
             input_ids_p = self.input_ids[num_tokens_d:num_tokens]
-            target_hidden_states_d_padded = target_hidden_states[:num_tokens_d_padded]
-            if num_tokens_d:
-                # remove padding (from pcp all-gather) in decode part
-                mask_start_loc = torch.cat(
-                    [torch.tensor([0], dtype=torch.int32), torch.cumsum(query_lens_d * self.pcp_size, dim=0)[:-1]]
-                )
-                mask_len = query_lens_d
-                mask = []
-                for req_id in range(num_decode_reqs):
-                    mask += list(range(mask_start_loc[req_id], mask_start_loc[req_id] + mask_len[req_id]))
-                target_hidden_states_d = target_hidden_states_d_padded[mask]
+            if self.runner.pcp_manager.pcp_use_hybrid_attn:
+                # For hybrid attention (qwen3_next), decode hidden states
+                # are NOT duplicated by pcp_size after restoration.
+                num_tokens_d_padded = num_tokens_d
+                target_hidden_states_d = target_hidden_states[:num_tokens_d]
             else:
-                target_hidden_states_d = target_hidden_states_d_padded
+                num_tokens_d_padded = num_tokens_d * self.pcp_size
+                target_hidden_states_d_padded = target_hidden_states[:num_tokens_d_padded]
+                if num_tokens_d:
+                    # remove padding (from pcp all-gather) in decode part
+                    mask_start_loc = torch.cat(
+                        [torch.tensor([0], dtype=torch.int32), torch.cumsum(query_lens_d * self.pcp_size, dim=0)[:-1]]
+                    )
+                    mask_len = query_lens_d
+                    mask = []
+                    for req_id in range(num_decode_reqs):
+                        mask += list(range(mask_start_loc[req_id], mask_start_loc[req_id] + mask_len[req_id]))
+                    target_hidden_states_d = target_hidden_states_d_padded[mask]
+                else:
+                    target_hidden_states_d = target_hidden_states_d_padded
             target_hidden_states_p = target_hidden_states[num_tokens_d_padded:]
             req_scheduled_tokens_p = {}
             for i, req_id in enumerate(self.runner.input_batch.req_ids):
@@ -362,11 +368,7 @@ class MtpProposer(EagleProposer):
 
             if self.pcp_size > 1 and step == 0:
                 # remove graph padding before all_gather
-                hidden_states = hidden_states[:num_tokens]
-                hidden_states = get_pcp_group().all_gather(hidden_states, 0)
-                hidden_states = torch.index_select(
-                    hidden_states, 0, self.runner.pcp_manager.pcp_allgather_restore_idx.gpu[: hidden_states.shape[0]]
-                )
+                hidden_states = self.pcp_manager.get_restore_hidden_states(hidden_states[:num_tokens])
 
             sample_hidden_states = hidden_states[last_token_indices]
             logits = self.model.compute_logits(sample_hidden_states)
