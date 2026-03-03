@@ -426,6 +426,7 @@ class EagleProposer(VllmEagleProposer):
             common_attn_metadata.prefill_context_parallel_metadata = long_seq_metadata
             ori_last_token_indices = last_token_indices.clone()
             query_lens_d = self.runner.query_lens[:num_decode_reqs]
+        print("*"*50, "Start pcp params modification", flush=True)
         if self.pcp_size > 1:
             # 1. preprocess decode/prefill input_ids & target_hidden_states
             # decode input_ids: keep unchanged
@@ -433,22 +434,28 @@ class EagleProposer(VllmEagleProposer):
             # prefill input_ids: add padding and pcp split
             # prefill target_hidden_states: pcp split
             num_tokens_d = query_lens_d.sum().item()
-            num_tokens_d_padded = num_tokens_d * self.pcp_size
             input_ids_d = self.input_ids[:num_tokens_d]
             input_ids_p = self.input_ids[num_tokens_d:num_tokens]
-            target_hidden_states_d_padded = target_hidden_states[:num_tokens_d_padded]
-            if num_tokens_d:
-                # remove padding (from pcp all-gather) in decode part
-                mask_start_loc = torch.cat(
-                    [torch.tensor([0], dtype=torch.int32), torch.cumsum(query_lens_d * self.pcp_size, dim=0)[:-1]]
-                )
-                mask_len = query_lens_d
-                mask = []
-                for req_id in range(num_decode_reqs):
-                    mask += list(range(mask_start_loc[req_id], mask_start_loc[req_id] + mask_len[req_id]))
-                target_hidden_states_d = target_hidden_states_d_padded[mask]
+            if self.runner.pcp_manager.use_hybrid_attn:
+                # For hybrid attention (qwen3_next), decode hidden states
+                # are NOT duplicated by pcp_size after restoration.
+                num_tokens_d_padded = num_tokens_d
+                target_hidden_states_d = target_hidden_states[:num_tokens_d]
             else:
-                target_hidden_states_d = target_hidden_states_d_padded
+                num_tokens_d_padded = num_tokens_d * self.pcp_size
+                target_hidden_states_d_padded = target_hidden_states[:num_tokens_d_padded]
+                if num_tokens_d:
+                    # remove padding (from pcp all-gather) in decode part
+                    mask_start_loc = torch.cat(
+                        [torch.tensor([0], dtype=torch.int32), torch.cumsum(query_lens_d * self.pcp_size, dim=0)[:-1]]
+                    )
+                    mask_len = query_lens_d
+                    mask = []
+                    for req_id in range(num_decode_reqs):
+                        mask += list(range(mask_start_loc[req_id], mask_start_loc[req_id] + mask_len[req_id]))
+                    target_hidden_states_d = target_hidden_states_d_padded[mask]
+                else:
+                    target_hidden_states_d = target_hidden_states_d_padded
             target_hidden_states_p = target_hidden_states[num_tokens_d_padded:]
             req_scheduled_tokens_p = {}
             for i, req_id in enumerate(self.runner.input_batch.req_ids):
@@ -474,6 +481,7 @@ class EagleProposer(VllmEagleProposer):
                 query_start_loc_p = cu_num_tokens_p[1:] + common_attn_metadata.query_start_loc[num_decode_reqs].item()
                 common_attn_metadata.query_start_loc[-num_prefill_reqs:] = query_start_loc_p
                 common_attn_metadata.query_start_loc_cpu[-num_prefill_reqs:] = query_start_loc_p
+        print("*"*50, "Finish pcp params modification", flush=True)
         if self.use_cuda_graph and num_tokens <= self.runner.cudagraph_batch_sizes[-1]:
             num_input_tokens = self.runner.cudagraph_dispatcher._bs_to_padded_graph_size[num_tokens]
             if not (
@@ -612,6 +620,9 @@ class EagleProposer(VllmEagleProposer):
                     for layer_name in self.attn_layer_names:
                         per_layer_attn_metadata[layer_name] = attn_metadata
                     multi_steps_attn_metadata.append(per_layer_attn_metadata)
+                print(f"{common_attn_metadata.block_table_tensor =}")
+                print("*"*50, "fold block_table", flush=True)
+            print("*"*50, "?"*20, flush=True)
         else:
             # Copy the old attn_metadata and update
             for draft_step in range(1, self.num_speculative_tokens):
@@ -632,6 +643,7 @@ class EagleProposer(VllmEagleProposer):
         last_token_indices_len = last_token_indices.shape[0]
         self.last_token_indices[:last_token_indices_len].copy_(last_token_indices)
 
+        print("*"*50, "Before Runnable", flush=True)
         with set_ascend_forward_context(
             multi_steps_attn_metadata[0],
             self.vllm_config,
@@ -643,6 +655,7 @@ class EagleProposer(VllmEagleProposer):
             is_draft_model=True,
             draft_attn_metadatas=multi_steps_attn_metadata,
         ):
+            print(f"{multi_steps_attn_metadata=}")
             # Reset MOE layer index for forward pass
             forward_context = get_forward_context()
             if forward_context is not None:
@@ -662,6 +675,7 @@ class EagleProposer(VllmEagleProposer):
             forward_context = get_forward_context()
             if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
                 self._update_full_graph_params(forward_context, num_input_tokens, multi_steps_attn_metadata)
+        print("*"*50, "After Runnable", flush=True)
         return draft_token_ids
 
     def _run_merged_draft(

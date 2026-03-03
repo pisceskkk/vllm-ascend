@@ -1938,7 +1938,6 @@ class NPUModelRunner(GPUModelRunner):
                 self.input_batch,
                 num_scheduled_tokens_np,
                 num_reqs_padded,
-                num_reqs,
             )
 
         def _get_block_table_and_slot_mapping(kv_cache_gid: int):

@@ -126,7 +126,6 @@ class PCPManager:
         )
         self.use_hybrid_attn = self.vllm_config.model_config.hf_config.model_type == "qwen3_next"
 
-        self.pcp_pads_logits_hybrid_attn = torch.ones(self.max_num_reqs, dtype=torch.int32) * (self.pcp_world_size - 1)
         self.pcp_padded_tokens_fla = 0
         self.pcp_padded_tokens_length = 0
         self.num_scheduled_tokens_padded = None
@@ -168,6 +167,7 @@ class PCPManager:
         self.num_decode_reqs = first_prefill
         self.num_prefill_reqs = num_reqs - self.num_decode_reqs
         self.num_decode_tokens = num_scheduled_tokens[: self.num_decode_reqs].sum()
+        print(f" {self.num_decode_reqs =}, {self.num_prefill_reqs =}, {self.num_decode_tokens =}, ", flush=True)
 
     def update_tokens_for_pcp(
         self,
@@ -326,8 +326,8 @@ class PCPManager:
                 )
             self.total_pcp_padding_tokens_fla = 0
             # have prefills
-            if self.num_reqs - self.num_decode_reqs > 0:
-                prefill_tokens_tensor = torch.Tensor(num_scheduled_tokens[self.num_decode_tokens :])
+            if self.num_prefill_reqs > 0:
+                prefill_tokens_tensor = torch.Tensor(num_scheduled_tokens[self.num_decode_reqs :])
                 # [num_prefill_reqs, pcp_world_size, 1] [[3,2]] [[2,2,2,1],[2,1,1,1]]
                 num_prefill_tokens_allranks = (
                     self._get_cp_local_seq_lens(prefill_tokens_tensor, self.pcp_world_size, 1, 1).long().numpy()
@@ -346,7 +346,7 @@ class PCPManager:
                 # [0,1,2] [0,1] | [0,1,0,1] [0,1,0] [0,1,0] [0,0]
                 # -> [0,1,2] [3,4] | [0,1,0,1] [2,3,2] [4,5,3] [6,4]
                 _, positions_linear = self._get_cumsum_and_arange(num_padded_scheduled_tokens, arange_np)
-                positions_linear[self.num_decode_reqs :] = positions_linear[self.num_decode_reqs :] + np.repeat(
+                positions_linear[self.num_decode_tokens :] = positions_linear[self.num_decode_tokens :] + np.repeat(
                     num_prefill_tokens_cu_ranks, num_prefill_scheduled_tokens_linear
                 )
 
@@ -359,7 +359,7 @@ class PCPManager:
 
             max_scheduled_tokens = max_scheduled_prefill_tokens + self.num_decode_tokens
             enter_fa_prefill_restore_idx = None
-            if self.num_reqs - self.num_decode_reqs > 0:
+            if self.num_prefill_reqs > 0:
                 # prefill reorder idx
                 # [[3,2]] [[2,2,2,1],[2,2,1,1],[1,1,1,1]]
                 num_prefill_tokens_allranks = num_prefill_tokens_allranks[..., 0]
@@ -394,7 +394,9 @@ class PCPManager:
             enter_fa_decode_restore_idx = None
             if self.num_decode_reqs > 0:
                 # [0,1,2], [4,4,4] -> [0,0,0,0,1,1,1,1,2,2,2,2]
-                num_decode_pcp_size = np.ones(self.num_decode_reqs, dtype=np.int64) * self.pcp_world_size
+                num_decode_pcp_size = (
+                    np.full(self.num_decode_reqs, self.decode_threshold * self.pcp_world_size, dtype=np.int64)
+                )
                 decode_reqs_offset = np.repeat(np.arange(self.num_decode_reqs, dtype=np.int64), num_decode_pcp_size)
                 decode_ranks_offset = (
                     self._get_cumsum_and_arange(num_decode_pcp_size, arange_np)[1] * max_scheduled_tokens
@@ -414,7 +416,7 @@ class PCPManager:
                 pcp_enter_fa_restore_idx.long(), non_blocking=True
             )
 
-            if self.num_reqs > self.num_decode_reqs:
+            if self.num_prefill_reqs:
                 all_positions_prefill = [
                     get_current_rank_positions(padded_pos_start_loc, rank_i)[self.num_decode_tokens :]
                     - self.num_decode_tokens * self.pcp_world_size
@@ -426,10 +428,10 @@ class PCPManager:
                     self.num_decode_reqs * self.pcp_world_size :
                 ]
                 # [0] | [0,7]
-                ori_tokens_start_loc = np.roll(np.cumsum(num_scheduled_tokens[self.num_decode_tokens :]), 1)
+                ori_tokens_start_loc = np.roll(np.cumsum(num_scheduled_tokens[self.num_decode_reqs :]), 1)
                 ori_tokens_start_loc[0] = 0
                 # [0,1,2] [3,4] | [0,1,7,8] [2,3,9] [4,5,10] [6,11]
-                exit_fa_scatter_indices = positions_linear[self.num_decode_reqs :] + np.repeat(
+                exit_fa_scatter_indices = positions_linear[self.num_decode_tokens :] + np.repeat(
                     ori_tokens_start_loc, num_prefill_scheduled_tokens_linear
                 )
 
@@ -467,12 +469,8 @@ class PCPManager:
             )
         else:
             tokens_original_tensor = torch.tensor(tokens_original, dtype=torch.int32)
-            num_prefill_reqs = (tokens_original_tensor > self.decode_threshold).sum().item()
-            num_decode_reqs = num_reqs - num_prefill_reqs
-            decode_pads = self.pcp_pads_logits_hybrid_attn[:num_decode_reqs]
-            pad_len = tokens_original_tensor.shape[0] - num_decode_reqs
-            tokens_logits = tokens_original_tensor + F.pad(decode_pads, (0, pad_len), value=0)
-            logits_indices = torch.cumsum(tokens_logits, dim=0) - 1
+            tokens_original_tensor[:self.num_decode_reqs] *= self.pcp_world_size
+            logits_indices = torch.cumsum(tokens_original_tensor, dim=0) - 1
         return logits_indices
 
     def get_padded_slot_mapping(self, num_tokens: int, num_tokens_padded: int, slot_mapping: torch.Tensor):
@@ -790,25 +788,27 @@ class PCPManager:
         block_table_tensor: torch.Tensor,
         num_reqs_padded: int,
     ):
-        # For pcp + spec decode, we flatten block_table
-        # to avoid irregular attn_mask shape, e.g.,
-        # num_decode_req=2, num_prefill_req=3, num_speculative_tokens=1,
-        # ori block_table: # [d0, d1, p0, p1, p2]
-        # (num_reqs_d + num_reqs_p, max_num_blocks),
-        # flattened block_table: [d0, d0, d1, d1, p0, p1, p2]
-        # (num_reqs_d * decode_threshold + num_reqs_p, max_num_blocks),
-        ori_query_lens_cpu = self.query_lens_pcp_full.cpu[:num_reqs_padded]
-        ori_query_lens = self.query_lens_pcp_full.gpu[:num_reqs_padded]
-        num_decode_reqs_flatten = ori_query_lens_cpu[:self.num_decode_reqs].sum().item()
-        num_prefill_reqs = self.num_prefill_reqs
-        num_decode_reqs = self.num_decode_reqs
-        block_table_tensor[num_decode_reqs_flatten : num_decode_reqs_flatten + num_prefill_reqs].copy_(
-            block_table_tensor[num_decode_reqs : num_decode_reqs + num_prefill_reqs].clone()
-        )
-        block_table_tensor[:num_decode_reqs_flatten].copy_(
-            block_table_tensor[:num_decode_reqs].repeat_interleave(ori_query_lens[:num_decode_reqs], dim=0)
-        )
-        block_table_tensor = block_table_tensor[: num_decode_reqs_flatten + num_prefill_reqs]
+        if self.use_hybrid_attn:
+            # For pcp + spec decode, we flatten block_table
+            # to avoid irregular attn_mask shape, e.g.,
+            # num_decode_req=2, num_prefill_req=3, num_speculative_tokens=1,
+            # ori block_table: # [d0, d1, p0, p1, p2]
+            # (num_reqs_d + num_reqs_p, max_num_blocks),
+            # flattened block_table: [d0, d0, d1, d1, p0, p1, p2]
+            # (num_reqs_d * decode_threshold + num_reqs_p, max_num_blocks),
+            ori_query_lens_cpu = self.query_lens_pcp_full.cpu[:num_reqs_padded]
+            ori_query_lens = self.query_lens_pcp_full.gpu[:num_reqs_padded]
+            num_decode_reqs_flatten = ori_query_lens_cpu[:self.num_decode_reqs].sum().item()
+            num_prefill_reqs = self.num_prefill_reqs
+            num_decode_reqs = self.num_decode_reqs
+            block_table_tensor[num_decode_reqs_flatten : num_decode_reqs_flatten + num_prefill_reqs].copy_(
+                block_table_tensor[num_decode_reqs : num_decode_reqs + num_prefill_reqs].clone()
+            )
+            block_table_tensor[:num_decode_reqs_flatten].copy_(
+                block_table_tensor[:num_decode_reqs].repeat_interleave(ori_query_lens[:num_decode_reqs], dim=0)
+            )
+            block_table_tensor = block_table_tensor[: num_decode_reqs_flatten + num_prefill_reqs]
+            
         return block_table_tensor
 
     def generate_pcp_metadata(
@@ -818,19 +818,12 @@ class PCPManager:
         input_batch: "NPUInputBatch",
         num_scheduled_tokens: np.ndarray | None,
         num_reqs_padded: int,
-        num_reqs: int,
     ):
         from vllm_ascend.attention.utils import AscendPrefillContextParallelMetadata
 
         if self.pcp_world_size > 1 and self.use_hybrid_attn:
             assert self.num_scheduled_tokens_padded is not None
             total_num_scheduled_tokens = self.num_scheduled_tokens_padded.sum()
-        query_lens_new = (
-            self.query_lens_pcp_full.cpu[:num_reqs]
-            if self.pcp_world_size > 1 and self.speculative_config
-            else query_lens
-        )
-        num_decodes = (query_lens_new <= self.decode_threshold).sum().item()
         num_actual_tokens_pcp_padded = total_num_scheduled_tokens * self.pcp_world_size
         self.num_actual_tokens_pcp_padded = num_actual_tokens_pcp_padded
         long_seq_metadata = None
@@ -851,13 +844,30 @@ class PCPManager:
             # Same as block_table, we flatten decode seq_lens to query_lens,
             # and keep prefill seq_lens unchanged.
             for decode_idx in range(self.decode_threshold):
-                num_computed_tokens_of_pcp_dcp[self.decode_threshold - 1 - decode_idx :: self.decode_threshold] = (
-                    self._get_cp_local_seq_lens(
+                if self.use_hybrid_attn:
+                    # For hybrid attention (e.g. qwen3_next), the KV cache is
+                    # fully replicated across PCP ranks via all-gather before
+                    # reshape_and_cache. So each PCP rank has the full context,
+                    # not a split portion. Use pcp_world_size=1 to avoid
+                    # splitting, then expand to all PCP ranks.
+                    local_seq_lens = self._get_cp_local_seq_lens(
+                        torch.tensor(context_lens) - decode_idx,
+                        1,
+                        self.dcp_world_size,
+                        self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
+                    )
+                    local_seq_lens = local_seq_lens.expand(
+                        -1, self.pcp_world_size, -1
+                    ).contiguous()
+                else:
+                    local_seq_lens = self._get_cp_local_seq_lens(
                         torch.tensor(context_lens) - decode_idx,
                         self.pcp_world_size,
                         self.dcp_world_size,
                         self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
                     )
+                num_computed_tokens_of_pcp_dcp[self.decode_threshold - 1 - decode_idx :: self.decode_threshold] = (
+                    local_seq_lens
                 )
             ori_query_lens_cpu = None
             if self.decode_threshold > 1:
@@ -880,8 +890,8 @@ class PCPManager:
                     )
                 num_computed_tokens_of_pcp_dcp = torch.cat(num_computed_tokens_of_pcp_dcp_list, dim=0)
                 ori_query_lens_cpu = self.query_lens_pcp_full.cpu[:num_reqs_padded]
-                if num_reqs_padded > num_reqs:
-                    pad_size = num_reqs_padded - num_reqs
+                if num_reqs_padded > self.num_reqs:
+                    pad_size = num_reqs_padded - self.num_reqs
                     ori_query_lens_cpu[-pad_size:] = torch.full([pad_size], ori_query_lens_cpu[-pad_size - 1].item())
             pcp_unpad_mask = self.pcp_unpad_mask_cpu[: self.pcp_padded_tokens_length]
             long_seq_metadata = AscendPrefillContextParallelMetadata(
@@ -995,13 +1005,13 @@ class PCPManager:
                 ]
                 if self.use_hybrid_attn:
                     long_seq_metadata.pcp_exit_fa_scatter_idx = self.pcp_exit_fa_scatter_idx.gpu[
-                        : num_scheduled_tokens.sum() - num_decodes
+                        : num_scheduled_tokens.sum() - self.num_decode_tokens
                     ]
                     long_seq_metadata.pcp_fa_query_idx = self.pcp_fa_query_idx[
-                        : num_actual_tokens_pcp_padded // self.pcp_world_size - num_decodes
+                        : num_actual_tokens_pcp_padded // self.pcp_world_size - self.num_decode_tokens
                     ]
                     long_seq_metadata.pcp_enter_fa_restore_idx = self.pcp_enter_fa_restore_idx[
-                        : pcp_unpad_mask.sum() + num_decodes * (self.pcp_world_size - 1)
+                        : pcp_unpad_mask.sum() + self.num_decode_tokens * (self.pcp_world_size - 1)
                     ]
                 long_seq_metadata.q_head_idx_tensor = self.q_head_idx_tensor
                 long_seq_metadata.q_tail_idx_tensor = self.q_tail_idx_tensor
