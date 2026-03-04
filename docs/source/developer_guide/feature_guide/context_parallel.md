@@ -127,3 +127,9 @@ By predefining the maximum amount of KV cache processed per round, we sequential
 - sequences splitting and metadata prepare: `vllm_ascend/worker/model_runner_v1.py`
 - GQA backend: `vllm_ascend/attention/attention_cp.py`
 - MLA backend: `vllm_ascend/attention/mla_cp.py`
+
+## Attention Metadata Details
+
+For a detailed breakdown of the `attention_metadata` data structures used in CP (including all fields of `AscendPrefillContextParallelMetadata`, `AscendCommonAttentionMetadata`, the construction chain, and PCP/DCP differences), see:
+
+[Context Parallel Attention Metadata 开发指南](context_parallel_attention_metadata.md)
