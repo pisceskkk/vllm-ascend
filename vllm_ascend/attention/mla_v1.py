@@ -1006,6 +1006,12 @@ class AscendMLAImpl(MLAAttentionImpl):
             kv_c_normed = torch.empty(toks, num_heads, latent_kv_dim, dtype=q_nope.dtype, device=q_nope.device)
             k_pe = torch.empty(toks, num_heads, rope_dim, dtype=q_nope.dtype, device=q_nope.device)
 
+            logger.info(
+                "!!!!! DefaultStream mla.chunk.cache_load.begin "
+                "chunk_idx=%s toks=%s",
+                i,
+                toks,
+            )
             torch_npu.atb.npu_paged_cache_load(
                 cache_kv_c,
                 cache_k_pe,
@@ -1014,6 +1020,12 @@ class AscendMLAImpl(MLAAttentionImpl):
                 seq_starts=prefill_metadata.chunked_context.starts[i],
                 key=kv_c_normed,
                 value=k_pe,
+            )
+            logger.info(
+                "!!!!! DefaultStream mla.chunk.cache_load.end "
+                "chunk_idx=%s toks=%s",
+                i,
+                toks,
             )
             kv_c_normed, k_pe = self._reorg_kvcache(
                 kv_c_normed,
@@ -1028,6 +1040,12 @@ class AscendMLAImpl(MLAAttentionImpl):
             k_pe = k_pe.expand((*k_nope.shape[:-1], -1))
 
             mask = attn_metadata.attn_mask
+            logger.info(
+                "!!!!! DefaultStream mla.chunk.ring_mla.begin "
+                "chunk_idx=%s toks=%s",
+                i,
+                toks,
+            )
             torch_npu.atb.npu_ring_mla(
                 q_nope=q_nope,
                 q_rope=q_pe,
@@ -1047,6 +1065,12 @@ class AscendMLAImpl(MLAAttentionImpl):
                 calc_type="calc_type_default",
                 output=prefix_output,
                 softmax_lse=prefix_lse,
+            )
+            logger.info(
+                "!!!!! DefaultStream mla.chunk.ring_mla.end "
+                "chunk_idx=%s toks=%s",
+                i,
+                toks,
             )
         return prefix_output, prefix_lse
 

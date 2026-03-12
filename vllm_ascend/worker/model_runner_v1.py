@@ -1308,8 +1308,22 @@ class NPUModelRunner(GPUModelRunner):
                 ),
                 self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
             ):
+                logger.info(
+                    "!!!!! DefaultStream execute_model.forward.begin "
+                    "num_tokens_padded=%s num_scheduled_tokens=%s is_last_pp=%s",
+                    num_tokens_padded,
+                    scheduler_output.total_num_scheduled_tokens,
+                    get_pp_group().is_last_rank,
+                )
                 hidden_states = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                )
+                logger.info(
+                    "!!!!! DefaultStream execute_model.forward.end "
+                    "num_tokens_padded=%s num_scheduled_tokens=%s output_type=%s",
+                    num_tokens_padded,
+                    scheduler_output.total_num_scheduled_tokens,
+                    type(hidden_states).__name__,
                 )
         else:
             with (
@@ -1330,8 +1344,22 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output, clear_metadata=clear_kv_metadata
                 ) as kv_connector_output,
             ):
+                logger.info(
+                    "!!!!! DefaultStream execute_model.forward.begin "
+                    "num_tokens_padded=%s num_scheduled_tokens=%s is_last_pp=%s",
+                    num_tokens_padded,
+                    scheduler_output.total_num_scheduled_tokens,
+                    get_pp_group().is_last_rank,
+                )
                 hidden_states = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                )
+                logger.info(
+                    "!!!!! DefaultStream execute_model.forward.end "
+                    "num_tokens_padded=%s num_scheduled_tokens=%s output_type=%s",
+                    num_tokens_padded,
+                    scheduler_output.total_num_scheduled_tokens,
+                    type(hidden_states).__name__,
                 )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
@@ -1370,7 +1398,18 @@ class NPUModelRunner(GPUModelRunner):
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
+                logger.info(
+                    "!!!!! DefaultStream execute_model.compute_logits.begin "
+                    "sample_hidden_states_shape=%s",
+                    tuple(sample_hidden_states.shape),
+                )
                 logits = self.model.compute_logits(sample_hidden_states)
+                logger.info(
+                    "!!!!! DefaultStream execute_model.compute_logits.end "
+                    "logits_shape=%s logits_dtype=%s",
+                    tuple(logits.shape),
+                    logits.dtype,
+                )
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -1461,7 +1500,16 @@ class NPUModelRunner(GPUModelRunner):
             logits = logits.to(self.device).to(logits_dtype)
 
         with record_function_or_nullcontext("sample_token"):
+            logger.info(
+                "!!!!! DefaultStream sample_tokens.sample.begin logits_shape=%s",
+                tuple(logits.shape),
+            )
             sampler_output = self._sample(logits, spec_decode_metadata)
+            logger.info(
+                "!!!!! DefaultStream sample_tokens.sample.end "
+                "sampled_token_ids_shape=%s",
+                tuple(sampler_output.sampled_token_ids.shape),
+            )
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -1500,6 +1548,12 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states,
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
+        )
+        logger.info(
+            "!!!!! DefaultStream sample_tokens.bookkeeping.end "
+            "valid_rows=%s invalid_req_count=%s",
+            len(valid_sampled_token_ids),
+            len(invalid_req_indices),
         )
 
         with record_function_or_nullcontext("draft_token"):
