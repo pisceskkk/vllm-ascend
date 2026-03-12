@@ -211,6 +211,7 @@ class ExecuteModelState(NamedTuple):
     positions: torch.Tensor
     ec_connector_output: "ECConnectorOutput | None"
     cudagraph_stats: CUDAGraphStat | None
+    stage_events: dict[str, torch.Event]
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -1184,6 +1185,11 @@ class NPUModelRunner(GPUModelRunner):
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
+                stage_events: dict[str, torch.Event] = {}
+                if self.vllm_config.parallel_config.data_parallel_size > 1 and num_tokens_across_dp is not None:
+                    dp_sync_done_event = torch.Event()
+                    dp_sync_done_event.record()
+                    stage_events["dp_sync_done"] = dp_sync_done_event
 
                 logger.debug(
                     "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -1305,6 +1311,7 @@ class NPUModelRunner(GPUModelRunner):
                     model_instance=self.model,
                     max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
                     skip_compiled=has_encoder_input,
+                    stage_events=stage_events,
                 ),
                 self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
             ):
@@ -1325,6 +1332,9 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output.total_num_scheduled_tokens,
                     type(hidden_states).__name__,
                 )
+                forward_done_event = torch.Event()
+                forward_done_event.record()
+                stage_events["forward_done"] = forward_done_event
         else:
             with (
                 record_function_or_nullcontext("forward"),
@@ -1339,6 +1349,7 @@ class NPUModelRunner(GPUModelRunner):
                     model_instance=self.model,
                     max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
                     skip_compiled=has_encoder_input,
+                    stage_events=stage_events,
                 ),
                 self.maybe_get_kv_connector_output(
                     scheduler_output, clear_metadata=clear_kv_metadata
@@ -1361,6 +1372,9 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output.total_num_scheduled_tokens,
                     type(hidden_states).__name__,
                 )
+                forward_done_event = torch.Event()
+                forward_done_event.record()
+                stage_events["forward_done"] = forward_done_event
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -1410,6 +1424,9 @@ class NPUModelRunner(GPUModelRunner):
                     tuple(logits.shape),
                     logits.dtype,
                 )
+                compute_logits_done_event = torch.Event()
+                compute_logits_done_event.record()
+                stage_events["compute_logits_done"] = compute_logits_done_event
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -1444,6 +1461,7 @@ class NPUModelRunner(GPUModelRunner):
                 positions,
                 ec_connector_output,
                 cudagraph_stats,
+                dict(stage_events),
             )
             self.kv_connector_output = kv_connector_output
         return None
@@ -1486,6 +1504,7 @@ class NPUModelRunner(GPUModelRunner):
             positions,
             ec_connector_output,
             cudagraph_stats,
+            stage_events,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -1510,6 +1529,8 @@ class NPUModelRunner(GPUModelRunner):
                 "sampled_token_ids_shape=%s",
                 tuple(sampler_output.sampled_token_ids.shape),
             )
+            sample_done_event = torch.Event()
+            sample_done_event.record()
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -1555,6 +1576,8 @@ class NPUModelRunner(GPUModelRunner):
             len(valid_sampled_token_ids),
             len(invalid_req_indices),
         )
+        bookkeeping_done_event = torch.Event()
+        bookkeeping_done_event.record()
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
@@ -1621,14 +1644,24 @@ class NPUModelRunner(GPUModelRunner):
 
         if not self.use_async_scheduling:
             return model_runner_output
-        return AsyncGPUModelRunnerOutput(
+        stage_events = {
+            **stage_events,
+            "sample_done": sample_done_event,
+            "bookkeeping_done": bookkeeping_done_event,
+        }
+        async_output = AsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
             sampled_token_ids=sampler_output.sampled_token_ids,
             logprobs_tensors=sampler_output.logprobs_tensors,
             invalid_req_indices=invalid_req_indices,
             async_output_copy_stream=self.async_output_copy_stream,
             vocab_size=self.input_batch.vocab_size,
+            stage_events=stage_events,
         )
+        async_output_ctor_done_event = torch.Event()
+        async_output_ctor_done_event.record()
+        async_output._stage_events["async_output_ctor_done"] = async_output_ctor_done_event
+        return async_output
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):

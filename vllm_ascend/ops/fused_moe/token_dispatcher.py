@@ -27,6 +27,7 @@ import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import get_ep_group
+from vllm.forward_context import get_forward_context
 
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.parallel_state import get_mc2_group
@@ -69,6 +70,17 @@ class MoETokenDispatcher(ABC):
     @property
     def ep_size(self):
         return get_ep_group().world_size
+
+    def _record_stage_event(self, event_name: str) -> None:
+        forward_context = get_forward_context()
+        if forward_context is None:
+            return
+        stage_events = getattr(forward_context, "stage_events", None)
+        if not stage_events:
+            return
+        event = torch.Event()
+        event.record()
+        stage_events[event_name] = event
 
     @abstractmethod
     def token_dispatch(
@@ -216,6 +228,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
             if self.enable_dispatch_v2
             else torch_npu.npu_moe_distribute_dispatch(**kwargs_mc2)
         )
+        self._record_stage_event("moe_mc2_dispatch_done")
         # comm_stream.wait_stream(torch.npu.current_stream())
         (
             expand_x,
@@ -305,6 +318,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
             if self.enable_dispatch_v2
             else torch_npu.npu_moe_distribute_combine(**kwargs_mc2)
         )
+        self._record_stage_event("moe_mc2_combine_done")
 
         return TokenCombineResult(
             routed_out=combined_output,
@@ -508,10 +522,12 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
             self.ep_group,
         )
         handle.wait()
+        self._record_stage_event("moe_alltoall_dispatch_done")
         hidden_states.untyped_storage().resize_(0)
 
         # 3. Postprocess using metadata
         output = self._combine_postprocess(permutated_local_input_tokens, context_metadata)
+        self._record_stage_event("moe_alltoall_combine_done")
 
         return TokenCombineResult(routed_out=output)
 
