@@ -932,12 +932,26 @@ def get_hccl_config_for_pg_options(group_name: str) -> dict | None:
     # based on HCCL_BUFFSIZE configuration. Using pg_options with mc2 group would
     # result in memory misalignment problems.
     if group_name and "mc2" in group_name:
+        logger.info_once(
+            "!!!!! Skip HCCL pg_options for group=%s. MC2 custom ops use HCCL_BUFFSIZE=%s MB.",
+            group_name,
+            os.getenv("HCCL_BUFFSIZE", "unset"),
+            scope="process",
+        )
         return None
     hccl_config_map = {
         "dp": {"hccl_buffer_size": calculate_dp_buffer_size()},
         "dynamic_eplb": {"hccl_buffer_size": _DYNAMIC_EPLB_BUFFER_SIZE},
     }
-    return hccl_config_map.get(group_name, get_default_buffer_config())
+    hccl_config = hccl_config_map.get(group_name, get_default_buffer_config())
+    if group_name == "dp":
+        logger.info_once(
+            "!!!!! Configure HCCL pg_options for group=%s with hccl_buffer_size=%s MB.",
+            group_name,
+            hccl_config["hccl_buffer_size"],
+            scope="process",
+        )
+    return hccl_config
 
 
 def get_default_buffer_config() -> dict:

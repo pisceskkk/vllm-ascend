@@ -8,6 +8,7 @@ import vllm.v1.executor.multiproc_executor
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
+from vllm.logger import init_logger
 from vllm.utils.network_utils import get_distributed_init_method, get_loopback_ip, get_open_port
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.executor.abstract import FailureCallback
@@ -18,6 +19,8 @@ from vllm.v1.executor.multiproc_executor import (
     WorkerProc,
     set_multiprocessing_worker_envs,
 )
+
+logger = init_logger(__name__)
 
 
 class AscendMultiprocExecutor(MultiprocExecutor):
@@ -146,6 +149,23 @@ class AscendMultiprocExecutor(MultiprocExecutor):
 
     def _is_driver_worker(self, rank: int) -> bool:
         return rank % self.parallel_config.tensor_parallel_size == 0
+
+    def execute_dummy_batch(self) -> None:
+        timeout = envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS
+        logger.info(
+            "!!!!! Executor starting execute_dummy_batch: timeout=%s output_rank=%s dp_size=%s tp_size=%s pp_size=%s",
+            timeout,
+            self.output_rank,
+            self.parallel_config.data_parallel_size,
+            self.parallel_config.tensor_parallel_size,
+            self.parallel_config.pipeline_parallel_size,
+        )
+        try:
+            self.collective_rpc("execute_dummy_batch", unique_reply_rank=self.output_rank, timeout=timeout)
+        except Exception:
+            logger.exception("!!!!! Executor execute_dummy_batch failed or timed out.")
+            raise
+        logger.info("!!!!! Executor finished execute_dummy_batch.")
 
 
 class AscendWorkerProc(WorkerProc):

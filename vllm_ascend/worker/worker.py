@@ -19,6 +19,7 @@
 
 import copy
 import gc
+import time
 from types import NoneType
 
 import torch
@@ -59,6 +60,7 @@ from vllm_ascend.utils import (
     get_ascend_device_type,
     register_ascend_customop,
 )
+from vllm_ascend.ascend_forward_context import select_moe_comm_method
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
@@ -375,6 +377,16 @@ class NPUWorker(WorkerBase):
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+        pp_rank = get_pp_group().rank_in_group
+        logger.info(
+            "!!!!! Worker execute_model enter: rank=%s local_rank=%s pp_rank=%s "
+            "total_num_scheduled_tokens=%s forward_pass=%s",
+            self.rank,
+            self.local_rank,
+            pp_rank,
+            scheduler_output.total_num_scheduled_tokens,
+            forward_pass,
+        )
         if forward_pass and not get_pp_group().is_first_rank:
             # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
             # it will conflict with the all-gather operation in flashcomm1.
@@ -382,11 +394,30 @@ class NPUWorker(WorkerBase):
                 all_gather_group = None
             else:
                 all_gather_group = get_tp_group()
+            logger.info(
+                "!!!!! Worker execute_model recv_intermediate.begin: rank=%s local_rank=%s pp_rank=%s",
+                self.rank,
+                self.local_rank,
+                pp_rank,
+            )
             intermediate_tensors = IntermediateTensors(
                 get_pp_group().recv_tensor_dict(all_gather_group=all_gather_group)
             )
+            logger.info(
+                "!!!!! Worker execute_model recv_intermediate.end: rank=%s local_rank=%s pp_rank=%s",
+                self.rank,
+                self.local_rank,
+                pp_rank,
+            )
 
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        logger.info(
+            "!!!!! Worker execute_model model_runner_return: rank=%s local_rank=%s pp_rank=%s output_type=%s",
+            self.rank,
+            self.local_rank,
+            pp_rank,
+            type(output).__name__,
+        )
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 
@@ -399,7 +430,19 @@ class NPUWorker(WorkerBase):
             all_gather_group = None
         else:
             all_gather_group = get_tp_group()
+        logger.info(
+            "!!!!! Worker execute_model send_intermediate.begin: rank=%s local_rank=%s pp_rank=%s",
+            self.rank,
+            self.local_rank,
+            pp_rank,
+        )
         get_pp_group().send_tensor_dict(output.tensors, all_gather_group=all_gather_group)
+        logger.info(
+            "!!!!! Worker execute_model send_intermediate.end: rank=%s local_rank=%s pp_rank=%s",
+            self.rank,
+            self.local_rank,
+            pp_rank,
+        )
 
         kv_connector_output = output.kv_connector_output
         if not kv_connector_output:
@@ -561,7 +604,34 @@ class NPUWorker(WorkerBase):
         self.model_runner.reset_encoder_cache()
 
     def execute_dummy_batch(self) -> None:
-        self.model_runner._dummy_run(num_tokens=self.model_runner.decode_token_per_req, uniform_decode=True)
+        num_tokens = self.model_runner.decode_token_per_req
+        moe_comm_type = select_moe_comm_method(num_tokens, self.vllm_config)
+        trace_id = f"dummy-rank{self.rank}-local{self.local_rank}-{time.monotonic_ns()}"
+        logger.info(
+            "!!!!! Worker starting execute_dummy_batch: trace_id=%s rank=%s local_rank=%s "
+            "requested_num_tokens=%s requested_moe_comm_hint=%s",
+            trace_id,
+            self.rank,
+            self.local_rank,
+            num_tokens,
+            moe_comm_type.name if moe_comm_type is not None else None,
+        )
+        try:
+            self.model_runner._dummy_run(num_tokens=num_tokens, uniform_decode=True, trace_id=trace_id)
+        except Exception:
+            logger.exception(
+                "!!!!! Worker execute_dummy_batch failed: trace_id=%s rank=%s local_rank=%s",
+                trace_id,
+                self.rank,
+                self.local_rank,
+            )
+            raise
+        logger.info(
+            "!!!!! Worker finished execute_dummy_batch: trace_id=%s rank=%s local_rank=%s",
+            trace_id,
+            self.rank,
+            self.local_rank,
+        )
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""

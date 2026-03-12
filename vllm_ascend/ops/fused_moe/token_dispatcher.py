@@ -22,16 +22,20 @@
 # limitations under the License.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+import os
 
 import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import get_ep_group
+from vllm.logger import init_logger
 
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe.comm_utils import async_all_to_all, gather_from_sequence_parallel_region
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, is_hierarchical_communication_enabled
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -128,6 +132,22 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
             max_num_tokens = min(max_num_reqs * uniform_decode_query_len, 512)
         num_tokens_per_tp_rank = (max_num_tokens + tp_size - 1) // tp_size
         self.global_bs = num_tokens_per_tp_rank * self.ep_world_size
+        logger.info_once(
+            "!!!!! Initialize MC2 dispatcher: hccl_comm=%s ep_rank=%s/%s global_bs=%s "
+            "max_bs_per_rank=%s max_num_tokens=%s tp_size=%s HCCL_BUFFSIZE=%s "
+            "enable_dispatch_v2=%s need_extra_args=%s",
+            self.moe_all_to_all_group_name,
+            self.ep_rank_id,
+            self.ep_world_size,
+            self.global_bs,
+            self.global_bs // self.ep_world_size if self.ep_world_size > 0 else 0,
+            max_num_tokens,
+            tp_size,
+            os.getenv("HCCL_BUFFSIZE", "unset"),
+            self.enable_dispatch_v2,
+            self.need_extra_args,
+            scope="process",
+        )
 
     def get_dispatch_mc2_kwargs(
         self,
@@ -208,6 +228,16 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         **kwargs,
     ):
         self.with_quant = with_quant
+        logger.info_once(
+            "!!!!! MC2 token dispatch runtime: hidden_states_shape=%s topk_ids_shape=%s "
+            "with_quant=%s dynamic_eplb=%s group=%s",
+            tuple(hidden_states.shape),
+            tuple(topk_ids.shape),
+            with_quant,
+            dynamic_eplb,
+            self.moe_all_to_all_group_name,
+            scope="process",
+        )
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(
             hidden_states, topk_weights, topk_ids, expert_map, mc2_mask, global_redundant_expert_num, **kwargs
         )
@@ -429,6 +459,16 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
         local_rank = torch.distributed.get_rank(group=self.ep_group)
         backend = self.ep_group._get_backend(torch.device("npu"))
         self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
+        logger.info_once(
+            "!!!!! Initialize All2All dispatcher: hccl_comm=%s ep_rank=%s/%s "
+            "num_local_experts=%s num_experts=%s",
+            self.moe_all_to_all_group_name,
+            self.ep_rank,
+            self.ep_size,
+            self.num_local_experts,
+            self.num_experts,
+            scope="process",
+        )
 
     def token_dispatch(
         self,
@@ -445,6 +485,16 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
     ):
         self.with_quant = with_quant
         self.hidden_shape = hidden_states.shape
+        logger.info_once(
+            "!!!!! All2All token dispatch runtime: hidden_states_shape=%s topk_ids_shape=%s "
+            "with_quant=%s dynamic_eplb=%s group=%s",
+            tuple(hidden_states.shape),
+            tuple(topk_ids.shape),
+            with_quant,
+            dynamic_eplb,
+            self.moe_all_to_all_group_name,
+            scope="process",
+        )
 
         (
             permutated_local_input_tokens,

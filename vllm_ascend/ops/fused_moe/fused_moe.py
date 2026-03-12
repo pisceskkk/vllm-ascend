@@ -304,6 +304,20 @@ class AscendFusedMoE(FusedMoE):
         self.moe_config.num_experts = self.global_num_experts
         self.moe_config.num_local_experts = self.local_num_experts
         self.moe_config.global_redundant_expert_num = self.global_redundant_expert_num
+        logger.info_once(
+            "!!!!! Initialize AscendFusedMoE: hidden_size=%s experts_per_token=%s "
+            "local_num_experts=%s global_num_experts=%s dp_size=%s tp_size=%s "
+            "ep_size=%s enable_shared_expert_dp=%s dynamic_eplb=%s",
+            self.hidden_size,
+            self.moe_config.experts_per_token,
+            self.local_num_experts,
+            self.global_num_experts,
+            self.moe_config.dp_group.world_size,
+            self.moe_config.tp_group.world_size,
+            self.ep_size,
+            ascend_config.enable_shared_expert_dp,
+            self.dynamic_eplb,
+        )
 
         moe_quant_params = {
             "num_experts": self.local_num_experts,

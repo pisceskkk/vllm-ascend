@@ -1,12 +1,14 @@
 import math
 from contextlib import contextmanager
 from enum import Enum
+from functools import lru_cache
 from typing import Any
 
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_dp_group, get_ep_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
+from vllm.logger import init_logger
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.utils import (
@@ -20,12 +22,51 @@ from vllm_ascend.utils import (
     speculative_enable_dispatch_gmm_combine_decode,
 )
 
+logger = init_logger(__name__)
+
 
 class MoECommType(Enum):
     ALLGATHER = 0
     MC2 = 1
     ALLTOALL = 2
     FUSED_MC2 = 3
+
+
+@lru_cache
+def _log_moe_comm_selection_once(
+    moe_comm_type: str | None,
+    soc_version: str,
+    within_mc2_capacity: bool | None,
+    mc2_tokens_capacity: int | None,
+    ep_world_size: int,
+    dp_size: int,
+    tp_size: int,
+    pp_size: int,
+    world_size_across_dp: int,
+    enable_expert_parallel: bool,
+    quant_type: str | None,
+    fused_mc2_mode: int,
+    is_draft_model: bool,
+) -> None:
+    logger.info(
+        "!!!!! MoE comm selection: method=%s within_mc2_capacity=%s mc2_tokens_capacity=%s "
+        "soc=%s ep_world_size=%s dp_size=%s tp_size=%s pp_size=%s "
+        "world_size_across_dp=%s enable_expert_parallel=%s moe_quantize=%s "
+        "fused_mc2_mode=%s is_draft_model=%s",
+        moe_comm_type,
+        within_mc2_capacity,
+        mc2_tokens_capacity,
+        soc_version,
+        ep_world_size,
+        dp_size,
+        tp_size,
+        pp_size,
+        world_size_across_dp,
+        enable_expert_parallel,
+        quant_type,
+        fused_mc2_mode,
+        is_draft_model,
+    )
 
 
 @contextmanager
@@ -44,6 +85,7 @@ def set_ascend_forward_context(
     skip_compiled: bool = False,
     max_tokens_across_pcp: int = 0,
     draft_attn_metadatas=None,
+    trace_id: str | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -63,6 +105,7 @@ def set_ascend_forward_context(
     with set_forward_context(**forward_context_kwargs):
         forward_context = get_forward_context()
         forward_context.draft_attn_metadatas = draft_attn_metadatas
+        forward_context.trace_id = trace_id
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
@@ -269,4 +312,21 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
             moe_comm_type = MoECommType.ALLTOALL
     else:
         raise ValueError(f"Unsupported soc_version: {soc_version}")
+
+    within_mc2_capacity = None if mc2_tokens_capacity is None else num_tokens <= mc2_tokens_capacity
+    _log_moe_comm_selection_once(
+        moe_comm_type.name if moe_comm_type is not None else None,
+        soc_version.name,
+        within_mc2_capacity,
+        mc2_tokens_capacity,
+        get_ep_group().world_size,
+        vllm_config.parallel_config.data_parallel_size,
+        vllm_config.parallel_config.tensor_parallel_size,
+        vllm_config.parallel_config.pipeline_parallel_size,
+        vllm_config.parallel_config.world_size_across_dp,
+        vllm_config.parallel_config.enable_expert_parallel,
+        quant_type,
+        envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2,
+        is_draft_model,
+    )
     return moe_comm_type

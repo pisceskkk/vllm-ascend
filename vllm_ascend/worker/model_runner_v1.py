@@ -19,6 +19,7 @@
 
 import math
 import sys
+import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
@@ -35,7 +36,14 @@ from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_f
 from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
-from vllm.distributed.parallel_state import get_dcp_group, get_dp_group, get_pcp_group, get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import (
+    get_dcp_group,
+    get_dp_group,
+    get_ep_group,
+    get_pcp_group,
+    get_pp_group,
+    get_tp_group,
+)
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -154,6 +162,7 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
+NO_WORK_DUMMY_TOKEN_COUNT = 1
 
 
 @dataclass
@@ -211,6 +220,7 @@ class ExecuteModelState(NamedTuple):
     positions: torch.Tensor
     ec_connector_output: "ECConnectorOutput | None"
     cudagraph_stats: CUDAGraphStat | None
+    trace_id: str
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -249,6 +259,8 @@ class NPUModelRunner(GPUModelRunner):
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+        self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
 
         self.sampler = AscendSampler()
         self.attn_state: AscendAttentionState | None = None
@@ -436,6 +448,150 @@ class NPUModelRunner(GPUModelRunner):
             and not self.model_config.enforce_eager
         )
 
+    def _get_moe_debug_ranks(self) -> tuple[int, int, int | str]:
+        pp_rank = get_pp_group().rank_in_group
+        tp_rank = get_tp_group().rank_in_group
+        ep_rank: int | str = "N/A"
+        if self.vllm_config.parallel_config.enable_expert_parallel:
+            ep_rank = get_ep_group().rank_in_group
+        return pp_rank, tp_rank, ep_rank
+
+    def _make_trace_id(self, phase: str) -> str:
+        pp_rank, tp_rank, ep_rank = self._get_moe_debug_ranks()
+        return (
+            f"{phase}-dp{self.dp_rank}-pp{pp_rank}-tp{tp_rank}"
+            f"-ep{ep_rank}-{time.monotonic_ns()}"
+        )
+
+    def _log_trace_event(self, trace_id: str, stage: str, **fields: Any) -> None:
+        pp_rank, tp_rank, ep_rank = self._get_moe_debug_ranks()
+        details = " ".join(f"{key}={value}" for key, value in fields.items())
+        if details:
+            logger.info(
+                "!!!!! Trace %s stage=%s dp_rank=%s pp_rank=%s tp_rank=%s ep_rank=%s %s",
+                trace_id,
+                stage,
+                self.dp_rank,
+                pp_rank,
+                tp_rank,
+                ep_rank,
+                details,
+            )
+        else:
+            logger.info(
+                "!!!!! Trace %s stage=%s dp_rank=%s pp_rank=%s tp_rank=%s ep_rank=%s",
+                trace_id,
+                stage,
+                self.dp_rank,
+                pp_rank,
+                tp_rank,
+                ep_rank,
+            )
+
+    def _log_moe_dp_batch_sync(
+        self,
+        debug_phase: str,
+        local_tokens: int | None,
+        cudagraph_mode: int,
+        tokens_across_dp: list[int] | None = None,
+        cudagraph_modes_across_dp: list[int] | None = None,
+        trace_id: str | None = None,
+    ) -> None:
+        if not is_moe_model(self.vllm_config) or local_tokens is None:
+            return
+
+        pp_rank, tp_rank, ep_rank = self._get_moe_debug_ranks()
+        mc2_tokens_capacity = get_mc2_tokens_capacity()
+        local_method = select_moe_comm_method(local_tokens, self.vllm_config)
+
+        if tokens_across_dp is None:
+            logger.info(
+                "!!!!! MoE DP batch sync (%s): trace_id=%s dp_rank=%s pp_rank=%s tp_rank=%s "
+                "ep_rank=%s skip_dp_all_reduce=True local_tokens=%s local_method=%s "
+                "mc2_tokens_capacity=%s cudagraph_mode=%s",
+                debug_phase,
+                trace_id,
+                self.dp_rank,
+                pp_rank,
+                tp_rank,
+                ep_rank,
+                local_tokens,
+                local_method.name if local_method is not None else None,
+                mc2_tokens_capacity,
+                cudagraph_mode,
+            )
+            return
+
+        methods_across_dp = [
+            method.name if method is not None else None
+            for method in (select_moe_comm_method(num_tokens, self.vllm_config) for num_tokens in tokens_across_dp)
+        ]
+        divergence_before_sync = len(set(methods_across_dp)) > 1
+        effective_tokens = max(tokens_across_dp)
+        effective_method = select_moe_comm_method(effective_tokens, self.vllm_config)
+
+        if self.dp_rank != 0 and not divergence_before_sync:
+            return
+
+        logger.info(
+            "!!!!! MoE DP batch sync (%s): trace_id=%s dp_rank=%s pp_rank=%s tp_rank=%s ep_rank=%s "
+            "local_tokens=%s tokens_across_dp=%s methods_across_dp=%s "
+            "divergence_before_sync=%s effective_tokens=%s effective_method=%s "
+            "mc2_tokens_capacity=%s local_cudagraph_mode=%s cudagraph_modes_across_dp=%s",
+            debug_phase,
+            trace_id,
+            self.dp_rank,
+            pp_rank,
+            tp_rank,
+            ep_rank,
+            local_tokens,
+            tokens_across_dp,
+            methods_across_dp,
+            divergence_before_sync,
+            effective_tokens,
+            effective_method.name if effective_method is not None else None,
+            mc2_tokens_capacity,
+            cudagraph_mode,
+            cudagraph_modes_across_dp,
+        )
+
+    def _log_moe_forward_selection(
+        self,
+        debug_phase: str,
+        num_tokens_padded: int,
+        num_actual_tokens: int,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_mode: CUDAGraphMode,
+        has_encoder_input: bool,
+        trace_id: str | None = None,
+    ) -> None:
+        if not is_moe_model(self.vllm_config) or self.dp_rank != 0:
+            return
+
+        pp_rank, tp_rank, ep_rank = self._get_moe_debug_ranks()
+        mc2_tokens_capacity = get_mc2_tokens_capacity()
+        selected_moe_comm = select_moe_comm_method(num_tokens_padded, self.vllm_config)
+        tokens_across_dp = None if num_tokens_across_dp is None else [int(token) for token in num_tokens_across_dp.tolist()]
+        cudagraph_mode_name = cudagraph_mode.name if isinstance(cudagraph_mode, CUDAGraphMode) else cudagraph_mode
+        logger.info(
+            "!!!!! MoE forward selection (%s): trace_id=%s dp_rank=%s pp_rank=%s tp_rank=%s ep_rank=%s "
+            "actual_tokens=%s padded_tokens=%s tokens_across_dp=%s selected_method=%s "
+            "mc2_tokens_capacity=%s cudagraph_mode=%s has_encoder_input=%s",
+            debug_phase,
+            trace_id,
+            self.dp_rank,
+            pp_rank,
+            tp_rank,
+            ep_rank,
+            num_actual_tokens,
+            num_tokens_padded,
+            tokens_across_dp,
+            selected_moe_comm.name if selected_moe_comm is not None else None,
+            mc2_tokens_capacity,
+            cudagraph_mode_name,
+            has_encoder_input,
+        )
+
     def _skip_all_reduce_across_dp_group(self, is_draft_model=False) -> bool:
         """
         Decide whether to skip the all-reduce across the data-parallel (DP) group.
@@ -474,7 +630,22 @@ class NPUModelRunner(GPUModelRunner):
 
         # Skip all-reduce if decode requires MC2 and either prefill also
         # requires MC2 or recompute-based scheduler is enabled.
-        return decode_must_use_mc2 and (prefill_must_use_mc2 or self.ascend_config.recompute_scheduler_enable)
+        skip_dp_all_reduce = decode_must_use_mc2 and (
+            prefill_must_use_mc2 or self.ascend_config.recompute_scheduler_enable
+        )
+        logger.info_once(
+            "!!!!! MoE DP all-reduce decision: decode_max_tokens=%s decode_uses_mc2=%s "
+            "prefill_max_tokens=%s prefill_uses_mc2=%s recompute_scheduler_enable=%s "
+            "skip_dp_all_reduce=%s",
+            potential_max_tokens,
+            decode_must_use_mc2,
+            self.vllm_config.scheduler_config.max_num_batched_tokens,
+            prefill_must_use_mc2,
+            self.ascend_config.recompute_scheduler_enable,
+            skip_dp_all_reduce,
+            scope="process",
+        )
+        return skip_dp_all_reduce
 
     def _sync_metadata_across_dp(
         self, num_tokens: int, with_prefill: bool = False, is_draft_model: bool = False
@@ -1086,6 +1257,7 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        trace_id = self._make_trace_id("execute_model")
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -1106,6 +1278,14 @@ class NPUModelRunner(GPUModelRunner):
         ):
             scheduler_output = deepcopy(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        self._log_trace_event(
+            trace_id,
+            "execute_model.start",
+            total_num_scheduled_tokens=num_scheduled_tokens,
+            scheduled_reqs=len(scheduler_output.num_scheduled_tokens),
+            num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+            has_intermediate_tensors=intermediate_tensors is not None,
+        )
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
@@ -1116,24 +1296,58 @@ class NPUModelRunner(GPUModelRunner):
                         scheduler_output,
                         encoder_cache=self.encoder_cache,
                     ) as ec_connector_output:
+                        self._log_trace_event(trace_id, "execute_model.mm_encoder.start")
                         self._execute_mm_encoder(scheduler_output)
+                        self._log_trace_event(trace_id, "execute_model.mm_encoder.end")
                         return make_empty_encoder_model_runner_output(scheduler_output)
 
                 if not num_scheduled_tokens:
+                    self._log_trace_event(trace_id, "execute_model.no_work")
+                    skip_dp_all_reduce = self._skip_all_reduce_across_dp_group()
+                    run_no_work_dummy = (
+                        self.parallel_config.data_parallel_size > 1
+                        and self.parallel_config.pipeline_parallel_size > 1
+                    )
+                    self._log_trace_event(
+                        trace_id,
+                        "execute_model.no_work.decision",
+                        run_no_work_dummy=run_no_work_dummy,
+                        dp_size=self.parallel_config.data_parallel_size,
+                        pp_size=self.parallel_config.pipeline_parallel_size,
+                        enable_expert_parallel=self.parallel_config.enable_expert_parallel,
+                        skip_dp_all_reduce=skip_dp_all_reduce,
+                        distributed_executor_backend=self.parallel_config.distributed_executor_backend,
+                    )
                     if (
                         self.parallel_config.distributed_executor_backend == "external_launcher"
                         and self.parallel_config.data_parallel_size > 1
                     ):
-                        # this is a corner case when both external launcher
-                        # and DP are enabled, num_scheduled_tokens could be
-                        # 0, and has_unfinished_requests in the outer loop
-                        # returns True. before returning early here we call
-                        # dummy run to ensure coordinate_batch_across_dp
-                        # is called into to avoid out of sync issues.
-                        self._dummy_run(1)
+                        dummy_trace_id = f"{trace_id}-no-work-dummy"
+                        self._log_trace_event(
+                            trace_id,
+                            "execute_model.no_work_dummy.begin",
+                            dummy_trace_id=dummy_trace_id,
+                            dummy_num_tokens=NO_WORK_DUMMY_TOKEN_COUNT,
+                        )
+                        try:
+                            self._dummy_run(NO_WORK_DUMMY_TOKEN_COUNT, trace_id=dummy_trace_id)
+                        except Exception:
+                            logger.exception(
+                                "!!!!! Trace %s stage=execute_model.no_work_dummy.failed dummy_trace_id=%s",
+                                trace_id,
+                                dummy_trace_id,
+                            )
+                            raise
+                        self._log_trace_event(
+                            trace_id,
+                            "execute_model.no_work_dummy.end",
+                            dummy_trace_id=dummy_trace_id,
+                        )
                     if not has_kv_transfer_group():
                         # Return empty ModelRunnerOutput if no work to do.
+                        self._log_trace_event(trace_id, "execute_model.no_work.return_empty")
                         return EMPTY_MODEL_RUNNER_OUTPUT
+                    self._log_trace_event(trace_id, "execute_model.no_work.return_kv_connector")
                     return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
                 if self.cache_config.kv_sharing_fast_prefill:
                     assert not self.num_prompt_logprobs, (
@@ -1155,6 +1369,13 @@ class NPUModelRunner(GPUModelRunner):
                 ) = self._prepare_inputs(
                     scheduler_output,
                     num_scheduled_tokens_np,
+                )
+                self._log_trace_event(
+                    trace_id,
+                    "execute_model.prepare_inputs.done",
+                    num_reqs=num_reqs,
+                    total_num_scheduled_tokens=total_num_scheduled_tokens,
+                    max_num_scheduled_tokens=max_num_scheduled_tokens,
                 )
 
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
@@ -1182,7 +1403,18 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     max_num_scheduled_tokens=max_num_scheduled_tokens,
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
+                    debug_phase="execute_model",
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                    trace_id=trace_id,
+                )
+                self._log_trace_event(
+                    trace_id,
+                    "execute_model.batch_determined",
+                    cudagraph_mode=cudagraph_mode.name,
+                    batch_num_tokens=batch_desc.num_tokens,
+                    batch_num_reqs=batch_desc.num_reqs,
+                    should_ubatch=should_ubatch,
+                    num_tokens_across_dp=None if num_tokens_across_dp is None else num_tokens_across_dp.tolist(),
                 )
 
                 logger.debug(
@@ -1239,6 +1471,13 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 )
+                self._log_trace_event(
+                    trace_id,
+                    "execute_model.attn_metadata.done",
+                    num_tokens_padded=num_tokens_padded,
+                    num_reqs_padded=num_reqs_padded,
+                    use_spec_decode=use_spec_decode,
+                )
 
             (
                 input_ids,
@@ -1253,6 +1492,14 @@ class NPUModelRunner(GPUModelRunner):
                 if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
                 else total_num_scheduled_tokens,
                 intermediate_tensors,
+            )
+            self._log_trace_event(
+                trace_id,
+                "execute_model.preprocess.done",
+                input_ids_is_none=input_ids is None,
+                inputs_embeds_is_none=inputs_embeds is None,
+                positions_shape=tuple(positions.shape),
+                model_kwargs_keys=sorted(model_kwargs.keys()),
             )
 
             # update global cos, sin
@@ -1288,6 +1535,15 @@ class NPUModelRunner(GPUModelRunner):
         # encoder inputs are present. Use eager for the first pass.
         num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
         has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
+        self._log_moe_forward_selection(
+            debug_phase="execute_model",
+            num_tokens_padded=num_tokens_padded,
+            num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
+            cudagraph_mode=cudagraph_mode,
+            has_encoder_input=has_encoder_input,
+            trace_id=trace_id,
+        )
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
@@ -1305,12 +1561,15 @@ class NPUModelRunner(GPUModelRunner):
                     model_instance=self.model,
                     max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
                     skip_compiled=has_encoder_input,
+                    trace_id=trace_id,
                 ),
                 self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
             ):
+                self._log_trace_event(trace_id, "execute_model.forward.begin")
                 hidden_states = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
                 )
+                self._log_trace_event(trace_id, "execute_model.forward.end")
         else:
             with (
                 record_function_or_nullcontext("forward"),
@@ -1325,15 +1584,19 @@ class NPUModelRunner(GPUModelRunner):
                     model_instance=self.model,
                     max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
                     skip_compiled=has_encoder_input,
+                    trace_id=trace_id,
                 ),
                 self.maybe_get_kv_connector_output(
                     scheduler_output, clear_metadata=clear_kv_metadata
                 ) as kv_connector_output,
             ):
+                self._log_trace_event(trace_id, "execute_model.forward.begin")
                 hidden_states = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
                 )
+                self._log_trace_event(trace_id, "execute_model.forward.end")
         with record_function_or_nullcontext("post process"):
+            self._log_trace_event(trace_id, "execute_model.postprocess.begin")
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = hidden_states
@@ -1354,6 +1617,7 @@ class NPUModelRunner(GPUModelRunner):
                     assert isinstance(hidden_states, IntermediateTensors)
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
+                    self._log_trace_event(trace_id, "execute_model.postprocess.return_intermediate")
                     if self.debugger is not None:
                         self.debugger.stop()
                         self.debugger.step()
@@ -1364,6 +1628,7 @@ class NPUModelRunner(GPUModelRunner):
                         hidden_states, num_scheduled_tokens, num_scheduled_tokens_np, kv_connector_output
                     )
                     output.kv_connector_output = kv_connector_output
+                    self._log_trace_event(trace_id, "execute_model.postprocess.return_pool")
                     if self.debugger is not None:
                         self.debugger.stop()
                         self.debugger.step()
@@ -1405,8 +1670,15 @@ class NPUModelRunner(GPUModelRunner):
                 positions,
                 ec_connector_output,
                 cudagraph_stats,
+                trace_id,
             )
             self.kv_connector_output = kv_connector_output
+            self._log_trace_event(
+                trace_id,
+                "execute_model.state_ready",
+                logits_shape=tuple(logits.shape),
+                is_last_pp_rank=get_pp_group().is_last_rank,
+            )
         return None
 
     @torch.inference_mode()
@@ -1417,6 +1689,12 @@ class NPUModelRunner(GPUModelRunner):
         self.kv_connector_output = None
 
         if self.execute_model_state is None:
+            trace_id = self._make_trace_id("sample_tokens")
+            self._log_trace_event(
+                trace_id,
+                "sample_tokens.no_execute_state",
+                has_kv_connector_output=bool(kv_connector_output),
+            )
             # Nothing to do (PP non-final rank case), output isn't used.
             if not kv_connector_output:
                 return None  # noqa
@@ -1442,9 +1720,16 @@ class NPUModelRunner(GPUModelRunner):
             positions,
             ec_connector_output,
             cudagraph_stats,
+            trace_id,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+        self._log_trace_event(
+            trace_id,
+            "sample_tokens.start",
+            has_grammar_output=grammar_output is not None,
+            total_num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
+        )
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -1457,6 +1742,7 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        self._log_trace_event(trace_id, "sample_tokens.sample.done")
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -1496,6 +1782,12 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+        self._log_trace_event(
+            trace_id,
+            "sample_tokens.bookkeeping.done",
+            valid_sampled_tokens=len(valid_sampled_token_ids),
+            invalid_req_count=len(invalid_req_indices),
+        )
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
@@ -1515,6 +1807,7 @@ class NPUModelRunner(GPUModelRunner):
 
             if has_kv_transfer_group():
                 get_kv_transfer_group().clear_connector_metadata()
+        self._log_trace_event(trace_id, "sample_tokens.draft.done")
 
         if self.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
@@ -1783,6 +2076,8 @@ class NPUModelRunner(GPUModelRunner):
         self,
         num_tokens_padded: int | None = None,
         cudagraph_mode: int = 0,
+        debug_phase: str = "execute_model",
+        trace_id: str | None = None,
     ) -> tuple[bool, torch.Tensor | None, int]:
         """
         Coordinates amongst all DP ranks to determine if and how the full batch
@@ -1815,8 +2110,29 @@ class NPUModelRunner(GPUModelRunner):
         if self.dp_size == 1:
             return False, None, cudagraph_mode
 
+        if trace_id is not None:
+            self._log_trace_event(
+                trace_id,
+                f"{debug_phase}.dp_sync.start",
+                num_tokens_padded=num_tokens_padded,
+                cudagraph_mode=cudagraph_mode,
+            )
+
         if self._skip_all_reduce_across_dp_group():
             num_tokens_after_padding = torch.tensor([num_tokens_padded] * self.dp_size, device="cpu", dtype=torch.int32)
+            self._log_moe_dp_batch_sync(
+                debug_phase=debug_phase,
+                local_tokens=num_tokens_padded,
+                cudagraph_mode=cudagraph_mode,
+                trace_id=trace_id,
+            )
+            if trace_id is not None:
+                self._log_trace_event(
+                    trace_id,
+                    f"{debug_phase}.dp_sync.skip",
+                    num_tokens_after_padding=num_tokens_after_padding.tolist(),
+                    synced_cudagraph_mode=cudagraph_mode,
+                )
             return False, num_tokens_after_padding, cudagraph_mode
 
         tensor = torch.zeros(2, self.dp_size, device="cpu", dtype=torch.int32)
@@ -1825,6 +2141,8 @@ class NPUModelRunner(GPUModelRunner):
         dist.all_reduce(tensor, group=get_dp_group().cpu_group)
 
         num_tokens_across_dp = tensor[0, :]
+        tokens_across_dp_before_padding = [int(token) for token in num_tokens_across_dp.tolist()]
+        cudagraph_modes_across_dp = [int(mode) for mode in tensor[1, :].tolist()]
         max_num_tokens = int(num_tokens_across_dp.max().item())
         num_tokens_after_padding = torch.tensor(
             [max_num_tokens] * len(num_tokens_across_dp),
@@ -1833,6 +2151,22 @@ class NPUModelRunner(GPUModelRunner):
         )
         # Synchronize cudagraph_mode across ranks (take min)
         synced_cudagraph_mode = _post_process_cudagraph_mode(tensor)
+        self._log_moe_dp_batch_sync(
+            debug_phase=debug_phase,
+            local_tokens=num_tokens_padded,
+            cudagraph_mode=cudagraph_mode,
+            tokens_across_dp=tokens_across_dp_before_padding,
+            cudagraph_modes_across_dp=cudagraph_modes_across_dp,
+            trace_id=trace_id,
+        )
+        if trace_id is not None:
+            self._log_trace_event(
+                trace_id,
+                f"{debug_phase}.dp_sync.end",
+                tokens_across_dp=tokens_across_dp_before_padding,
+                num_tokens_after_padding=num_tokens_after_padding.tolist(),
+                synced_cudagraph_mode=synced_cudagraph_mode,
+            )
         return False, num_tokens_after_padding, synced_cudagraph_mode
 
     def _determine_batch_execution_and_padding(
@@ -1844,12 +2178,14 @@ class NPUModelRunner(GPUModelRunner):
         use_cascade_attn: bool,
         allow_microbatching: bool = False,
         force_eager: bool = False,
+        debug_phase: str = "execute_model",
         # For cudagraph capture TODO(lucas): Refactor how we capture cudagraphs (will
         # be improved in model runner v2)
         force_uniform_decode: bool | None = None,
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        trace_id: str | None = None,
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
@@ -1871,6 +2207,20 @@ class NPUModelRunner(GPUModelRunner):
             else len(self.input_batch.lora_id_to_lora_request)
         )
         has_lora = num_active_loras > 0 if force_has_lora is None else force_has_lora
+
+        if trace_id is not None:
+            self._log_trace_event(
+                trace_id,
+                f"{debug_phase}.dispatch.start",
+                num_tokens=num_tokens,
+                num_tokens_padded=num_tokens_padded,
+                num_reqs=num_reqs,
+                max_num_scheduled_tokens=max_num_scheduled_tokens,
+                uniform_decode=uniform_decode,
+                force_eager=force_eager,
+                has_lora=has_lora,
+                num_encoder_reqs=num_encoder_reqs,
+            )
 
         # ruff: noqa: E731
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
@@ -1897,6 +2247,15 @@ class NPUModelRunner(GPUModelRunner):
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(num_tokens_padded, use_cascade_attn or has_encoder_output)
         num_tokens_padded = batch_descriptor.num_tokens
+        if trace_id is not None:
+            self._log_trace_event(
+                trace_id,
+                f"{debug_phase}.dispatch.after_local",
+                cudagraph_mode=cudagraph_mode.name,
+                batch_num_tokens=batch_descriptor.num_tokens,
+                batch_num_reqs=batch_descriptor.num_reqs,
+                has_encoder_output=has_encoder_output,
+            )
         if enable_sp(self.vllm_config):
             assert batch_descriptor.num_tokens % self.vllm_config.parallel_config.tensor_parallel_size == 0, (
                 "Sequence parallelism requires num_tokens to be a multiple of tensor parallel size"
@@ -1908,12 +2267,23 @@ class NPUModelRunner(GPUModelRunner):
             _, num_tokens_across_dp, synced_cudagraph_mode = self._sync_batch_across_dp(
                 num_tokens_padded=num_tokens_padded,
                 cudagraph_mode=cudagraph_mode.value,
+                debug_phase=debug_phase,
+                trace_id=trace_id,
             )
 
             # Extract DP padding if there is any
             if num_tokens_across_dp is not None:
                 dp_rank = self.parallel_config.data_parallel_rank
                 num_tokens_padded = int(num_tokens_across_dp[dp_rank].item())
+                if trace_id is not None:
+                    self._log_trace_event(
+                        trace_id,
+                        f"{debug_phase}.dispatch.before_redispatch",
+                        dp_rank=dp_rank,
+                        num_tokens_padded=num_tokens_padded,
+                        num_tokens_across_dp=num_tokens_across_dp.tolist(),
+                        synced_cudagraph_mode=synced_cudagraph_mode,
+                    )
                 # Re-dispatch with DP padding
                 if vllm_version_is("0.16.0"):
                     cudagraph_mode, batch_descriptor = dispatch_cudagraph(
@@ -1928,6 +2298,14 @@ class NPUModelRunner(GPUModelRunner):
                 # Assert to make sure the agreed upon token count is correct otherwise
                 # num_tokens_across_dp will no-longer be valid
                 assert batch_descriptor.num_tokens == num_tokens_padded
+                if trace_id is not None:
+                    self._log_trace_event(
+                        trace_id,
+                        f"{debug_phase}.dispatch.after_redispatch",
+                        cudagraph_mode=cudagraph_mode.name,
+                        batch_num_tokens=batch_descriptor.num_tokens,
+                        batch_num_reqs=batch_descriptor.num_reqs,
+                    )
         cudagraph_stats = None
         if self.vllm_config.observability_config.cudagraph_metrics:
             cudagraph_stats = CUDAGraphStat(
@@ -2206,9 +2584,25 @@ class NPUModelRunner(GPUModelRunner):
         remove_lora: bool = True,
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
+        trace_id: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
+        if trace_id is None:
+            trace_id = self._make_trace_id("dummy_run")
+        self._log_trace_event(
+            trace_id,
+            "dummy_run.start",
+            num_tokens=num_tokens,
+            with_prefill=with_prefill,
+            cudagraph_runtime_mode=None if cudagraph_runtime_mode is None else cudagraph_runtime_mode.name,
+            force_attention=force_attention,
+            uniform_decode=uniform_decode,
+            is_profile=is_profile,
+            allow_microbatching=allow_microbatching,
+            is_graph_capturing=is_graph_capturing,
+            num_active_loras=num_active_loras,
+        )
         # If cudagraph_mode.decode_mode() == FULL and
         # cudagraph_mode.separate_routine(). This means that we are using
         # different graphs and/or modes for mixed prefill-decode batches vs.
@@ -2259,6 +2653,7 @@ class NPUModelRunner(GPUModelRunner):
             use_cascade_attn=False,
             allow_microbatching=allow_microbatching,
             force_eager=is_profile or (cudagraph_runtime_mode == CUDAGraphMode.NONE),
+            debug_phase="dummy_run",
             # `force_uniform_decode` is used for cudagraph capture; because for
             # capturing mixed prefill-decode batches, we sometimes use
             # num_tokens == num_reqs which looks like a uniform decode batch to the
@@ -2269,6 +2664,15 @@ class NPUModelRunner(GPUModelRunner):
             # LoRA state when determining the batch descriptor for capture
             force_has_lora=num_active_loras > 0,
             force_num_active_loras=num_active_loras,
+            trace_id=trace_id,
+        )
+        self._log_trace_event(
+            trace_id,
+            "dummy_run.batch_determined",
+            cudagraph_mode=_cudagraph_mode.name,
+            batch_num_tokens=batch_desc.num_tokens,
+            batch_num_reqs=batch_desc.num_reqs,
+            num_tokens_across_dp=None if num_tokens_across_dp is None else num_tokens_across_dp.tolist(),
         )
         if self.use_cp:
             self.pcp_manager.init_batch_info(
@@ -2337,6 +2741,13 @@ class NPUModelRunner(GPUModelRunner):
                 for_cudagraph_capture=is_graph_capturing,
                 num_scheduled_tokens_np=num_scheduled_tokens,
             )
+            self._log_trace_event(
+                trace_id,
+                "dummy_run.attn_metadata.done",
+                num_tokens_padded=num_tokens_padded,
+                num_reqs_padded=num_reqs_padded,
+                attn_state=self.attn_state.name,
+            )
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
@@ -2366,6 +2777,15 @@ class NPUModelRunner(GPUModelRunner):
 
             # update global cos, sin
             update_cos_sin(positions)
+            self._log_moe_forward_selection(
+                debug_phase="dummy_run",
+                num_tokens_padded=num_tokens_padded,
+                num_actual_tokens=num_tokens_unpadded,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_mode=cudagraph_runtime_mode,
+                has_encoder_input=False,
+                trace_id=trace_id,
+            )
 
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None
@@ -2413,10 +2833,13 @@ class NPUModelRunner(GPUModelRunner):
                 aclgraph_runtime_mode=cudagraph_runtime_mode,
                 batch_descriptor=batch_desc,
                 model_instance=self.model,
+                trace_id=trace_id,
             ):
+                self._log_trace_event(trace_id, "dummy_run.forward.begin")
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
                 )
+                self._log_trace_event(trace_id, "dummy_run.forward.end")
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
             else:
@@ -2424,6 +2847,7 @@ class NPUModelRunner(GPUModelRunner):
             dummy_compute_logits(hidden_states)
 
             if self.drafter:
+                self._log_trace_event(trace_id, "dummy_run.drafter.begin")
                 self.drafter.dummy_run(
                     num_tokens=num_tokens_padded,
                     with_prefill=with_prefill,
@@ -2435,10 +2859,17 @@ class NPUModelRunner(GPUModelRunner):
                     in_graph_capturing=not force_attention,
                     is_profile=is_profile,
                 )
+                self._log_trace_event(trace_id, "dummy_run.drafter.end")
             if is_profile and self.dynamic_eplb:
                 self.model.clear_all_moe_loads()
             if self.dynamic_eplb:
                 self.eplb_updator.forward_end()
+            self._log_trace_event(
+                trace_id,
+                "dummy_run.end",
+                hidden_states_type=type(hidden_states).__name__,
+                used_drafter=self.drafter is not None,
+            )
             return hidden_states, hidden_states
 
     @torch.inference_mode()
@@ -2463,9 +2894,19 @@ class NPUModelRunner(GPUModelRunner):
     def profile_run(self) -> None:
         self.eplb_warmup()
         mc2_tokens_capacity = get_mc2_tokens_capacity()
-        if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
-            mc2_tokens_capacity, self.vllm_config
-        ) in {MoECommType.MC2, MoECommType.FUSED_MC2}:
+        selected_moe_comm = select_moe_comm_method(mc2_tokens_capacity, self.vllm_config)
+        logger.info(
+            "!!!!! MoE profile run: max_num_tokens=%s mc2_tokens_capacity=%s "
+            "selected_comm_at_capacity=%s dp_size=%s tp_size=%s pp_size=%s pcp_size=%s",
+            self.max_num_tokens,
+            mc2_tokens_capacity,
+            selected_moe_comm.name if selected_moe_comm is not None else None,
+            self.dp_size,
+            self.tp_size,
+            self.pp_size,
+            self.pcp_size,
+        )
+        if self.max_num_tokens > mc2_tokens_capacity and selected_moe_comm in {MoECommType.MC2, MoECommType.FUSED_MC2}:
             self._dummy_run(mc2_tokens_capacity, with_prefill=True, is_profile=True)
         origin_max_num_tokens = self.max_num_tokens
         # in the pcp scenario, the split sequence needs to be used for profile run
