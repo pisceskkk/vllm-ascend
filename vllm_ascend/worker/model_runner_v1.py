@@ -228,6 +228,8 @@ class NPUModelRunner(GPUModelRunner):
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
         self._debug_stage_debug_id: str | None = None
+        self._debug_prev_async_stage_debug_id: str | None = None
+        self._debug_prev_async_stage_events: dict[str, torch.Event] | None = None
 
         # NOTE: For FULL mode we change +1 to +2 to reserve extra space for padding.
         # See _pad_query_start_loc_for_fia.
@@ -1676,13 +1678,16 @@ class NPUModelRunner(GPUModelRunner):
 
         if not self.use_async_scheduling:
             return model_runner_output
+        prev_async_stage_debug_id = self._debug_prev_async_stage_debug_id
+        prev_async_stage_events = self._debug_prev_async_stage_events
         async_output_ctor_submit_event = torch.Event()
         async_output_ctor_submit_event.record()
         stage_events["async_output_ctor_submit_done"] = async_output_ctor_submit_event
         logger.info(
             "!!!!! StageEvents.async_output_ctor_submit "
-            "stage_debug_id=%s keys=%s",
+            "stage_debug_id=%s prev_stage_debug_id=%s keys=%s",
             stage_debug_id,
+            prev_async_stage_debug_id,
             sorted(stage_events.keys()),
         )
         async_output = AsyncGPUModelRunnerOutput(
@@ -1694,7 +1699,11 @@ class NPUModelRunner(GPUModelRunner):
             vocab_size=self.input_batch.vocab_size,
             stage_events=stage_events,
             stage_debug_id=stage_debug_id,
+            prev_stage_events=prev_async_stage_events,
+            prev_stage_debug_id=prev_async_stage_debug_id,
         )
+        self._debug_prev_async_stage_debug_id = stage_debug_id
+        self._debug_prev_async_stage_events = dict(stage_events)
         return async_output
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
