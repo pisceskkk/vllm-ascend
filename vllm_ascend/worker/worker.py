@@ -389,6 +389,12 @@ class NPUWorker(WorkerBase):
                 all_gather_group = None
             else:
                 all_gather_group = get_tp_group()
+                if all_gather_group.world_size == 1:
+                    logger.info(
+                        "!!!!! PP handoff disable_tp_all_gather tp_world_size=%s",
+                        all_gather_group.world_size,
+                    )
+                    all_gather_group = None
             tensor_dict, comm_handles, comm_postprocess = get_pp_group().irecv_tensor_dict(
                 all_gather_group=all_gather_group
             )
@@ -423,6 +429,12 @@ class NPUWorker(WorkerBase):
             all_gather_group = None
         else:
             all_gather_group = get_tp_group()
+            if all_gather_group.world_size == 1:
+                logger.info(
+                    "!!!!! PP handoff disable_tp_all_gather tp_world_size=%s",
+                    all_gather_group.world_size,
+                )
+                all_gather_group = None
         hidden_states = output.tensors.get("hidden_states")
         if hidden_states is not None:
             logger.info(
