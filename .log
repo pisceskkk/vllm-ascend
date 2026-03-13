@@ -1,0 +1,205 @@
+(ApiServer_1 pid=892837) INFO:     127.0.0.1:60716 - "GET /metrics HTTP/1.1" 200 OK
+(ApiServer_1 pid=892837) INFO:     127.0.0.1:60716 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+(ApiServer_2 pid=892838) INFO:     127.0.0.1:60734 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [model_runner_v1.py:1316] !!!!! DefaultStream execute_model.forward.begin num_tokens_padded=6 num_scheduled_tokens=6 is_last_pp=False
+(Worker_DP1_PP0_EP1 pid=894076) /mnt/share/xxxx/vllm-ascend/vllm_ascend/attention/mla_v1.py:995: UserWarning: To copy construct from a tensor, it is recommended to use sourceTensor.detach().clone() or sourceTensor.detach().clone().requires_grad_(True), rather than torch.tensor(sourceTensor).
+(Worker_DP1_PP0_EP1 pid=894076)   current_seq_len = torch.tensor(prefill_metadata.query_lens, dtype=torch.int32)
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(ApiServer_1 pid=892837) INFO:     127.0.0.1:60738 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP2_PP0_EP2 pid=894084) INFO 03-13 11:14:40 [multiproc_executor.py:974] !!!!! WorkerProc busy_loop.func.end rank=0 rpc_id=49 method=execute_dummy_batch output_type=NoneType will_reply=False
+(Worker_DP2_PP0_EP2 pid=894084) INFO 03-13 11:14:40 [multiproc_executor.py:1016] !!!!! WorkerProc busy_loop.skip_output rank=0 rpc_id=49 method=execute_dummy_batch output_rank=1 reason=non_output_rank
+(Worker_DP3_PP0_EP3 pid=894078) INFO 03-13 11:14:40 [multiproc_executor.py:974] !!!!! WorkerProc busy_loop.func.end rank=0 rpc_id=49 method=execute_dummy_batch output_type=NoneType will_reply=False
+(Worker_DP3_PP0_EP3 pid=894078) INFO 03-13 11:14:40 [multiproc_executor.py:1016] !!!!! WorkerProc busy_loop.skip_output rank=0 rpc_id=49 method=execute_dummy_batch output_rank=1 reason=non_output_rank
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP0_PP0_EP0 pid=894085) INFO 03-13 11:14:40 [multiproc_executor.py:974] !!!!! WorkerProc busy_loop.func.end rank=0 rpc_id=47 method=execute_dummy_batch output_type=NoneType will_reply=False
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP0_PP0_EP0 pid=894085) INFO 03-13 11:14:40 [multiproc_executor.py:1016] !!!!! WorkerProc busy_loop.skip_output rank=0 rpc_id=47 method=execute_dummy_batch output_rank=1 reason=non_output_rank
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [model_runner_v1.py:1326] !!!!! DefaultStream execute_model.forward.end num_tokens_padded=6 num_scheduled_tokens=6 output_type=IntermediateTensors
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [worker.py:428] !!!!! PP send hidden_states.pre_isend shape=(6, 2048) device=npu:0 stride=(2048, 1) is_contiguous=True
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [multiproc_executor.py:974] !!!!! WorkerProc busy_loop.func.end rank=0 rpc_id=47 method=execute_model output_type=NoneType will_reply=False
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [multiproc_executor.py:1016] !!!!! WorkerProc busy_loop.skip_output rank=0 rpc_id=47 method=execute_model output_rank=1 reason=non_output_rank
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [multiproc_executor.py:974] !!!!! WorkerProc busy_loop.func.end rank=0 rpc_id=48 method=sample_tokens output_type=NoneType will_reply=False
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [worker.py:398] !!!!! PP recv hidden_states.post_irecv shape=(12288,) device=npu:1 stride=(1,) handle_count=2 postprocess_count=2
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [multiproc_executor.py:1016] !!!!! WorkerProc busy_loop.skip_output rank=0 rpc_id=48 method=sample_tokens output_rank=1 reason=non_output_rank
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [multiproc_executor.py:974] !!!!! WorkerProc busy_loop.func.end rank=0 rpc_id=49 method=execute_model output_type=ModelRunnerOutput will_reply=False
+(Worker_DP1_PP0_EP1 pid=894076) INFO 03-13 11:14:40 [multiproc_executor.py:1016] !!!!! WorkerProc busy_loop.skip_output rank=0 rpc_id=49 method=execute_model output_rank=1 reason=non_output_rank
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_model_runner.py:2723] !!!!! Intermediate hidden_states wait_for_comm.begin num_tokens=6
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_worker.py:87] !!!!! AsyncIntermediateTensors.wait_for_comm.enter _comm_waited=False
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_worker.py:93] !!!!! AsyncIntermediateTensors.wait_for_comm.begin handle_count=2 postprocess_count=2
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_worker.py:101] !!!!! AsyncIntermediateTensors.wait_for_comm.handle.begin idx=0
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_worker.py:106] !!!!! AsyncIntermediateTensors.wait_for_comm.handle.end idx=0
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_worker.py:101] !!!!! AsyncIntermediateTensors.wait_for_comm.handle.begin idx=1
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_worker.py:106] !!!!! AsyncIntermediateTensors.wait_for_comm.handle.end idx=1
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_worker.py:112] !!!!! AsyncIntermediateTensors.wait_for_comm.postprocess.begin idx=0
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_worker.py:118] !!!!! AsyncIntermediateTensors.wait_for_comm.postprocess.end idx=0
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_worker.py:112] !!!!! AsyncIntermediateTensors.wait_for_comm.postprocess.begin idx=1
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_worker.py:118] !!!!! AsyncIntermediateTensors.wait_for_comm.postprocess.end idx=1
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_worker.py:126] !!!!! AsyncIntermediateTensors.wait_for_comm.ready hidden_states_shape=(6, 2048) device=npu:1 stride=(2048, 1)
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_model_runner.py:2729] !!!!! Intermediate hidden_states wait_for_comm.end num_tokens=6
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_model_runner.py:2738] !!!!! Intermediate hidden_states copy.begin copy_len=6 src_shape=(6, 2048) dst_shape=(32768, 2048) src_device=npu:1 dst_device=npu:1 src_stride=(2048, 1) dst_stride=(2048, 1)
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_model_runner.py:2754] !!!!! Intermediate hidden_states copy.end copy_len=6
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [model_runner_v1.py:1316] !!!!! DefaultStream execute_model.forward.begin num_tokens_padded=6 num_scheduled_tokens=6 is_last_pp=True
+(Worker_DP1_PP1_EP1 pid=894077) /mnt/share/xxxx/vllm-ascend/vllm_ascend/attention/mla_v1.py:995: UserWarning: To copy construct from a tensor, it is recommended to use sourceTensor.detach().clone() or sourceTensor.detach().clone().requires_grad_(True), rather than torch.tensor(sourceTensor).
+(Worker_DP1_PP1_EP1 pid=894077)   current_seq_len = torch.tensor(prefill_metadata.query_lens, dtype=torch.int32)
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(ApiServer_0 pid=892836) INFO:     127.0.0.1:60726 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+(ApiServer_0 pid=892836) INFO:     127.0.0.1:60746 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+(ApiServer_0 pid=892836) INFO:     127.0.0.1:60752 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+(ApiServer_0 pid=892836) INFO:     127.0.0.1:60766 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+(ApiServer_0 pid=892836) INFO:     127.0.0.1:60778 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP2_PP1_EP2 pid=894086) INFO 03-13 11:14:40 [multiproc_executor.py:974] !!!!! WorkerProc busy_loop.func.end rank=1 rpc_id=49 method=execute_dummy_batch output_type=NoneType will_reply=True
+(Worker_DP2_PP1_EP2 pid=894086) INFO 03-13 11:14:40 [multiproc_executor.py:942] !!!!! WorkerProc async_output_busy_loop.dequeue rank=1 rpc_id=49 output_type=NoneType
+(Worker_DP3_PP1_EP3 pid=894079) INFO 03-13 11:14:40 [multiproc_executor.py:974] !!!!! WorkerProc busy_loop.func.end rank=1 rpc_id=49 method=execute_dummy_batch output_type=NoneType will_reply=True
+(Worker_DP2_PP1_EP2 pid=894086) INFO 03-13 11:14:40 [multiproc_executor.py:910] !!!!! WorkerProc enqueue_output.begin rank=1 rpc_id=49 status=SUCCESS output_type=NoneType
+(Worker_DP2_PP1_EP2 pid=894086) INFO 03-13 11:14:40 [multiproc_executor.py:919] !!!!! WorkerProc enqueue_output.end rank=1 rpc_id=49 status=SUCCESS output_type=NoneType
+(Worker_DP3_PP1_EP3 pid=894079) INFO 03-13 11:14:40 [multiproc_executor.py:942] !!!!! WorkerProc async_output_busy_loop.dequeue rank=1 rpc_id=49 output_type=NoneType
+(Worker_DP2_PP1_EP2 pid=894086) INFO 03-13 11:14:40 [multiproc_executor.py:950] !!!!! WorkerProc async_output_busy_loop.enqueue_done rank=1 rpc_id=49 output_type=NoneType
+(EngineCore_DP2 pid=892834) INFO 03-13 11:14:40 [multiproc_executor.py:398] !!!!! Executor collective_rpc.wait_response.dequeue.end rpc_id=49 method=execute_dummy_batch response_index=0 response_rpc_id=49 status=SUCCESS result_type=NoneType
+(Worker_DP3_PP1_EP3 pid=894079) INFO 03-13 11:14:40 [multiproc_executor.py:910] !!!!! WorkerProc enqueue_output.begin rank=1 rpc_id=49 status=SUCCESS output_type=NoneType
+(Worker_DP3_PP1_EP3 pid=894079) INFO 03-13 11:14:40 [multiproc_executor.py:919] !!!!! WorkerProc enqueue_output.end rank=1 rpc_id=49 status=SUCCESS output_type=NoneType
+(Worker_DP3_PP1_EP3 pid=894079) INFO 03-13 11:14:40 [multiproc_executor.py:950] !!!!! WorkerProc async_output_busy_loop.enqueue_done rank=1 rpc_id=49 output_type=NoneType
+(EngineCore_DP3 pid=892835) INFO 03-13 11:14:40 [multiproc_executor.py:398] !!!!! Executor collective_rpc.wait_response.dequeue.end rpc_id=49 method=execute_dummy_batch response_index=0 response_rpc_id=49 status=SUCCESS result_type=NoneType
+(Worker_DP0_PP1_EP0 pid=894087) INFO 03-13 11:14:40 [multiproc_executor.py:974] !!!!! WorkerProc busy_loop.func.end rank=1 rpc_id=47 method=execute_dummy_batch output_type=NoneType will_reply=True
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP0_PP1_EP0 pid=894087) INFO 03-13 11:14:40 [multiproc_executor.py:942] !!!!! WorkerProc async_output_busy_loop.dequeue rank=1 rpc_id=47 output_type=NoneType
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP0_PP1_EP0 pid=894087) INFO 03-13 11:14:40 [multiproc_executor.py:910] !!!!! WorkerProc enqueue_output.begin rank=1 rpc_id=47 status=SUCCESS output_type=NoneType
+(Worker_DP0_PP1_EP0 pid=894087) INFO 03-13 11:14:40 [multiproc_executor.py:919] !!!!! WorkerProc enqueue_output.end rank=1 rpc_id=47 status=SUCCESS output_type=NoneType
+(Worker_DP0_PP1_EP0 pid=894087) INFO 03-13 11:14:40 [multiproc_executor.py:950] !!!!! WorkerProc async_output_busy_loop.enqueue_done rank=1 rpc_id=47 output_type=NoneType
+(EngineCore_DP0 pid=892832) INFO 03-13 11:14:40 [multiproc_executor.py:398] !!!!! Executor collective_rpc.wait_response.dequeue.end rpc_id=47 method=execute_dummy_batch response_index=0 response_rpc_id=47 status=SUCCESS result_type=NoneType
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1009] !!!!! DefaultStream mla.chunk.cache_load.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1024] !!!!! DefaultStream mla.chunk.cache_load.end chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1043] !!!!! DefaultStream mla.chunk.ring_mla.begin chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [mla_v1.py:1069] !!!!! DefaultStream mla.chunk.ring_mla.end chunk_idx=0 toks=4096
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [model_runner_v1.py:1326] !!!!! DefaultStream execute_model.forward.end num_tokens_padded=6 num_scheduled_tokens=6 output_type=Tensor
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [model_runner_v1.py:1407] !!!!! DefaultStream execute_model.compute_logits.begin sample_hidden_states_shape=(1, 2048)
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [model_runner_v1.py:1413] !!!!! DefaultStream execute_model.compute_logits.end logits_shape=(1, 102400) logits_dtype=torch.bfloat16
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [multiproc_executor.py:974] !!!!! WorkerProc busy_loop.func.end rank=1 rpc_id=47 method=execute_model output_type=NoneType will_reply=True
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [model_runner_v1.py:1511] !!!!! DefaultStream sample_tokens.sample.begin logits_shape=(1, 102400)
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [multiproc_executor.py:942] !!!!! WorkerProc async_output_busy_loop.dequeue rank=1 rpc_id=47 output_type=NoneType
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [multiproc_executor.py:910] !!!!! WorkerProc enqueue_output.begin rank=1 rpc_id=47 status=SUCCESS output_type=NoneType
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [multiproc_executor.py:919] !!!!! WorkerProc enqueue_output.end rank=1 rpc_id=47 status=SUCCESS output_type=NoneType
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [multiproc_executor.py:950] !!!!! WorkerProc async_output_busy_loop.enqueue_done rank=1 rpc_id=47 output_type=NoneType
+(EngineCore_DP1 pid=892833) INFO 03-13 11:14:40 [multiproc_executor.py:398] !!!!! Executor collective_rpc.wait_response.dequeue.end rpc_id=47 method=execute_model response_index=0 response_rpc_id=47 status=SUCCESS result_type=NoneType
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [model_runner_v1.py:1516] !!!!! DefaultStream sample_tokens.sample.end sampled_token_ids_shape=(1, 1)
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [model_runner_v1.py:1560] !!!!! DefaultStream sample_tokens.bookkeeping.end valid_rows=0 invalid_req_count=0
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_model_runner.py:230] !!!!! AsyncGPUModelRunnerOutput.init.begin sampled_token_ids_shape=(1, 1) invalid_req_count=0 has_logprobs=False device=npu:1 dtype=torch.int32 is_contiguous=True stride=(1, 1)
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_model_runner.py:243] !!!!! AsyncGPUModelRunnerOutput.init.wait_stream.begin
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_model_runner.py:245] !!!!! AsyncGPUModelRunnerOutput.init.wait_stream.end
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_model_runner.py:246] !!!!! AsyncGPUModelRunnerOutput.init.copy_submitted_event.begin
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_model_runner.py:250] !!!!! AsyncGPUModelRunnerOutput.init.copy_submitted_event.end
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_model_runner.py:251] !!!!! AsyncGPUModelRunnerOutput.init.token_copy.begin
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_model_runner.py:255] !!!!! AsyncGPUModelRunnerOutput.init.token_copy.end
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_model_runner.py:256] !!!!! AsyncGPUModelRunnerOutput.init.logprobs_copy.begin enabled=False
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_model_runner.py:265] !!!!! AsyncGPUModelRunnerOutput.init.logprobs_copy.end enabled=False
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_model_runner.py:269] !!!!! AsyncGPUModelRunnerOutput.init.event_record.begin
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_model_runner.py:271] !!!!! AsyncGPUModelRunnerOutput.init.event_record.end
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_model_runner.py:272] !!!!! AsyncGPUModelRunnerOutput.init.end sampled_token_ids_cpu_shape=(1, 1) has_logprobs=False
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [multiproc_executor.py:974] !!!!! WorkerProc busy_loop.func.end rank=1 rpc_id=48 method=sample_tokens output_type=AsyncGPUModelRunnerOutput will_reply=True
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [multiproc_executor.py:942] !!!!! WorkerProc async_output_busy_loop.dequeue rank=1 rpc_id=48 output_type=AsyncGPUModelRunnerOutput
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_model_runner.py:284] !!!!! AsyncGPUModelRunnerOutput.get_output.begin sampled_token_ids_cpu_shape=(1, 1) invalid_req_count=0 has_logprobs=False
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_model_runner.py:292] !!!!! AsyncGPUModelRunnerOutput.get_output.sync.begin max_gen_len=1
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_model_runner.py:301] !!!!! AsyncGPUModelRunnerOutput.get_output.sync.wait elapsed_ms=0 ready_event=False copy_submitted_event=False, stage_events={'hidden_states_recv_comm_done': False, 'hidden_states_local_copy_done': False}
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [multiproc_executor.py:974] !!!!! WorkerProc busy_loop.func.end rank=1 rpc_id=49 method=execute_model output_type=ModelRunnerOutput will_reply=True
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_model_runner.py:312] !!!!! AsyncGPUModelRunnerOutput.get_output.sync.poll elapsed_ms=100 ready_event=False copy_submitted_event=False, stage_events={'hidden_states_recv_comm_done': False, 'hidden_states_local_copy_done': False}
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_model_runner.py:312] !!!!! AsyncGPUModelRunnerOutput.get_output.sync.poll elapsed_ms=200 ready_event=False copy_submitted_event=False, stage_events={'hidden_states_recv_comm_done': False, 'hidden_states_local_copy_done': False}
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_model_runner.py:312] !!!!! AsyncGPUModelRunnerOutput.get_output.sync.poll elapsed_ms=300 ready_event=False copy_submitted_event=False, stage_events={'hidden_states_recv_comm_done': False, 'hidden_states_local_copy_done': False}
+(Worker_DP1_PP1_EP1 pid=894077) INFO 03-13 11:14:40 [gpu_model_runner.py:312] !!!!! AsyncGPUModelRunnerOutput.get_output.sync.poll elapsed_ms=400 ready_event=False copy_submitted_event=False, stage_events={'hidden_states_recv_comm_done': False, 'hidden_states_local_copy_done': False}
