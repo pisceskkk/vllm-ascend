@@ -1249,20 +1249,24 @@ class NPUModelRunner(GPUModelRunner):
                 attn_metadata_done_event.record()
                 stage_events["attn_metadata_done"] = attn_metadata_done_event
 
-            (
-                input_ids,
-                inputs_embeds,
-                positions,
-                intermediate_tensors,
-                model_kwargs,
-                ec_connector_output,
-            ) = self._preprocess(
-                scheduler_output,
-                num_tokens_padded
-                if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
-                else total_num_scheduled_tokens,
-                intermediate_tensors,
-            )
+            self._debug_stage_events = stage_events
+            try:
+                (
+                    input_ids,
+                    inputs_embeds,
+                    positions,
+                    intermediate_tensors,
+                    model_kwargs,
+                    ec_connector_output,
+                ) = self._preprocess(
+                    scheduler_output,
+                    num_tokens_padded
+                    if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
+                    else total_num_scheduled_tokens,
+                    intermediate_tensors,
+                )
+            finally:
+                self._debug_stage_events = None
             preprocess_done_event = torch.Event()
             preprocess_done_event.record()
             stage_events["preprocess_done"] = preprocess_done_event
