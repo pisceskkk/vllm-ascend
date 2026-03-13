@@ -1322,6 +1322,9 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output.total_num_scheduled_tokens,
                     get_pp_group().is_last_rank,
                 )
+                forward_enter_done_event = torch.Event()
+                forward_enter_done_event.record()
+                stage_events["forward_enter_done"] = forward_enter_done_event
                 hidden_states = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
                 )
@@ -1362,6 +1365,9 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output.total_num_scheduled_tokens,
                     get_pp_group().is_last_rank,
                 )
+                forward_enter_done_event = torch.Event()
+                forward_enter_done_event.record()
+                stage_events["forward_enter_done"] = forward_enter_done_event
                 hidden_states = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
                 )
@@ -1529,8 +1535,6 @@ class NPUModelRunner(GPUModelRunner):
                 "sampled_token_ids_shape=%s",
                 tuple(sampler_output.sampled_token_ids.shape),
             )
-            sample_done_event = torch.Event()
-            sample_done_event.record()
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -1576,8 +1580,6 @@ class NPUModelRunner(GPUModelRunner):
             len(valid_sampled_token_ids),
             len(invalid_req_indices),
         )
-        bookkeeping_done_event = torch.Event()
-        bookkeeping_done_event.record()
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
@@ -1644,11 +1646,6 @@ class NPUModelRunner(GPUModelRunner):
 
         if not self.use_async_scheduling:
             return model_runner_output
-        stage_events = {
-            **stage_events,
-            "sample_done": sample_done_event,
-            "bookkeeping_done": bookkeeping_done_event,
-        }
         async_output = AsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
             sampled_token_ids=sampler_output.sampled_token_ids,
@@ -1658,9 +1655,6 @@ class NPUModelRunner(GPUModelRunner):
             vocab_size=self.input_batch.vocab_size,
             stage_events=stage_events,
         )
-        async_output_ctor_done_event = torch.Event()
-        async_output_ctor_done_event.record()
-        async_output._stage_events["async_output_ctor_done"] = async_output_ctor_done_event
         return async_output
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
