@@ -1186,10 +1186,6 @@ class NPUModelRunner(GPUModelRunner):
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
                 stage_events: dict[str, torch.Event] = {}
-                if self.vllm_config.parallel_config.data_parallel_size > 1 and num_tokens_across_dp is not None:
-                    dp_sync_done_event = torch.Event()
-                    dp_sync_done_event.record()
-                    stage_events["dp_sync_done"] = dp_sync_done_event
 
                 logger.debug(
                     "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -1245,10 +1241,6 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 )
-                attn_metadata_done_event = torch.Event()
-                attn_metadata_done_event.record()
-                stage_events["attn_metadata_done"] = attn_metadata_done_event
-
             self._debug_stage_events = stage_events
             try:
                 (
@@ -1267,15 +1259,8 @@ class NPUModelRunner(GPUModelRunner):
                 )
             finally:
                 self._debug_stage_events = None
-            preprocess_done_event = torch.Event()
-            preprocess_done_event.record()
-            stage_events["preprocess_done"] = preprocess_done_event
-
             # update global cos, sin
             update_cos_sin(positions)
-            cos_sin_done_event = torch.Event()
-            cos_sin_done_event.record()
-            stage_events["cos_sin_done"] = cos_sin_done_event
 
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB weight D2D"):
@@ -1302,9 +1287,6 @@ class NPUModelRunner(GPUModelRunner):
                 head_dim=self.model_config.get_vocab_size(),
                 generators=self.input_batch.sampling_metadata.generators,
             )
-            async_exponential_done_event = torch.Event()
-            async_exponential_done_event.record()
-            stage_events["async_exponential_done"] = async_exponential_done_event
 
         # Encoder-decoder models can only compile the pure decode steps where no
         # encoder inputs are present. Use eager for the first pass.
@@ -1338,9 +1320,6 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output.total_num_scheduled_tokens,
                     get_pp_group().is_last_rank,
                 )
-                forward_enter_done_event = torch.Event()
-                forward_enter_done_event.record()
-                stage_events["forward_enter_done"] = forward_enter_done_event
                 hidden_states = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
                 )
@@ -1351,9 +1330,6 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output.total_num_scheduled_tokens,
                     type(hidden_states).__name__,
                 )
-                forward_done_event = torch.Event()
-                forward_done_event.record()
-                stage_events["forward_done"] = forward_done_event
         else:
             with (
                 record_function_or_nullcontext("forward"),
@@ -1381,9 +1357,6 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output.total_num_scheduled_tokens,
                     get_pp_group().is_last_rank,
                 )
-                forward_enter_done_event = torch.Event()
-                forward_enter_done_event.record()
-                stage_events["forward_enter_done"] = forward_enter_done_event
                 hidden_states = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
                 )
@@ -1394,9 +1367,6 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output.total_num_scheduled_tokens,
                     type(hidden_states).__name__,
                 )
-                forward_done_event = torch.Event()
-                forward_done_event.record()
-                stage_events["forward_done"] = forward_done_event
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:

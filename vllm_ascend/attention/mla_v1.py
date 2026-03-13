@@ -1583,12 +1583,6 @@ class AscendMLAImpl(MLAAttentionImpl):
         output[...] = self.o_proj(o_proj_input, is_prefill=prefill_preprocess_res is not None)[0]
 
         del o_proj_input
-        stage_events = getattr(forward_context, "stage_events", None)
-        if stage_events is not None:
-            mla_forward_done_event = torch.Event()
-            mla_forward_done_event.record()
-            stage_events["mla_forward_done"] = mla_forward_done_event
-
         if has_prefill:
             maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
         return output_padded

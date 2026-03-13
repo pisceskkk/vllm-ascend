@@ -393,6 +393,17 @@ class NPUWorker(WorkerBase):
                 all_gather_group=all_gather_group
             )
             assert tensor_dict is not None
+            hidden_states = tensor_dict.get("hidden_states")
+            if hidden_states is not None:
+                logger.info(
+                    "!!!!! PP recv hidden_states.post_irecv "
+                    "shape=%s device=%s stride=%s handle_count=%s postprocess_count=%s",
+                    tuple(hidden_states.shape),
+                    hidden_states.device,
+                    hidden_states.stride(),
+                    0 if comm_handles is None else len(comm_handles),
+                    0 if comm_postprocess is None else len(comm_postprocess),
+                )
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
                 comm_handles=comm_handles,
@@ -412,6 +423,16 @@ class NPUWorker(WorkerBase):
             all_gather_group = None
         else:
             all_gather_group = get_tp_group()
+        hidden_states = output.tensors.get("hidden_states")
+        if hidden_states is not None:
+            logger.info(
+                "!!!!! PP send hidden_states.pre_isend "
+                "shape=%s device=%s stride=%s is_contiguous=%s",
+                tuple(hidden_states.shape),
+                hidden_states.device,
+                hidden_states.stride(),
+                hidden_states.is_contiguous(),
+            )
         self._pp_send_work = get_pp_group().isend_tensor_dict(
             output.tensors,
             all_gather_group=all_gather_group,
