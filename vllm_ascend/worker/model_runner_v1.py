@@ -212,6 +212,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: "ECConnectorOutput | None"
     cudagraph_stats: CUDAGraphStat | None
     stage_events: dict[str, torch.Event]
+    stage_debug_id: str
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -226,6 +227,7 @@ class NPUModelRunner(GPUModelRunner):
         vllm_config.scheduler_config.max_num_batched_tokens += max_pcp_pad_tokens
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
+        self._debug_stage_debug_id: str | None = None
 
         # NOTE: For FULL mode we change +1 to +2 to reserve extra space for padding.
         # See _pad_query_start_loc_for_fia.
@@ -1186,6 +1188,19 @@ class NPUModelRunner(GPUModelRunner):
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
                 stage_events: dict[str, torch.Event] = {}
+                stage_debug_id = (
+                    f"stage-{id(stage_events):x}-"
+                    f"tokens-{total_num_scheduled_tokens}-"
+                    f"pp{get_pp_group().rank_in_group}"
+                )
+                logger.info(
+                    "!!!!! StageEvents.create stage_debug_id=%s "
+                    "num_tokens=%s num_reqs=%s is_last_pp=%s",
+                    stage_debug_id,
+                    total_num_scheduled_tokens,
+                    num_reqs,
+                    get_pp_group().is_last_rank,
+                )
 
                 logger.debug(
                     "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -1242,6 +1257,7 @@ class NPUModelRunner(GPUModelRunner):
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 )
             self._debug_stage_events = stage_events
+            self._debug_stage_debug_id = stage_debug_id
             try:
                 (
                     input_ids,
@@ -1259,6 +1275,7 @@ class NPUModelRunner(GPUModelRunner):
                 )
             finally:
                 self._debug_stage_events = None
+                self._debug_stage_debug_id = None
             # update global cos, sin
             update_cos_sin(positions)
 
@@ -1438,6 +1455,15 @@ class NPUModelRunner(GPUModelRunner):
                 logits = broadcasted["logits"]
 
             # Apply structured output bitmasks if present
+            execute_state_captured_event = torch.Event()
+            execute_state_captured_event.record()
+            stage_events["execute_state_captured_done"] = execute_state_captured_event
+            logger.info(
+                "!!!!! StageEvents.execute_state_captured "
+                "stage_debug_id=%s keys=%s",
+                stage_debug_id,
+                sorted(stage_events.keys()),
+            )
             self.execute_model_state = ExecuteModelState(
                 scheduler_output,
                 logits,
@@ -1451,6 +1477,7 @@ class NPUModelRunner(GPUModelRunner):
                 ec_connector_output,
                 cudagraph_stats,
                 dict(stage_events),
+                stage_debug_id,
             )
             self.kv_connector_output = kv_connector_output
         return None
@@ -1494,9 +1521,19 @@ class NPUModelRunner(GPUModelRunner):
             ec_connector_output,
             cudagraph_stats,
             stage_events,
+            stage_debug_id,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+        logger.info(
+            "!!!!! StageEvents.sample_tokens.enter "
+            "stage_debug_id=%s keys=%s",
+            stage_debug_id,
+            sorted(stage_events.keys()),
+        )
+        sample_tokens_enter_event = torch.Event()
+        sample_tokens_enter_event.record()
+        stage_events["sample_tokens_enter_done"] = sample_tokens_enter_event
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -1509,13 +1546,19 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("sample_token"):
             logger.info(
-                "!!!!! DefaultStream sample_tokens.sample.begin logits_shape=%s",
+                "!!!!! DefaultStream sample_tokens.sample.begin "
+                "stage_debug_id=%s logits_shape=%s",
+                stage_debug_id,
                 tuple(logits.shape),
             )
             sampler_output = self._sample(logits, spec_decode_metadata)
+            sample_done_event = torch.Event()
+            sample_done_event.record()
+            stage_events["sample_done"] = sample_done_event
             logger.info(
                 "!!!!! DefaultStream sample_tokens.sample.end "
-                "sampled_token_ids_shape=%s",
+                "stage_debug_id=%s sampled_token_ids_shape=%s",
+                stage_debug_id,
                 tuple(sampler_output.sampled_token_ids.shape),
             )
 
@@ -1559,10 +1602,14 @@ class NPUModelRunner(GPUModelRunner):
         )
         logger.info(
             "!!!!! DefaultStream sample_tokens.bookkeeping.end "
-            "valid_rows=%s invalid_req_count=%s",
+            "stage_debug_id=%s valid_rows=%s invalid_req_count=%s",
+            stage_debug_id,
             len(valid_sampled_token_ids),
             len(invalid_req_indices),
         )
+        bookkeeping_done_event = torch.Event()
+        bookkeeping_done_event.record()
+        stage_events["bookkeeping_done"] = bookkeeping_done_event
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
@@ -1629,6 +1676,15 @@ class NPUModelRunner(GPUModelRunner):
 
         if not self.use_async_scheduling:
             return model_runner_output
+        async_output_ctor_submit_event = torch.Event()
+        async_output_ctor_submit_event.record()
+        stage_events["async_output_ctor_submit_done"] = async_output_ctor_submit_event
+        logger.info(
+            "!!!!! StageEvents.async_output_ctor_submit "
+            "stage_debug_id=%s keys=%s",
+            stage_debug_id,
+            sorted(stage_events.keys()),
+        )
         async_output = AsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
             sampled_token_ids=sampler_output.sampled_token_ids,
@@ -1637,6 +1693,7 @@ class NPUModelRunner(GPUModelRunner):
             async_output_copy_stream=self.async_output_copy_stream,
             vocab_size=self.input_batch.vocab_size,
             stage_events=stage_events,
+            stage_debug_id=stage_debug_id,
         )
         return async_output
 
