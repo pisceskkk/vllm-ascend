@@ -1245,6 +1245,9 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 )
+                attn_metadata_done_event = torch.Event()
+                attn_metadata_done_event.record()
+                stage_events["attn_metadata_done"] = attn_metadata_done_event
 
             (
                 input_ids,
@@ -1260,9 +1263,15 @@ class NPUModelRunner(GPUModelRunner):
                 else total_num_scheduled_tokens,
                 intermediate_tensors,
             )
+            preprocess_done_event = torch.Event()
+            preprocess_done_event.record()
+            stage_events["preprocess_done"] = preprocess_done_event
 
             # update global cos, sin
             update_cos_sin(positions)
+            cos_sin_done_event = torch.Event()
+            cos_sin_done_event.record()
+            stage_events["cos_sin_done"] = cos_sin_done_event
 
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB weight D2D"):
@@ -1289,6 +1298,9 @@ class NPUModelRunner(GPUModelRunner):
                 head_dim=self.model_config.get_vocab_size(),
                 generators=self.input_batch.sampling_metadata.generators,
             )
+            async_exponential_done_event = torch.Event()
+            async_exponential_done_event.record()
+            stage_events["async_exponential_done"] = async_exponential_done_event
 
         # Encoder-decoder models can only compile the pure decode steps where no
         # encoder inputs are present. Use eager for the first pass.
@@ -1430,9 +1442,6 @@ class NPUModelRunner(GPUModelRunner):
                     tuple(logits.shape),
                     logits.dtype,
                 )
-                compute_logits_done_event = torch.Event()
-                compute_logits_done_event.record()
-                stage_events["compute_logits_done"] = compute_logits_done_event
             else:
                 # Rare case.
                 assert not self.is_pooling_model
