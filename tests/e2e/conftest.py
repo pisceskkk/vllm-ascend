@@ -453,7 +453,6 @@ class RemoteEPDServer(RemoteOpenAIServer):
             self.env_dict.update(env_dict)
 
         self.env_dict["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
-        self.env_dict["VLLM_USE_V1"] = "1"
         self.env_dict["PYTORCH_NPU_ALLOC_CONF"] = "expandable_segments:True"
         self.env_dict["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -693,7 +692,6 @@ def _run_vllm_runner_dp_worker(conn, llm_kwargs: dict[str, Any], dp_rank: int, d
         os.environ["VLLM_DP_MASTER_IP"] = "127.0.0.1"
         os.environ["VLLM_DP_MASTER_PORT"] = str(master_port)
         os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-        os.environ["VLLM_USE_V1"] = "1"
 
         llm = LLM(**llm_kwargs)
         conn.send({"status": "ready", "rank": dp_rank})
@@ -1088,17 +1086,16 @@ class DPVllmRunner(VllmRunner):
 
         for rank, conn in enumerate(self._dp_parent_conns):
             indices = shard_indices[rank]
-            worker_indices = indices or [0]
-            worker_prompts = _slice_list_inputs(prompts, worker_indices)
+            worker_prompts = _slice_list_inputs(prompts, indices)
             conn.send(
                 {
                     "command": command,
                     "indices": indices,
                     "inputs": self.get_inputs(
                         worker_prompts,
-                        images=_slice_optional_inputs(images, worker_indices),
-                        videos=_slice_optional_inputs(videos, worker_indices),
-                        audios=_slice_optional_inputs(audios, worker_indices),
+                        images=_slice_optional_inputs(images, indices),
+                        videos=_slice_optional_inputs(videos, indices),
+                        audios=_slice_optional_inputs(audios, indices),
                     ),
                     "prompts": worker_prompts,
                     **payload,
@@ -1131,12 +1128,11 @@ class DPVllmRunner(VllmRunner):
 
         for rank, conn in enumerate(self._dp_parent_conns):
             indices = shard_indices[rank]
-            worker_indices = indices or [0]
             conn.send(
                 {
                     "command": command,
                     "indices": indices,
-                    "prompts": _slice_list_inputs(prompts, worker_indices),
+                    "prompts": _slice_list_inputs(prompts, indices),
                 }
             )
 
@@ -1244,13 +1240,12 @@ class DPVllmRunner(VllmRunner):
 
         for rank, conn in enumerate(self._dp_parent_conns):
             indices = shard_indices[rank]
-            worker_indices = indices or [0]
             conn.send(
                 {
                     "command": "score",
                     "indices": indices,
-                    "text_1": _slice_list_inputs(normalized_text_1, worker_indices),
-                    "text_2": _slice_list_inputs(normalized_text_2, worker_indices),
+                    "text_1": _slice_list_inputs(normalized_text_1, indices),
+                    "text_2": _slice_list_inputs(normalized_text_2, indices),
                     "args": args,
                     "kwargs": kwargs,
                 }
