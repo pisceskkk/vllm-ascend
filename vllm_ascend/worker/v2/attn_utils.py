@@ -85,6 +85,8 @@ def build_attn_metadata(
             query_start_loc_cpu=query_start_loc_cpu,
             seq_lens_cpu=seq_lens_cpu,
             seq_lens=seq_lens[:num_reqs],
+            dcp_local_seq_lens=dcp_local_seq_lens,
+            num_computed_tokens_cpu=num_computed_tokens_cpu,
             num_reqs=num_reqs,
             num_actual_tokens=num_tokens,
             max_query_len=max_query_len,

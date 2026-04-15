@@ -23,6 +23,7 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
+from vllm_ascend.attention.utils import AscendPrefillContextParallelMetadata
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 
@@ -72,6 +73,13 @@ class AscendInputBatch(InputBatch):
     seq_lens_np: np.ndarray
     # attn_state is used to build attention metadata.
     attn_state: AscendAttentionState | None = None
+    # CPU tensor of num computed tokens for the scheduled requests.
+    num_computed_tokens_cpu: torch.Tensor | None = None
+    # Query lengths used by attention metadata. This may differ from
+    # `num_scheduled_tokens` when PCP pads hybrid-attn inputs.
+    query_lens: torch.Tensor | None = None
+    # PCP/DCP metadata built during attention preparation.
+    prefill_context_parallel_metadata: AscendPrefillContextParallelMetadata | None = None
 
     @classmethod
     def make_dummy(
@@ -100,6 +108,8 @@ class AscendInputBatch(InputBatch):
         # attention metadata isn't needed,
         # we can also set attn_state to AscendAttentionState.DecodeOnly.
         input_batch.attn_state = AscendAttentionState.DecodeOnly
+        input_batch.num_computed_tokens_cpu = torch.zeros(num_reqs, dtype=torch.int32)
+        input_batch.query_lens = torch.from_numpy(seq_lens_np)
         return cls(**asdict(input_batch), seq_lens_np=seq_lens_np)
 
 

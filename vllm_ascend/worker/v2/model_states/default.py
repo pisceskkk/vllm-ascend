@@ -52,7 +52,44 @@ class AscendModelState(DefaultModelState):
             num_reqs = input_batch.num_reqs
             num_tokens = input_batch.num_tokens
         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
-        max_query_len = input_batch.num_scheduled_tokens.max().item()
+        max_query_len = (
+            input_batch.query_lens.max().item()
+            if input_batch.query_lens is not None
+            else input_batch.num_scheduled_tokens.max().item()
+        )
+        prefill_context_parallel_metadata = None
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is not None and getattr(model_runner, "use_cp", False):
+            pcp_manager = model_runner.pcp_manager
+            assert pcp_manager is not None
+            while len(pcp_manager.pcp_padded_slot_mapping_list) < len(block_tables):
+                pcp_manager.initialize_slot_mapping()
+
+            updated_block_tables = list(block_tables)
+            prefill_context_parallel_metadata, updated_block_tables[0] = pcp_manager.generate_pcp_metadata(
+                num_tokens,
+                (input_batch.query_lens if input_batch.query_lens is not None
+                else torch.from_numpy(input_batch.num_scheduled_tokens)),
+                input_batch,
+                input_batch.num_scheduled_tokens,
+                updated_block_tables[0],
+                num_reqs,
+                input_batch.num_reqs,
+            )
+            block_tables = tuple(updated_block_tables)
+
+            if model_runner.pcp_size > 1:
+                padded_slot_mappings = []
+                for kv_cache_gid, slot_mapping in enumerate(slot_mappings):
+                    padded_slot_mappings.append(
+                        pcp_manager.get_padded_slot_mapping(
+                            num_tokens,
+                            input_batch.num_tokens_after_padding,
+                            slot_mapping,
+                            kv_cache_gid,
+                        )
+                    )
+                slot_mappings = torch.stack(padded_slot_mappings)
         # attn_metadata is needed when update_full_graph_params, but no way can get it now.
         # Temporarily store it in model_state.
         self.attn_metadata = build_attn_metadata(
@@ -70,6 +107,9 @@ class AscendModelState(DefaultModelState):
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             # extra attributes for ascend npus.
             seq_lens_np=input_batch.seq_lens_np,
+            num_computed_tokens_cpu=input_batch.num_computed_tokens_cpu,
+            positions=input_batch.positions,
             attn_state=input_batch.attn_state,
+            prefill_context_parallel_metadata=prefill_context_parallel_metadata,
         )
         return self.attn_metadata
