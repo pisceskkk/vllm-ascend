@@ -587,7 +587,6 @@ class KVCacheRecvingThread(threading.Thread):
         head_dim = self.model_config.hf_text_config.head_dim
         block_size = self.vllm_config.cache_config.block_size
         num_kv_head = max(self.model_config.hf_text_config.num_key_value_heads // self.tp_size, 1)
-        layers = self.model_config.hf_text_config.num_hidden_layers
         flat_block_ids = [item for sublist in block_ids for item in sublist]
         block_ids_tensor = torch.tensor(flat_block_ids, dtype=torch.int64, device=device)
 
@@ -597,6 +596,14 @@ class KVCacheRecvingThread(threading.Thread):
             k_caches.append(k_cache_layer)
             v_caches.append(v_cache_layer)
 
+        # Use the actual number of layers in k_caches/v_caches rather than
+        # num_hidden_layers, because when MTP (speculative decoding) is active
+        # the last PP stage appends one extra MTP KV-cache layer
+        # (end_layer_index + 1 in _transfer_kv_cache).  Using num_hidden_layers
+        # here would cause the fused op to skip that MTP layer, leaving its KV
+        # heads in the wrong interleaved order after GQA TP-split reassembly
+        # and degrading the speculative-decoding acceptance rate.
+        layers = len(k_caches)
         torch.ops._C_ascend.transpose_kv_cache_by_block(
             k_caches, v_caches, block_ids_tensor, block_size, num_kv_head, head_dim, tp_num_need_pulls, layers
         )
