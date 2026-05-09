@@ -539,7 +539,307 @@ vLLM-Ascend 支持两种模型适配方式：
 
 ---
 
-## 五、总结
+## 五、核心数据结构
+
+理解 vLLM 中关键数据结构的流转，是读懂源码的基础。以下按请求生命周期顺序梳理各阶段的核心数据结构。
+
+### 5.1 请求全生命周期数据结构
+
+```
+客户端 HTTP 请求
+  │
+  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ EngineCoreRequest  (API Server → Engine Core, 通过 ZMQ 传输)     │
+│   ├─ request_id: str                                            │
+│   ├─ prompt_token_ids: list[int]                                │
+│   ├─ mm_features: list[MultiModalFeatureSpec]                   │
+│   ├─ sampling_params: SamplingParams                            │
+│   ├─ arrival_time: float                                        │
+│   ├─ priority: int                                              │
+│   └─ lora_request: LoRARequest | None                           │
+└─────────────────────────────────────────────────────────────────┘
+  │  Scheduler.add_request()
+  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Request  (Scheduler 内部管理)                                    │
+│   ├─ request_id: str                                            │
+│   ├─ prompt_token_ids: list[int]                                │
+│   ├─ status: RequestStatus  (WAITING / RUNNING / FINISHED_*)    │
+│   ├─ num_computed_tokens: int  (已计算的 token 数)               │
+│   ├─ num_tokens: int  (prompt + 已生成的 token 总数)             │
+│   ├─ block_ids: list[int]  (分配的 KV Cache block 列表)          │
+│   ├─ sampling_params: SamplingParams                            │
+│   ├─ max_tokens: int                                            │
+│   ├─ stop_token_ids: set[int]                                   │
+│   ├─ output_token_ids: list[int]  (已生成的 token)               │
+│   └─ kv_transfer_params: dict | None  (分离式推理 KV 传输参数)    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**RequestStatus 状态机**：
+
+```
+                    ┌──────────┐
+        add_request │ WAITING  │
+        ───────────>│          │
+                    └────┬─────┘
+                         │ schedule() 分配 KV Cache 成功
+                         ▼
+                    ┌──────────┐
+                    │ RUNNING  │◄──────────────┐
+                    └────┬─────┘               │
+                         │                    │ 未完成，继续
+              ┌──────────┼──────────┐         │
+              ▼          ▼          ▼         │
+         EOS/stop   max_tokens   abort        │
+              │          │          │         │
+              ▼          ▼          ▼         │
+         FINISHED_  FINISHED_  FINISHED_      │
+         STOPPED    LENGTH_    ABORTED        │
+                    CAPPED                    │
+                                              │
+         WAITING_FOR_REMOTE_KVS ──────────────┘
+         (分离式推理：等待远端 KV Cache 到达后转为 RUNNING)
+```
+
+### 5.2 调度阶段数据结构
+
+```
+Scheduler.schedule() 输出:
+
+┌─────────────────────────────────────────────────────────────────┐
+│ SchedulerOutput                                                 │
+│   ├─ scheduled_new_reqs: list[NewRequestData]                   │
+│   │     ├─ req_id: str                                          │
+│   │     ├─ prompt_token_ids: list[int]                          │
+│   │     ├─ mm_features: list[MultiModalFeatureSpec]             │
+│   │     ├─ sampling_params: SamplingParams                      │
+│   │     ├─ block_ids: list[int]  (新分配的 KV Cache blocks)      │
+│   │     ├─ num_computed_tokens: int                             │
+│   │     ├─ lora_request: LoRARequest | None                     │
+│   │     └─ kv_transfer_params: dict | None                      │
+│   │                                                             │
+│   ├─ scheduled_cached_reqs: CachedRequestData                   │
+│   │     ├─ req_ids: list[str]                                   │
+│   │     ├─ resumed_req_ids: list[str]  (从 waiting 恢复的请求)   │
+│   │     ├─ num_computed_tokens: list[int]                       │
+│   │     ├─ new_block_ids: list[list[int]]  (新分配的 blocks)     │
+│   │     ├─ resumed_block_ids: list[list[int]]                   │
+│   │     └─ num_common_prefix_blocks: list[int]  (前缀缓存命中)   │
+│   │                                                             │
+│   ├─ num_scheduled_tokens: dict[str, int]                       │
+│   │     └─ {req_id: 本步调度的 token 数}                         │
+│   │                                                             │
+│   ├─ total_num_scheduled_tokens: int                            │
+│   ├─ scheduled_spec_decode_tokens: dict[str, list[int]]         │
+│   ├─ scheduled_encoder_inputs: dict[str, list[int]]             │
+│   └─ finished_req_ids: set[str]                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 5.3 模型执行阶段数据结构
+
+```
+Worker 输入准备:
+
+┌─────────────────────────────────────────────────────────────────┐
+│ NPUInputBatch  (ModelRunner 构建，传入 model.forward())          │
+│   ├─ input_ids: Tensor  [num_tokens]                            │
+│   ├─ positions: Tensor  [num_tokens]                            │
+│   ├─ query_start_loc: Tensor  [batch_size + 1]  (ragged batch)  │
+│   ├─ seq_lens: Tensor  [batch_size]                             │
+│   ├─ block_tables: Tensor  [batch_size, max_blocks_per_seq]     │
+│   ├─ slot_mappings: Tensor  [num_tokens]                        │
+│   ├─ is_token_ids: bool                                         │
+│   └─ num_prefills: int  (prefill 请求数)                         │
+└─────────────────────────────────────────────────────────────────┘
+
+Attention Metadata:
+
+┌─────────────────────────────────────────────────────────────────┐
+│ AscendMetadata  (AscendAttentionMetadataBuilder 构建)            │
+│   ├─ block_tables: Tensor  [batch_size, max_blocks_per_seq]     │
+│   ├─ seq_lens: Tensor  [batch_size]                             │
+│   ├─ context_lens: Tensor  [batch_size]                         │
+│   ├─ slot_mappings: Tensor  [num_tokens]                        │
+│   ├─ query_start_loc: Tensor  [batch_size + 1]                  │
+│   ├─ max_query_len: int                                         │
+│   ├─ max_seq_len: int                                           │
+│   ├─ num_prefills: int                                          │
+│   ├─ num_decode_tokens: int                                     │
+│   ├─ num_prefill_tokens: int                                    │
+│   └─ attn_type: str  (PrefillNoCache / DecodeOnly / ChunkedPrefill)│
+└─────────────────────────────────────────────────────────────────┘
+
+模型输出:
+
+┌─────────────────────────────────────────────────────────────────┐
+│ ModelRunnerOutput  (Worker → Engine Core)                       │
+│   ├─ req_ids: list[str]                                         │
+│   ├─ req_id_to_index: dict[str, int]                            │
+│   ├─ sampled_token_ids: list[list[int]]  (每个请求采样的 token)  │
+│   ├─ logprobs: LogprobsLists | None                             │
+│   ├─ prompt_logprobs: LogprobsLists | None                      │
+│   ├─ kv_connector_output: KVConnectorOutput | None              │
+│   └─ spec_decoding_output: SpecDecodingOutput | None            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 5.4 结果返回阶段数据结构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ EngineCoreOutput  (Engine Core → API Server, 通过 ZMQ 传输)      │
+│   ├─ request_id: str                                            │
+│   ├─ outputs: list[EngineCoreOutputItem]                        │
+│   │     ├─ token_ids: list[int]  (新生成的 token)                │
+│   │     ├─ logprobs: LogprobsLists | None                       │
+│   │     └─ finish_reason: FinishReason | None                   │
+│   ├─ finished: bool                                             │
+│   ├─ kv_transfer_params: dict | None                            │
+│   └─ trace_headers: dict | None                                 │
+└─────────────────────────────────────────────────────────────────┘
+  │  OutputProcessor.process_outputs()
+  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ RequestOutput  (返回给客户端)                                    │
+│   ├─ request_id: str                                            │
+│   ├─ prompt: str | None                                         │
+│   ├─ outputs: list[CompletionOutput]                            │
+│   │     ├─ text: str  (detokenized)                             │
+│   │     ├─ token_ids: list[int]                                 │
+│   │     ├─ logprobs: Logprobs | None                            │
+│   │     └─ finish_reason: str | None                            │
+│   ├─ finished: bool                                             │
+│   └─ metrics: RequestMetrics | None                             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 5.5 KV Cache 相关数据结构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ KVCacheBlock  (单个 KV Cache Block)                              │
+│   ├─ block_id: int  (全局唯一 ID)                                │
+│   ├─ ref_cnt: int  (引用计数，前缀缓存共享时 > 1)                 │
+│   ├─ is_null: bool  (是否为空 block)                             │
+│   └─ block_hash: int  (用于前缀缓存的哈希值)                      │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│ BlockTable  (每个 Request 的 KV Cache 映射表)                    │
+│   └─ block_ids: list[int]  (逻辑 block → 物理 block 的映射)      │
+│                                                                  │
+│   示例: Request 有 12 个 token, block_size=4                     │
+│   block_ids = [7, 3, 15]                                        │
+│   token 0-3  → block 7                                          │
+│   token 4-7  → block 3                                          │
+│   token 8-11 → block 15                                         │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│ SlotMapping  (每个 token → KV Cache 物理位置)                    │
+│   └─ slot_mappings[i] = block_id * block_size + block_offset    │
+│                                                                  │
+│   示例: token 5 在 block 3 的 offset 1                           │
+│   slot_mappings[5] = 3 * 4 + 1 = 13                             │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│ KVCacheManager  (全局 KV Cache 管理器)                           │
+│   ├─ block_pool: BlockPool  (所有 block 的池)                    │
+│   │     ├─ blocks: list[KVCacheBlock]                           │
+│   │     ├─ free_block_queue: FreeBlockQueue                     │
+│   │     └─ num_total_blocks: int                                │
+│   ├─ prefix_cache: PrefixCachingScheduler                       │
+│   │     └─ 基于 block_hash 的 LRU 缓存                           │
+│   └─ allocate_slots(req_id, num_tokens) → list[int]             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 5.6 配置体系数据结构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ VllmConfig  (全局配置根对象，贯穿整个调用链)                       │
+│   ├─ model_config: ModelConfig                                  │
+│   │     ├─ model: str  (模型路径或 HuggingFace ID)               │
+│   │     ├─ dtype: str  (float16 / bfloat16 / ...)               │
+│   │     ├─ max_model_len: int                                   │
+│   │     ├─ tokenizer: str                                       │
+│   │     ├─ trust_remote_code: bool                              │
+│   │     └─ hf_config: PretrainedConfig                          │
+│   │                                                             │
+│   ├─ cache_config: CacheConfig                                  │
+│   │     ├─ block_size: int  (通常 16)                            │
+│   │     ├─ gpu_memory_utilization: float  (通常 0.9)             │
+│   │     ├─ enable_prefix_caching: bool                          │
+│   │     └─ kv_cache_dtype: str  (auto / fp8 / ...)              │
+│   │                                                             │
+│   ├─ parallel_config: ParallelConfig                            │
+│   │     ├─ tensor_parallel_size: int  (tp)                      │
+│   │     ├─ pipeline_parallel_size: int  (pp)                    │
+│   │     ├─ data_parallel_size: int  (dp)                        │
+│   │     └─ context_parallel_size: int  (cp)                     │
+│   │                                                             │
+│   ├─ scheduler_config: SchedulerConfig                          │
+│   │     ├─ max_num_seqs: int  (最大并发请求数)                   │
+│   │     ├─ max_num_batched_tokens: int  (每步最大 token 数)      │
+│   │     ├─ max_model_len: int                                   │
+│   │     └─ policy: str  (fcfs / priority)                       │
+│   │                                                             │
+│   ├─ compilation_config: CompilationConfig                      │
+│   │     ├─ mode: CompilationMode  (0/1/2/3)                     │
+│   │     ├─ cudagraph_capture_sizes: list[int]                   │
+│   │     └─ cudagraph_mode: CUDAGraphMode                        │
+│   │                                                             │
+│   ├─ lora_config: LoRAConfig | None                             │
+│   ├─ speculative_config: SpeculativeConfig | None               │
+│   ├─ observability_config: ObservabilityConfig                  │
+│   ├─ kv_transfer_config: KVTransferConfig | None                │
+│   ├─ quant_config: QuantizationConfig | None                    │
+│   ├─ additional_config: dict  ★ vllm-ascend 在此注入 ascend_config ★│
+│   └─ instance_id: str                                           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 5.7 数据流全景图
+
+```
+API Server 进程                    Engine Core 进程                  Worker 进程
+─────────────                      ────────────────                  ───────────
+
+HTTP Request                        ZMQ Input Queue
+  │                                    │
+  ▼                                    ▼
+EngineCoreRequest ────ZMQ────>  Scheduler.add_request()
+                                     │
+                                     ▼
+                                  Request (WAITING)
+                                     │
+                                     ▼ schedule()
+                                  SchedulerOutput ──────ZMQ────>  NPUWorker.execute_model()
+                                     │                                │
+                                     │                                ▼
+                                     │                          NPUInputBatch
+                                     │                                │
+                                     │                                ▼
+                                     │                          model.forward()
+                                     │                                │
+                                     │                                ▼
+                                  ModelRunnerOutput <────ZMQ───  ModelRunnerOutput
+                                     │
+                                     ▼ update_from_output()
+                                  EngineCoreOutput ────ZMQ────>  OutputProcessor
+                                                                     │
+                                                                     ▼
+                                                                  RequestOutput ──> SSE Stream
+```
+
+---
+
+## 六、总结
 
 vLLM-Ascend 的插件化设计核心思路是：
 
@@ -548,3 +848,71 @@ vLLM-Ascend 的插件化设计核心思路是：
 3. **通过 Patch 机制兜底**：对于无法通过接口替换的硬编码逻辑，使用 Monkey Patch 临时适配
 4. **Worker/ModelRunner 继承复用**：NPUWorker 继承 WorkerBase，NPUModelRunner 继承 GPUModelRunner，最大化复用 vLLM 调度、KV Cache 管理等核心逻辑
 5. **AscendC 自定义算子 + ACL Graph 提供极致性能**：PagedAttention、FusedMoE、RMSNorm 等关键算子均有 NPU 定制实现
+
+---
+
+## 七、关键文档索引
+
+### 7.1 vLLM 官方文档
+
+| 文档 | 路径 | 说明 |
+|------|------|------|
+| 架构概览 | `vllm/docs/design/arch_overview.md` | V1 多进程架构、Engine/Worker/ModelRunner 层次结构 |
+| 插件系统 | `vllm/docs/design/plugin_system.md` | Platform Plugin、General Plugin 机制详解 |
+| PagedAttention | `vllm/docs/design/paged_attention.md` | KV Cache 分页管理、Block Table 设计 |
+| Prefix Caching | `vllm/docs/design/prefix_caching.md` | 前缀缓存自动命中与复用机制 |
+| Hybrid KV Cache | `vllm/docs/design/hybrid_kv_cache_manager.md` | 混合 KV Cache 管理器设计 |
+| HuggingFace 集成 | `vllm/docs/design/huggingface_integration.md` | 模型加载、Config 解析、权重映射 |
+| 多模态支持 | `vllm/docs/design/multimodal/multimodal.md` | 多模态数据处理流程 |
+| 配置选项 | `vllm/docs/configuration/engine_args.md` | Engine 启动参数完整列表 |
+| 环境变量 | `vllm/docs/configuration/env_vars.md` | 所有环境变量说明 |
+| OpenAI 兼容 API | `vllm/docs/serving/openai_compatible_server.md` | API 接口规范 |
+| 离线推理 | `vllm/docs/design/offline_inference.md` | LLM 类离线推理流程 |
+| 量化 | `vllm/docs/features/quantization/` | 量化方案总览 |
+| LoRA | `vllm/docs/features/lora.md` | LoRA 适配器机制 |
+| 投机解码 | `vllm/docs/features/spec_decode.md` | 投机解码设计 |
+| 分离式推理 | `vllm/docs/features/disagg_prefill.md` | Prefill/Decode 分离架构 |
+| 添加新模型 | `vllm/docs/contributing/model/basic.md` | 如何在 vLLM 中添加新模型 |
+
+### 7.2 vLLM-Ascend 文档
+
+| 文档 | 路径 | 说明 |
+|------|------|------|
+| 全流程架构（本文档） | `vllm-ascend/docs/source/developer_guide/Design_Documents/vllm_ascend_architecture_flow.md` | 服务启动、推理全流程 + 核心数据结构 |
+| Patch 机制 | `vllm-ascend/docs/source/developer_guide/Design_Documents/patch.md` | Patch 原则、分类、清理指南 |
+| 添加新模型 | `vllm-ascend/docs/source/developer_guide/modeling/adding_a_new_model.md` | Ascend 模型适配开发指南 |
+| 量化指南 | `vllm-ascend/docs/source/developer_guide/Design_Documents/quantization.md` | Ascend 量化方案 (W8A8/W4A8/FP8) |
+| FP8 on NPU | `vllm-ascend/.agents/skills/vllm-ascend-model-adapter/references/fp8-on-npu-lessons.md` | FP8 量化在 NPU 上的实践经验 |
+| 多模态 EP + ACLGraph | `vllm-ascend/.agents/skills/vllm-ascend-model-adapter/references/multimodal-ep-aclgraph-lessons.md` | 多模态 + Expert Parallel + ACLGraph 组合经验 |
+| 故障排查 | `vllm-ascend/.agents/skills/vllm-ascend-model-adapter/references/troubleshooting.md` | 常见问题排查指南 |
+| 开发工作流 | `vllm-ascend/.agents/skills/vllm-ascend-model-adapter/references/workflow-checklist.md` | 模型适配开发检查清单 |
+| LoRA 特性 | `vllm-ascend/docs/source/user_guide/feature_guide/lora.md` | Ascend LoRA 使用指南 |
+| 安装指南 | `vllm-ascend/docs/source/user_guide/installation.md` | 环境安装与依赖配置 |
+| 发布说明 | `vllm-ascend/docs/source/release_notes/` | 各版本 Release Notes |
+
+### 7.3 关键源码入口
+
+| 模块 | 文件 | 关键类/函数 |
+|------|------|-----------|
+| CLI 入口 | `vllm/entrypoints/cli/serve.py` | `ServeSubcommand.cmd()` |
+| API Server | `vllm/entrypoints/openai/api_server.py` | `run_server()` → `serve_http()` |
+| AsyncLLM | `vllm/v1/engine/async_llm.py` | `AsyncLLM.generate()`, `output_handler()` |
+| Engine Core | `vllm/v1/engine/core.py` | `EngineCore.run_busy_loop()`, `step()` |
+| Scheduler | `vllm/v1/core/sched/scheduler.py` | `Scheduler.schedule()`, `update_from_output()` |
+| KV Cache Manager | `vllm/v1/core/kv_cache_manager.py` | `KVCacheManager.allocate_slots()` |
+| Block Pool | `vllm/v1/core/block_pool.py` | `BlockPool`, `KVCacheBlock` |
+| Worker Base | `vllm/v1/worker/worker_base.py` | `WorkerBase.execute_model()` |
+| GPU Worker | `vllm/v1/worker/gpu_worker.py` | `Worker` |
+| GPU ModelRunner | `vllm/v1/worker/gpu/model_runner.py` | `GPUModelRunner.execute_model()` |
+| Attention Selector | `vllm/v1/attention/selector.py` | `get_attn_backend()` |
+| Platform 发现 | `vllm/platforms/__init__.py` | `resolve_current_platform_cls_qualname()` |
+| VllmConfig | `vllm/config/vllm.py` | `VllmConfig` |
+| **Ascend 插件入口** | `vllm_ascend/__init__.py` | `register()`, `register_connector()` 等 |
+| **Ascend Platform** | `vllm_ascend/platform.py` | `NPUPlatform` |
+| **Ascend Worker** | `vllm_ascend/worker/worker.py` | `NPUWorker` |
+| **Ascend ModelRunner** | `vllm_ascend/worker/model_runner_v1.py` | `NPUModelRunner` |
+| **Ascend Attention** | `vllm_ascend/attention/attention_v1.py` | `AscendAttentionBackendImpl` |
+| **Ascend Patch** | `vllm_ascend/patch/__init__.py` | `adapt_patch()` |
+| **Ascend 量化** | `vllm_ascend/quantization/` | Ascend 量化方案实现 |
+| **Ascend 图编译** | `vllm_ascend/compilation/` | `ACLGraphWrapper`, `AscendCompiler` |
+| **Ascend 模型** | `vllm_ascend/models/` | Ascend 专用模型实现 |
