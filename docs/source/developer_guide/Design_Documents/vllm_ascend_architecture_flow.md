@@ -10,9 +10,9 @@ vLLM V1 采用**多进程架构**，核心进程包括：
 
 | 进程 | 数量 | 职责 |
 |------|------|------|
-| **API Server** | 1（或 dp_size 个） | HTTP 请求处理、Tokenization、结果流式返回 |
+| **API Server** | api-server-count | HTTP 请求处理、Tokenization、结果流式返回 |
 | **Engine Core** | 1（或 dp_size 个） | 调度、KV Cache 管理、协调 Worker |
-| **GPU/NPU Worker** | tp_size × pp_size 个 | 模型加载、前向推理 |
+| **GPU/NPU Worker** | dp_size × tp_size × pp_size 个 | 模型加载、前向推理 |
 | **DP Coordinator** | 1（dp>1 时） | 数据并行协调 |
 
 进程间通过 **ZMQ Socket** 通信。
