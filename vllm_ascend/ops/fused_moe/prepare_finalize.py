@@ -459,17 +459,26 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
     def _finalize_with_dp_group(self, hidden_states: torch.Tensor, reduce_results: bool) -> torch.Tensor:
         """
         Finalization steps:
-          1. If DP > 1 and not shared expert, reduce-scatter output across DP group.
-          2. Slice to original local token count.
-          3. If `reduce_results=True` and TP/EP > 1, apply tensor_model_parallel_all_reduce.
+          1. If PCP > 1, reduce-scatter output across PCP group first.
+          2. If DP > 1 and not shared expert, reduce-scatter output across DP group,
+             then slice to original local token count.
+          3. If PCP-only (DP == 1), slice to original per-PCP-rank token count.
+          4. If `reduce_results=True` and TP/EP > 1, apply tensor_model_parallel_all_reduce.
+
+        NOTE: PCP reduce_scatter must precede DP reduce_scatter to correctly
+        reconstruct the tensor layout (all-gather concats DP first, then PCP).
 
         Returns:
             Tensor with shape [original_local_num_tokens, hidden_size]
         """
+        if self.moe_config.pcp_size > 1:
+            hidden_states = get_pcp_group().reduce_scatter(hidden_states, dim=0)
+
         if self.moe_config.dp_size > 1 and not self.enable_shared_expert_dp:
             hidden_states = get_dp_group().reduce_scatter(hidden_states, 0)
             hidden_states = hidden_states[: self.num_tokens]
+        elif self.moe_config.pcp_size > 1:
+            # PCP-only (no DP): truncate padded tokens after reduce_scatter
+            hidden_states = hidden_states[: self.num_tokens_pcp]
 
-        if self.moe_config.pcp_size > 1:
-            hidden_states = get_pcp_group().reduce_scatter(hidden_states, dim=0)
         return hidden_states
