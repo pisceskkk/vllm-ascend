@@ -7,43 +7,43 @@ log() {
     echo "[build_aclnn] $*"
 }
 
-resolve_op_dir() {
+find_op_dir() {
     local op_name=$1
-    local candidate_dir
-    for candidate_dir in \
+    local dir
+    for dir in \
         "${ROOT_DIR}/csrc/moe/${op_name}" \
         "${ROOT_DIR}/csrc/gmm/${op_name}" \
         "${ROOT_DIR}/csrc/attention/${op_name}" \
         "${ROOT_DIR}/csrc/mc2/${op_name}" \
         "${ROOT_DIR}/csrc/ffn/${op_name}" \
         "${ROOT_DIR}/csrc/posembedding/${op_name}"; do
-        if [[ -d "${candidate_dir}" ]]; then
-            echo "${candidate_dir}"
+        if [[ -d "${dir}" ]]; then
+            echo "${dir}"
             return 0
         fi
     done
     find "${ROOT_DIR}/csrc" -maxdepth 3 -type d -name "${op_name}" -print -quit 2>/dev/null
 }
 
-log_selected_ops() {
+dump_selected_ops() {
     local op_name
-    local op_path
-    local kernel_cpp_file_count
+    local op_dir
+    local kernel_cpp_count
 
     log "resolved SOC_ARG=${SOC_ARG}"
     log "resolved CUSTOM_OPS=${CUSTOM_OPS}"
     log "custom op count=${#CUSTOM_OPS_ARRAY[@]}"
     for op_name in "${CUSTOM_OPS_ARRAY[@]}"; do
-        op_path=$(resolve_op_dir "${op_name}")
-        if [[ -z "${op_path}" ]]; then
+        op_dir=$(find_op_dir "${op_name}")
+        if [[ -z "${op_dir}" ]]; then
             log "op ${op_name}: dir=<missing>"
             continue
         fi
-        kernel_cpp_file_count=0
-        if [[ -d "${op_path}/op_kernel" ]]; then
-            kernel_cpp_file_count=$(find "${op_path}/op_kernel" -maxdepth 1 -name '*.cpp' | wc -l | tr -d ' ')
+        kernel_cpp_count=0
+        if [[ -d "${op_dir}/op_kernel" ]]; then
+            kernel_cpp_count=$(find "${op_dir}/op_kernel" -maxdepth 1 -name '*.cpp' | wc -l | tr -d ' ')
         fi
-        log "op ${op_name}: dir=${op_path} cmake=$([[ -f "${op_path}/CMakeLists.txt" ]] && echo yes || echo no) op_host_cmake=$([[ -f "${op_path}/op_host/CMakeLists.txt" ]] && echo yes || echo no) op_kernel_cpp_count=${kernel_cpp_file_count}"
+        log "op ${op_name}: dir=${op_dir} cmake=$([[ -f "${op_dir}/CMakeLists.txt" ]] && echo yes || echo no) op_host_cmake=$([[ -f "${op_dir}/op_host/CMakeLists.txt" ]] && echo yes || echo no) op_kernel_cpp_count=${kernel_cpp_count}"
     done
 }
 
@@ -59,7 +59,7 @@ if [[ "$SOC_VERSION" =~ ^ascend310 ]]; then
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend310p"
-elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
+elif [[ "$SOC_VERSION" =~ ^(ascend)?910b ]]; then
     log "matched SOC branch: ascend910b"
     # ASCEND910B (A2) series
     # dependency: catlass
@@ -77,6 +77,8 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
     log "catlass include=${ABSOLUTE_CATLASS_PATH}"
 
     CUSTOM_OPS_ARRAY=(
+        "dequant_swiglu_quant"
+        "scatter_nd_update_v2"
         "moe_grouped_matmul"
         "grouped_matmul_swiglu_quant_weight_nz_tensor_list"
         "lightning_indexer_vllm"
@@ -84,15 +86,27 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
         "matmul_allreduce_add_rmsnorm"
         "moe_init_routing_custom"
         "moe_gating_top_k"
+        "moe_gating_top_k_hash"
         "add_rms_norm_bias"
         "apply_top_k_top_p_custom"
         "transpose_kv_cache_by_block"
         "copy_and_expand_eagle_inputs"
         "causal_conv1d"
         "lightning_indexer_quant"
-        "hamming_dist_top_k"
-        "reshape_and_cache_bnsd"
-        "recurrent_gated_delta_rule"
+        "compressor"
+        "quant_lightning_indexer"
+        "quant_lightning_indexer_metadata"
+        "lightning_indexer_quant_metadata"
+        "sparse_attn_sharedkv"
+        "sparse_attn_sharedkv_metadata"
+        "hc_pre_sinkhorn"
+        "hc_pre_inv_rms"
+        "hc_post"
+        "hc_pre"
+        "rms_norm_dynamic_quant"
+        "inplace_partial_rotary_mul"
+        "grouped_matmul_swiglu_quant"
+        "grouped_matmul_swiglu_quant_v2"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
@@ -152,6 +166,8 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
     cp "$HCCL_STRUCT_FILE_PATH" "$TARGET_DIR"
     
     CUSTOM_OPS_ARRAY=(
+        "dequant_swiglu_quant"
+        "scatter_nd_update_v2"
         "grouped_matmul_swiglu_quant_weight_nz_tensor_list"
         "lightning_indexer_vllm"
         "sparse_flash_attention"
@@ -165,6 +181,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "notify_dispatch"
         "moe_init_routing_custom"
         "moe_gating_top_k"
+        "moe_gating_top_k_hash"
         "add_rms_norm_bias"
         "apply_top_k_top_p_custom"
         "transpose_kv_cache_by_block"
@@ -172,9 +189,19 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "causal_conv1d"
         "moe_grouped_matmul"
         "lightning_indexer_quant"
-        "hamming_dist_top_k"
-        "reshape_and_cache_bnsd"
-        "recurrent_gated_delta_rule"
+        "compressor"
+        "quant_lightning_indexer"
+        "quant_lightning_indexer_metadata"
+        "sparse_attn_sharedkv"
+        "sparse_attn_sharedkv_metadata"
+        "hc_pre_sinkhorn"
+        "hc_pre_inv_rms"
+        "hc_post"
+        "hc_pre"
+        "rms_norm_dynamic_quant"
+        "inplace_partial_rotary_mul"
+        "grouped_matmul_swiglu_quant"
+        "grouped_matmul_swiglu_quant_v2"
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend910_93"
@@ -185,8 +212,7 @@ else
     exit 0
 fi
 
-log_selected_ops
-
+dump_selected_ops
 
 # # build custom ops
 # cd csrc
@@ -217,31 +243,31 @@ log_selected_ops
   bash build.sh --pkg --ops="${CUSTOM_OPS}" --soc="${SOC_ARG}"
   log "build.sh finished"
 
-  custom_ops_install_dir="${ROOT_DIR}/vllm_ascend/_cann_ops_custom"
-  log "custom_ops_install_dir=${custom_ops_install_dir}"
+  install_dir="${ROOT_DIR}/vllm_ascend/_cann_ops_custom"
+  log "install_dir=${install_dir}"
 
-  mkdir -p -- "$custom_ops_install_dir"
+  mkdir -p -- "$install_dir"
 
-  # Remove all top-level entries under custom_ops_install_dir except .gitkeep, including hidden files and directories.
-  find "$custom_ops_install_dir" -mindepth 1 -maxdepth 1 \
+  # 删除 install_dir 下除 .gitkeep 外的所有内容（包含隐藏文件/目录）
+  find "$install_dir" -mindepth 1 -maxdepth 1 \
     ! -name '.gitkeep' \
     -exec rm -rf -- {} +
 
   shopt -s nullglob
-  installer_candidates=(./build/cann-ops-transformer*.run)
+  runs=(./build/cann-ops-transformer*.run)
   shopt -u nullglob
 
-  log "installer candidate count=${#installer_candidates[@]}"
-  for installer_file in "${installer_candidates[@]}"; do
-    log "installer candidate: $(ls -lh "${installer_file}")"
+  log "installer candidate count=${#runs[@]}"
+  for run_file in "${runs[@]}"; do
+    log "installer candidate: $(ls -lh "${run_file}")"
   done
 
-  (( ${#installer_candidates[@]} == 1 )) || { echo "ERROR: expected 1 installer, got ${#installer_candidates[@]}" >&2; exit 1; }
+  (( ${#runs[@]} == 1 )) || { echo "ERROR: expected 1 installer, got ${#runs[@]}" >&2; exit 1; }
 
-  chmod +x -- "${installer_candidates[0]}" || true
-  log "running installer: ${installer_candidates[0]}"
-  "${installer_candidates[0]}" --install-path="${custom_ops_install_dir}"
+  chmod +x -- "${runs[0]}" || true
+  log "running installer: ${runs[0]}"
+  "${runs[0]}" --install-path="${install_dir}"
   log "installer finished"
-  log "installed files under ${custom_ops_install_dir} (maxdepth=4, first 120 entries):"
-  { find "${custom_ops_install_dir}" -mindepth 1 -maxdepth 4 -print | sort | head -n 120 | sed 's#^#[build_aclnn] install: #'; } || true
+  log "installed files under ${install_dir} (maxdepth=4, first 120 entries):"
+  { find "${install_dir}" -mindepth 1 -maxdepth 4 -print | sort | head -n 120 | sed 's#^#[build_aclnn] install: #'; } || true
 )
