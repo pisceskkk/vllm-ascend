@@ -73,10 +73,12 @@ class FusedExpertsResult:
     # communication method that supports shared experts in parallel with routed
     # experts.
     before_dispatch_evt: torch.npu.Event | None = None
+    before_gmm2_evt: torch.npu.Event | None = None
     before_combine_evt: torch.npu.Event | None = None
     # For dynamic_eplb
     group_list_type: int = 1
     expert_tokens: torch.Tensor | None = None
+    swiglu_limit: int = 0
 
 
 class MoECommMethod(ABC):
@@ -141,6 +143,8 @@ class MoECommMethod(ABC):
             use_fusion_ops=self.use_fusion_ops,
         )
 
+        mlp_output, before_gmm2_evt = self._apply_mlp(mlp_compute_input)
+
         mlp_output = self._apply_mlp(mlp_compute_input)
 
         before_combine_evt = torch.npu.current_stream().record_event()
@@ -152,9 +156,11 @@ class MoECommMethod(ABC):
         return FusedExpertsResult(
             routed_out=routed_out,
             before_dispatch_evt=before_dispatch_evt,
+            before_gmm2_evt=before_gmm2_evt,
             before_combine_evt=before_combine_evt,
             group_list_type=token_dispatch_output.group_list_type,
             expert_tokens=token_dispatch_output.group_list,
+            swiglu_limit=fused_experts_input.swiglu_limit
         )
 
     def _apply_mlp(self, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
@@ -208,6 +214,8 @@ class MC2CommImpl(MoECommMethod):
     This implementation uses the MC2 communication method, which is optimized for
     Communication and Computation parallelism on Ascend devices.
     """
+    def pad_and_split_input_ids(self, input_ids):
+        return self.prepare_finalize.pad_and_split_input_ids(input_ids)
 
     def _get_token_dispatcher(self):
         return TokenDispatcherWithMC2()
@@ -225,7 +233,9 @@ class AlltoAllCommImpl(MoECommMethod):
     between data parallel ranks before and after the MLP computation. It should
     have better performance than AllGatherCommImpl when DP size > 1.
     """
-
+    def pad_and_split_input_ids(self, input_ids):
+        return self.prepare_finalize.pad_and_split_input_ids(input_ids)
+    
     def _get_token_dispatcher(self):
         return TokenDispatcherWithAll2AllV(
             top_k=self.moe_config.experts_per_token,
@@ -253,6 +263,9 @@ class FusedMC2CommImpl(MoECommMethod):
             self.expert_token_nums = torch.zeros([self.moe_config.num_local_experts], dtype=torch.int32, device="npu")
         else:
             self.expert_token_nums = None
+    
+    def pad_and_split_input_ids(self, input_ids):
+        return self.prepare_finalize.pad_and_split_input_ids(input_ids)
 
     def _get_token_dispatcher(self):
         return TokenDispatcherWithMC2()
@@ -266,6 +279,10 @@ class FusedMC2CommImpl(MoECommMethod):
     ):
         assert not (fused_experts_input.weights.w1_scale is None or fused_experts_input.weights.w2_scale is None), (
             "w1_scale and w2_scale cannot be None for FusedMC2CommImpl."
+        )
+
+        assert not (fused_experts_input.weights.w1_scale_bias is None or fused_experts_input.weights.w2_scale_bias is None), (
+            "w1_scale_bias and w2_scale_bias cannot be None for FusedMC2CommImpl."
         )
 
         assert isinstance(self.token_dispatcher, TokenDispatcherWithMC2), (
@@ -292,6 +309,7 @@ class FusedMC2CommImpl(MoECommMethod):
                 probs=fused_experts_input.topk_weights.to(torch.float32),
                 group=self.token_dispatcher.moe_all_to_all_group_name,
                 max_output_size=65536,
+                swiglu_limit=fused_experts_input.swiglu_limit,
                 x_active_mask=fused_experts_input.routing.mc2_mask,
                 out=out,
                 expert_token_nums=self.expert_token_nums,
@@ -316,4 +334,4 @@ class FusedMC2CommImpl(MoECommMethod):
             )
         else:
             raise ValueError(f"Wrong value of {envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2=}")
-        return FusedExpertsResult(routed_out=out, expert_tokens=expert_tokens)
+        return FusedExpertsResult(routed_out=out, expert_tokens=expert_tokens, swiglu_limit=fused_experts_input.swiglu_limit)
