@@ -282,6 +282,26 @@
 #       Remove this patch once the vLLM fix is included in the supported vLLM
 #       version.
 #
+# ** 12. File: platform/patch_deepseek_v4_agentic.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.tokenizers.registry.TokenizerRegistry`
+#      `vllm.tool_parsers.ToolParserManager`
+#      `vllm.reasoning.ReasoningParserManager`
+#    Why:
+#       The runtime vLLM version used by vllm-ascend does not yet contain the
+#       DeepSeek V4 tokenizer mode, DSML tool-call parser, or reasoning parser
+#       alias needed by agentic serving.
+#    How:
+#       Backport the DeepSeek V4 prompt renderer/tokenizer wrapper and DSML
+#       tool parser, then register `deepseek_v4` with the tokenizer, tool
+#       parser, and reasoning parser registries.
+#    Related PR (if no, explain why):
+#       Backported from local upstream vLLM commit
+#       e874f918281f3349904b3b5e7124c880d223721a.
+#    Future Plan:
+#       Remove this patch once DeepSeek V4 agentic support is present in the
+#       runtime vLLM version used by vllm-ascend.
+#
 # * Worker Patch:
 # ===============
 #
