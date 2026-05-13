@@ -65,7 +65,7 @@ from vllm.model_executor.models.utils import (
     sequence_parallel_chunk)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+from vllm.model_executor.layers.deepseek_v4_attention import DeepseekV4IndexerCache
 from vllm.model_executor.layers.deepseek_compressor import CompressorStateCache
 from vllm_ascend.utils import (
     AscendDeviceType,
@@ -362,24 +362,27 @@ class DeepseekV4MoE(nn.Module):
             fused_moe_out = self.experts(hidden_states=hidden_states,
                                          router_logits=router_logits)
 
-        shared_output, final_hidden_states = fused_moe_out
-        if self.shared_experts is None:
-            assert shared_output is None
+        if isinstance(fused_moe_out, tuple):
+            shared_output, final_hidden_states = fused_moe_out
+            if self.shared_experts is None:
+                assert shared_output is None
 
-        if hidden_states.dtype != torch.float16:
-            if not self.is_rocm_aiter_moe_enabled:
-                if self.shared_experts is not None:
-                    assert shared_output is not None
-                    final_hidden_states = muls_add_triton(
-                        final_hidden_states, shared_output,
-                        self.routed_scaling_factor)
-                else:
-                    final_hidden_states *= self.routed_scaling_factor
-        elif self.shared_experts is not None:
-            assert shared_output is not None
-            final_hidden_states = muls_add_triton(
-                shared_output, final_hidden_states,
-                1.0 / self.routed_scaling_factor)
+            if hidden_states.dtype != torch.float16:
+                if not self.is_rocm_aiter_moe_enabled:
+                    if self.shared_experts is not None:
+                        assert shared_output is not None
+                        final_hidden_states = muls_add_triton(
+                            final_hidden_states, shared_output,
+                            self.routed_scaling_factor)
+                    else:
+                        final_hidden_states *= self.routed_scaling_factor
+            elif self.shared_experts is not None:
+                assert shared_output is not None
+                final_hidden_states = muls_add_triton(
+                    shared_output, final_hidden_states,
+                    1.0 / self.routed_scaling_factor)
+        else:
+            final_hidden_states = fused_moe_out
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
@@ -453,7 +456,7 @@ class Indexer(nn.Module):
 
         if self.compress_ratio == 4:
             # TODO(cmq): change the dtype of cache
-            self.k_cache = DeepseekV32IndexerCache(
+            self.k_cache = DeepseekV4IndexerCache(
                 head_dim=self.head_dim,
                 dtype=k_dtype,
                 prefix=f"{prefix}.k_cache",
