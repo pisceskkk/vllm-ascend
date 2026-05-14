@@ -931,6 +931,16 @@ class DeepseekV4Model(nn.Module):
             torch.empty(hc_mult, dtype=torch.float32))
         self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
 
+        # Pre-hc_head residual stream buffer for the MTP draft. Stable
+        # address (outside the cudagraph pool) so the copy_ in forward()
+        # refreshes it correctly across captured shapes.
+        self._mtp_hidden_buffer = torch.empty(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            hc_dim,
+            dtype=vllm_config.model_config.dtype,
+            device=self.device,
+        )
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -980,6 +990,11 @@ class DeepseekV4Model(nn.Module):
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual,
                                             llama_4_scaling)
+
+        # Stash pre-hc_head residual for the MTP draft (captured copy_).
+        num_tokens = hidden_states.shape[0]
+        self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+
         hidden_states = self.hc_head(hidden_states, self.hc_head_fn,
                                      self.hc_head_scale, self.hc_head_base)
         if not get_pp_group().is_last_rank:
@@ -1122,6 +1137,12 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP,
              if getattr(get_ascend_config(), "mix_placement", False) else 0),
             num_redundant_experts=0,
         )
+
+    def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
+        """Pre-hc_head residual stream buffer (max_num_batched_tokens,
+        hc_mult * hidden_size) for the MTP draft model. Populated by
+        forward(); valid after each target step."""
+        return getattr(self.model, "_mtp_hidden_buffer", None)
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
