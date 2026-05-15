@@ -16,3 +16,8 @@ def test_dsv4_mtp_projection_scales_are_remapped_for_loading():
     assert '".e_proj."' in _DSV4_MTP_SOURCE
     assert '".h_proj."' in _DSV4_MTP_SOURCE
     assert '".weight_scale_inv"' in _DSV4_MTP_SOURCE
+
+
+def test_dsv4_mtp_h_proj_flattens_hc_dimension_before_linear():
+    assert "previous_hidden_states.reshape(-1, self.config.hidden_size)" in _DSV4_MTP_SOURCE
+    assert "previous_hidden_states_proj.reshape(" in _DSV4_MTP_SOURCE

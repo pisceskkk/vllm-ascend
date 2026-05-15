@@ -139,8 +139,13 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         previous_hidden_states = previous_hidden_states.view(-1, self.hc_mult, self.config.hidden_size)
         previous_hidden_states = self.hnorm(previous_hidden_states)
 
+        # Ascend W8A8_DYNAMIC linear kernels expect token-major 2D inputs.
+        previous_hidden_states_proj = self.h_proj(
+            previous_hidden_states.reshape(-1, self.config.hidden_size))
+        previous_hidden_states_proj = previous_hidden_states_proj.reshape(
+            -1, self.hc_mult, self.config.hidden_size)
         hidden_states = (self.e_proj(inputs_embeds).unsqueeze(-2) +
-                         self.h_proj(previous_hidden_states))
+                         previous_hidden_states_proj)
 
         hidden_states, residual = self.mtp_block(positions=positions,
                                                  hidden_states=hidden_states,
