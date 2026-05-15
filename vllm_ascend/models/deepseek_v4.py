@@ -327,8 +327,7 @@ class DeepseekV4MoE(nn.Module):
             # Keep scaling outside the router path so the order matches
             # DeepSeek V4: normalize top-k weights, then scale routed output.
             # AITER applies routed_scaling_factor internally.
-            routed_scaling_factor=1.0 if not self.is_rocm_aiter_moe_enabled
-            else self.routed_scaling_factor,
+            routed_scaling_factor=self.routed_scaling_factor,
             e_score_correction_bias=self.gate.e_score_correction_bias,
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
