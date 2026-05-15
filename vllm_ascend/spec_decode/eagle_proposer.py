@@ -314,12 +314,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     )
             else:
                 # MTP model
-                share_embeddings = not self.use_compress
-                if share_embeddings:
-                    logger.info(
-                        "Detected MTP model. "
-                        "Sharing target model embedding weights with the draft model."
-                    )
+                share_embeddings = True
+                logger.info(
+                    "Detected MTP model. "
+                    "Sharing target model embedding weights with the draft model."
+                )
 
             if share_embeddings:
                 if hasattr(self.model.model, "embed_tokens"):
@@ -335,19 +334,49 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     def _maybe_share_lm_head(self, model: nn.Module) -> None:
         # some model definition do not define lm_head explicitly
         # and reuse embed_tokens for lm_head, e.g., CohereForCausalLM
+        target_lm_head = None
+        if hasattr(model, "lm_head"):
+            target_lm_head = model.lm_head
+        elif hasattr(model, "get_language_model") and hasattr(
+                model.get_language_model(), "lm_head"):
+            target_lm_head = model.get_language_model().lm_head
+
         if self.method in ("eagle", "dflash"):
-            logger.info("Loading EAGLE or DFLASH LM head weights from the target model.")
-            if hasattr(model, "lm_head"):
-                self.model.lm_head = model.lm_head
-            elif hasattr(model, "get_language_model") and hasattr(model.get_language_model(), "lm_head"):
-                self.model.lm_head = model.get_language_model().lm_head
+            logger.info(
+                "Loading EAGLE or DFLASH LM head weights from the target model."
+            )
+            if target_lm_head is not None:
+                self.model.lm_head = target_lm_head
             else:
                 logger.warning("Target model has no accessible lm_head for sharing.")
 
-        if self.method == "mtp" and self.vllm_config.model_config.is_deepseek_mla:
-            for _, layer_module in self.model.model.layers.items():
-                if torch.equal(layer_module.shared_head.head.weight, model.lm_head.weight):
-                    layer_module.shared_head.head = model.lm_head
+        if self.method == "mtp":
+            if target_lm_head is None:
+                logger.warning(
+                    "Target model has no accessible lm_head for MTP sharing.")
+            else:
+                if hasattr(self.model, "lm_head"):
+                    del self.model.lm_head
+                self.model.lm_head = target_lm_head
+
+                # MTP computes logits through each layer's shared_head.head.
+                # Share the target lm_head explicitly so DSV4 compressed MTP
+                # does not depend on a separately loaded or uninitialized head.
+                layers = getattr(getattr(self.model, "model", None), "layers",
+                                 None)
+                if layers is not None:
+                    items = layers.values() if isinstance(
+                        layers, nn.ModuleDict) else layers
+                    for layer_module in items:
+                        shared_head = getattr(layer_module, "shared_head",
+                                              None)
+                        if shared_head is not None and hasattr(
+                                shared_head, "head"):
+                            del shared_head.head
+                            shared_head.head = target_lm_head
+                logger.info(
+                    "Detected MTP model. Sharing target model lm_head weights "
+                    "with the draft model.")
 
         if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:
             self.update_stream = torch.npu.Stream()
@@ -920,6 +949,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 model_kwargs["hidden_states"] = model_hidden_states
                 if self.method == "mtp":
                     model_kwargs["positions"] = model_positions
+                    model_kwargs["spec_step_idx"] = 0
 
         ret_hidden_states = self.model(**model_kwargs)
         if not self.model_returns_tuple():
@@ -964,7 +994,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
-        logits = self.model.compute_logits(sample_hidden_states)
+        if self.method == "mtp":
+            logits = self.model.compute_logits(sample_hidden_states,
+                                               spec_step_idx=0)
+        else:
+            logits = self.model.compute_logits(sample_hidden_states)
 
         if lmhead_tp_enable() and num_indices < logits.shape[0]:
             logits = logits[:num_indices]
@@ -1074,6 +1108,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             }
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = model_hidden_states
+                if self.method == "mtp":
+                    model_kwargs["spec_step_idx"] = draft_step + 1
 
             ret_hidden_states = self.model(**model_kwargs)
             if not self.model_returns_tuple():
@@ -1097,7 +1133,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 )
 
             sample_hidden_states = last_hidden_states[token_indices_to_sample]
-            logits = self.model.compute_logits(sample_hidden_states)
+            if self.method == "mtp":
+                logits = self.model.compute_logits(
+                    sample_hidden_states, spec_step_idx=draft_step + 1)
+            else:
+                logits = self.model.compute_logits(sample_hidden_states)
 
             if lmhead_tp_enable() and num_indices < logits.shape[0]:
                 logits = logits[:num_indices]

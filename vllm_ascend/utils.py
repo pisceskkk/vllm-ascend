@@ -97,7 +97,10 @@ def get_dsv4_spec_layer_idx_from_weight_name(config: Any,
                                              weight_name: str) -> int | None:
     """Return local MTP layer index for DSV4 checkpoint weight names."""
     if weight_name.startswith("mtp."):
-        return int(weight_name.split(".")[1])
+        try:
+            return int(weight_name.split(".")[1])
+        except (IndexError, ValueError):
+            return None
     return None
 
 

@@ -304,13 +304,17 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
             if spec_layer is None:
                 continue
 
-            assert "mtp.0." in name
+            mtp_prefix = f"mtp.{spec_layer}."
+            if mtp_prefix not in name:
+                continue
             if ".emb.tok_emb." in name:
-                name = name.replace("mtp.0.", "model.")
+                name = name.replace(mtp_prefix, "model.")
             elif self.no_mtp_block_in_name(name):
-                name = name.replace("mtp.0.", "model.layers.0.")
+                name = name.replace(mtp_prefix,
+                                    f"model.layers.{spec_layer}.")
             else:
-                name = name.replace("mtp.0.", "model.layers.0.mtp_block.")
+                name = name.replace(
+                    mtp_prefix, f"model.layers.{spec_layer}.mtp_block.")
 
             if ".w1." in name:
                 name = name.replace(".w1.", ".gate_proj.")
@@ -495,6 +499,22 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
                         weight_loader(param, loaded_weight)
             if not is_fusion_moe_shared_experts_layer:
                 loaded_params.add(name)
+        loaded_layers = set()
+        for param_name in loaded_params:
+            parts = param_name.split(".")
+            if len(parts) > 2 and parts[0] == "model" and parts[1] == "layers":
+                try:
+                    loaded_layers.add(int(parts[2]))
+                except ValueError:
+                    continue
+        for layer_idx in range(self.model.num_mtp_layers):
+            if layer_idx not in loaded_layers:
+                raise ValueError(
+                    f"MTP speculative decoding layer {layer_idx} weights "
+                    f"missing from checkpoint. The checkpoint may have been "
+                    f"quantized without including the MTP layers. Use a "
+                    f"checkpoint that includes MTP layer weights, or disable "
+                    f"speculative decoding.")
         return loaded_params
 
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:

@@ -71,6 +71,7 @@ from vllm_ascend.utils import (
     AscendDeviceType,
     get_ascend_device_type,
     extract_dsv4_layer_index,
+    get_dsv4_spec_layer_idx_from_weight_name,
     get_dsv4_compress_ratio,
 )
 
@@ -179,9 +180,7 @@ def apply_rotary_emb(x: torch.Tensor,
 def get_spec_layer_idx_from_weight_name(config: DeepseekV2Config
                                         | DeepseekV3Config,
                                         weight_name: str) -> int | None:
-    if weight_name.startswith("mtp."):
-        return 0
-    return None
+    return get_dsv4_spec_layer_idx_from_weight_name(config, weight_name)
 
 
 class DeepseekV2MLP(nn.Module):
