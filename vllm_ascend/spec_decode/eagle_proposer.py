@@ -774,6 +774,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         # Copy the old attn_metadata and update
         attn_metadata_i = per_layer_attn_metadata[self.attn_layer_names[0]]
+        draft_step_input_tokens = (
+            num_input_tokens
+            if aclgraph_runtime_mode == CUDAGraphMode.FULL
+            else batch_size
+        )
 
         # Clone the data so that when calculating the data at position 2 and position 3
         # in the merged graph, it does not affect position 1
@@ -845,7 +850,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                                 attn_metadata,
                                 common_attn_metadata,
                                 batch_size,
-                                num_input_tokens,
+                                draft_step_input_tokens,
                                 used_update_positions,
                                 aclgraph_runtime_mode,
                                 ori_seq_len,
@@ -868,7 +873,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                             attn_metadata,
                             common_attn_metadata,
                             batch_size,
-                            num_input_tokens,
+                            draft_step_input_tokens,
                             used_update_positions,
                             aclgraph_runtime_mode,
                             attn_group=attn_group,
@@ -1038,9 +1043,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         hidden_states = hidden_states[token_indices_to_sample]
         token_indices_to_sample = self.arange[:batch_size]
 
-        input_batch_size = num_input_tokens if (self.method == "mtp" or self.use_cuda_graph) else batch_size
-
         forward_context = get_forward_context()
+        use_full_graph_padding = (
+            self.use_cuda_graph
+            and forward_context is not None
+            and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+        )
+        input_batch_size = num_input_tokens if use_full_graph_padding else batch_size
         _EXTRA_CTX.num_tokens = input_batch_size
         _EXTRA_CTX.num_accept_tokens = batch_size
 
@@ -1077,8 +1086,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self.input_ids[:batch_size] = input_ids
             self._set_positions(batch_size, clamped_positions)
             self.hidden_states[:batch_size] = hidden_states.view(batch_size, -1)
+            if self.method == "mtp" and input_batch_size > batch_size:
+                self.input_ids[batch_size:input_batch_size].zero_()
+                if self.uses_mrope:
+                    self.mrope_positions[:, batch_size:input_batch_size].zero_()
+                elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
+                    self.xdrope_positions[:, batch_size:input_batch_size].zero_()
+                else:
+                    self.positions[batch_size:input_batch_size].zero_()
+                self.hidden_states[batch_size:input_batch_size].zero_()
             if self.supports_mm_inputs:
                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
+                if self.method == "mtp" and input_batch_size > batch_size:
+                    self.inputs_embeds[batch_size:input_batch_size].zero_()
 
                 input_ids = self.input_ids[:input_batch_size]
                 inputs_embeds = self.inputs_embeds[:input_batch_size]

@@ -2094,7 +2094,7 @@ class MockDraftModel:
             return last_hidden_states, hidden_states
         return last_hidden_states
 
-    def compute_logits(self, sample_hidden_states):
+    def compute_logits(self, sample_hidden_states, **kwargs):
         self.logit_inputs.append(sample_hidden_states.clone())
         token_ids = sample_hidden_states[:, 0].to(torch.long)
         logits = torch.full((sample_hidden_states.shape[0], self.vocab_size), -1000.0)
@@ -2548,6 +2548,7 @@ class TestRunMergedDraft(TestBase):
         forward_context = MagicMock()
         forward_context.moe_layer_index = 9
         forward_context.attn_metadata = None
+        forward_context.cudagraph_runtime_mode = CUDAGraphMode.FULL
         multi_steps_attn_metadata = [MagicMock(), MagicMock(), MagicMock()]
 
         with (
@@ -2577,7 +2578,7 @@ class TestRunMergedDraft(TestBase):
         self.assertTrue(
             torch.equal(
                 second_call["input_ids"],
-                torch.tensor([14, 271, 14, 832, 128798, 271], dtype=torch.int32),
+                torch.tensor([14, 271, 0, 0, 0, 0], dtype=torch.int32),
             )
         )
         self.assertTrue(
@@ -2585,9 +2586,9 @@ class TestRunMergedDraft(TestBase):
                 second_call["positions"],
                 torch.tensor(
                     [
-                        [0, 0, 3, 0, 1, 3],
-                        [0, 0, 13, 10, 11, 13],
-                        [0, 0, 23, 20, 21, 23],
+                        [0, 0, 0, 0, 0, 0],
+                        [0, 0, 0, 0, 0, 0],
+                        [0, 0, 0, 0, 0, 0],
                     ],
                     dtype=torch.int64,
                 ),
@@ -2600,6 +2601,49 @@ class TestRunMergedDraft(TestBase):
             )
         )
         self.assertIs(forward_context.attn_metadata, multi_steps_attn_metadata[2])
+
+    def test_run_merged_draft_mtp_eager_uses_batch_sized_followup_steps(self):
+        self.proposer.method = "mtp"
+        self.proposer.use_cuda_graph = False
+        self.proposer.model = MockDraftModel(returns_tuple=False)
+        initial_input_ids = torch.tensor(
+            [201, 33001, 14, 832, 128798, 271], dtype=torch.int32)
+        self.proposer.input_ids[:6] = initial_input_ids
+        initial_positions = torch.tensor([10, 11, 12, 9, 10, 11], dtype=torch.int32)
+        initial_hidden_states = torch.arange(24, dtype=torch.float32).view(6, 4)
+        self.proposer.positions[:6] = initial_positions
+        self.proposer.hidden_states[:6] = initial_hidden_states
+        token_indices_to_sample = torch.tensor([2, 5], dtype=torch.int64)
+        forward_context = MagicMock()
+        forward_context.moe_layer_index = 3
+        forward_context.attn_metadata = None
+        forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE
+        multi_steps_attn_metadata = [MagicMock(), MagicMock(), MagicMock()]
+
+        with (
+            patch.object(eagle_proposer, "lmhead_tp_enable", return_value=False),
+            patch.object(eagle_proposer, "get_forward_context", return_value=forward_context),
+        ):
+            draft_token_ids = self.proposer._run_merged_draft(
+                num_input_tokens=6,
+                batch_size=2,
+                token_indices_to_sample=token_indices_to_sample,
+                target_positions=self.proposer.positions[:6],
+                inputs_embeds=None,
+                multi_steps_attn_metadata=multi_steps_attn_metadata,
+                num_tokens=6,
+                is_prefill=False,
+            )
+
+        model = self.proposer.model
+        self.assertEqual(draft_token_ids.tolist(), [[14, 15, 17], [271, 272, 274]])
+        self.assertEqual(len(model.calls), 3)
+        self.assertTrue(torch.equal(model.calls[0]["input_ids"], initial_input_ids))
+        self.assertTrue(torch.equal(model.calls[1]["input_ids"], torch.tensor([14, 271], dtype=torch.int32)))
+        self.assertTrue(torch.equal(model.calls[2]["input_ids"], torch.tensor([15, 272], dtype=torch.int32)))
+        self.assertTrue(all(logit_input.shape[0] == 2 for logit_input in model.logit_inputs))
+        self.assertEqual(eagle_proposer._EXTRA_CTX.num_tokens, 2)
+        self.assertEqual(eagle_proposer._EXTRA_CTX.num_accept_tokens, 2)
 
     def test_run_merged_draft_early_return_conditions(self):
         test_cases = [

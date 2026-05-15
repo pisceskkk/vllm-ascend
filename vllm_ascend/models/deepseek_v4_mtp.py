@@ -14,6 +14,7 @@ from vllm.distributed import (get_tensor_model_parallel_rank,
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -63,12 +64,25 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         self.config = config
         quant_config = vllm_config.quant_config
 
-        self.e_proj = nn.Linear(config.hidden_size,
-                                config.hidden_size,
-                                bias=False)
-        self.h_proj = nn.Linear(config.hidden_size,
-                                config.hidden_size,
-                                bias=False)
+        # DSV4 stores these projection weights with the same fp8 linear
+        # quantization metadata as the target model. Use vLLM's quant-aware
+        # layer so weight_scale_inv is loaded and applied correctly.
+        self.e_proj = ReplicatedLinear(
+            config.hidden_size,
+            config.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            return_bias=False,
+            prefix=maybe_prefix(prefix, "e_proj"),
+        )
+        self.h_proj = ReplicatedLinear(
+            config.hidden_size,
+            config.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            return_bias=False,
+            prefix=maybe_prefix(prefix, "h_proj"),
+        )
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -344,6 +358,10 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
             if ".gate.bias" in name:
                 name = name.replace(".gate.bias",
                                     ".gate.e_score_correction_bias")
+
+            if (name.endswith(".scale")
+                    and (".e_proj." in name or ".h_proj." in name)):
+                name = name.removesuffix(".scale") + ".weight_scale_inv"
 
             if "sink" in name:
                 # Handle attention sinks (distributed across ranks)
