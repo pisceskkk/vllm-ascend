@@ -28,7 +28,7 @@ from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
 from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
-from vllm_ascend.utils import (AscendDeviceType, attention_calculation_stream,
+from vllm_ascend.utils import (AscendDeviceType, attention_calculation_stream, enable_dsa_cp,
                                get_ascend_device_type, npu_stream_switch, get_dsv4_compress_ratio, extract_dsv4_layer_index,
                                olora_tp_enable)
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
@@ -145,6 +145,9 @@ class AscendDSABackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls():
+        if enable_dsa_cp():
+            from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
+            return AscendDSACPMetadataBuilder
         return AscendDSAMetadataBuilder
 
     @staticmethod
@@ -159,6 +162,9 @@ class AscendDSABackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls() -> Type["DSAAttentionImpl"]:
+        if enable_dsa_cp():
+            from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPImpl
+            return AscendDSACPImpl
         return AscendDSAImpl
 
     @staticmethod

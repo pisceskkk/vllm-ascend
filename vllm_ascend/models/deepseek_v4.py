@@ -69,6 +69,7 @@ from vllm.model_executor.layers.deepseek_v4_attention import DeepseekV4IndexerCa
 from vllm.model_executor.layers.deepseek_compressor import CompressorStateCache
 from vllm_ascend.utils import (
     AscendDeviceType,
+    enable_dsa_cp,
     get_ascend_device_type,
     extract_dsv4_layer_index,
     get_dsv4_spec_layer_idx_from_weight_name,
@@ -612,21 +613,23 @@ class DeepseekV4Attention(nn.Module):
         tp_size = get_tensor_model_parallel_world_size()
         self.dim = config.hidden_size
         self.n_heads = config.num_attention_heads
-        self.n_local_heads = config.num_attention_heads // tp_size
         self.q_lora_rank = config.q_lora_rank
         self.o_lora_rank = config.o_lora_rank
         self.head_dim = config.head_dim
         self.rope_head_dim = config.qk_rope_head_dim
         self.nope_head_dim = config.head_dim - config.qk_rope_head_dim
         self.n_groups = config.o_groups
-        self.n_local_groups = self.n_groups // tp_size
         self.window_size = config.sliding_window
         self.eps = config.rms_norm_eps
         self.norm_eps = config.rms_norm_eps
         self.scale = self.head_dim**-0.5
+        self.n_local_heads = self.n_heads // tp_size
+        self.n_local_groups = self.n_groups // tp_size
 
+        self._dsa_cp_enabled = enable_dsa_cp()
+        sink_heads = self.n_heads if self._dsa_cp_enabled else self.n_local_heads
         self.attn_sink = nn.Parameter(
-            torch.empty(self.n_local_heads, dtype=torch.float32))
+            torch.empty(sink_heads, dtype=torch.float32))
         self.wq_a = ReplicatedLinear(
             self.dim,
             self.q_lora_rank,
@@ -1216,9 +1219,14 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP,
             if "sink" in name:
                 # Handle attention sinks (distributed across ranks)
                 param = params_dict[name]
-                narrow_weight = loaded_weight.narrow(0, head_start,
-                                                     heads_per_rank)
-                param.data.copy_(narrow_weight)
+                if enable_dsa_cp():
+                    # When DSA-CP is enabled, attn_sink is created with full
+                    # heads (not TP-sharded), so load the full weight directly.
+                    param.data.copy_(loaded_weight)
+                else:
+                    narrow_weight = loaded_weight.narrow(0, head_start,
+                                                         heads_per_rank)
+                    param.data.copy_(narrow_weight)
                 loaded_params.add(name)
                 continue
 

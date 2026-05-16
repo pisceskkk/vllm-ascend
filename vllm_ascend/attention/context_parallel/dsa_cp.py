@@ -8,7 +8,7 @@ import torch_npu
 import vllm.envs as envs_vllm
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON
@@ -22,12 +22,14 @@ from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.dsa_v1 import rotate_activation 
 from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
                                          split_decodes_and_prefills)
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
 from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import (AscendDeviceType,
+                               enable_dsa_cp,
                                get_ascend_device_type, get_dsv4_compress_ratio, extract_dsv4_layer_index,
                                olora_tp_enable)
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
@@ -41,126 +43,6 @@ if HAS_TRITON:
     from vllm_ascend.ops.triton.rms_norm import triton_q_rms  # noqa: F811
 else:
     triton_q_rms = None  # type: ignore
-
-
-
-def hadamard_transform_ref(x: torch.Tensor, hadamard: torch.Tensor, scale:int =1.0,):
-    x_shape = x.shape
-    dim = x.shape[-1]
-    x = x.reshape(-1, dim)
-    log_dim = math.ceil(math.log2(dim))
-    dim_padded = 2**log_dim
-    if dim != dim_padded:
-        x = F.pad(x, (0, dim_padded - dim))
-    out = F.linear(x, hadamard)
-    out = out * scale
-    return out[..., :dim].reshape(*x_shape)
-
-
-def rotate_activation(x: torch.Tensor, hadamard: torch.Tensor) -> torch.Tensor:
-    hidden_size = x.size(-1)
-    return hadamard_transform_ref(x,
-                                  hadamard=hadamard,
-                                  scale=hidden_size**-0.5)
-
-
-def pad_to_blocks(x: torch.Tensor,
-                  length_list: torch.Tensor,
-                  block_size: int = 128):
-    """
-    Pads a ragged/packed tensor into fixed-size blocks.
-
-    Args:
-        x: Input tensor of shape [t, n, d] where t = sum(length_list).
-        length_list: Tensor of shape [bs] containing valid sequence lengths.
-        block_size: The size of each block (default 128).
-
-    Returns:
-        padded_blocks: Tensor of shape [total_blocks, block_size, n, d].
-    """
-    # 1. Validation
-    if x.shape[0] != length_list.sum():
-        raise ValueError(
-            f"Input dimension 0 ({x.shape[0]}) does not match sum of length_list ({length_list.sum()})"
-        )
-
-    bs = length_list.shape[0]
-    n, d = x.shape[1], x.shape[2]
-
-    # 2. Calculate how many blocks are needed for each request
-    # Formula: ceil(length / block_size) -> (length + block_size - 1) // block_size
-    blocks_per_req = (length_list + block_size - 1) // block_size
-    total_blocks = blocks_per_req.sum() + 1
-
-    # 3. Allocate output tensor with zeros (this handles the padding automatically)
-    # Shape: [total_blocks, block_size, n, d]
-    out = torch.zeros((total_blocks, block_size, n, d),
-                      dtype=x.dtype,
-                      device=x.device)
-
-    # 4. Fill data
-    input_offset = 0
-    block_offset = 1
-
-    for i in range(bs):
-        length = length_list[i]
-        num_blocks = blocks_per_req[i]
-
-        if length > 0:
-            # Slice the valid data for this request from the packed input
-            # Shape: [length, n, d]
-            req_data = x[input_offset:input_offset + length]
-
-            # Select the assigned blocks in the output
-            # Shape: [num_blocks, block_size, n, d]
-            target_blocks = out[block_offset:block_offset + num_blocks]
-
-            # View as a flat sequence to easily copy the data
-            # Shape: [num_blocks * block_size, n, d]
-            target_flat = target_blocks.view(-1, n, d)
-
-            # Copy valid data into the beginning of the allocated blocks
-            # The rest remains zeros
-            target_flat[:length] = req_data
-
-        # Update pointers
-        input_offset += length
-        block_offset += num_blocks
-
-    return out
-
-
-class AscendDSABackend(AttentionBackend):
-    accept_output_buffer: bool = True
-
-    @staticmethod
-    def get_name() -> str:
-        # HACK(Ronald1995): vllm `initialize_kv_cache` method in model runner v2 make
-        # attention name assertion, we just set name to FLASH_ATTN to avoid assertion error.
-        # rectify this when vllm disable the assertion.
-        return "ASCEND_DSA" if not envs_vllm.VLLM_USE_V2_MODEL_RUNNER else "FLASH_ATTN"
-
-    @staticmethod
-    def get_builder_cls():
-        return AscendDSAMetadataBuilder
-
-    @staticmethod
-    def get_kv_cache_shape(num_blocks: int, block_size: int, num_kv_heads: int,
-                           head_size: int) -> tuple[int, ...]:
-        return num_blocks, block_size, num_kv_heads, head_size
-
-    @staticmethod
-    def get_scale_shape(num_blocks: int, block_size: int,
-                        scale_size: int) -> tuple[int, ...]:
-        return num_blocks, block_size, scale_size
-
-    @staticmethod
-    def get_impl_cls() -> Type["DSAAttentionImpl"]:
-        return AscendDSAImpl
-
-    @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int]:
-        return [8, 32, 128]
 
 
 @dataclass
@@ -186,6 +68,23 @@ class AscendDSAReqMetadata:
     cu_c4_cmp_seqlen_list: torch.Tensor = None
     cu_c128_cmp_seqlen_list: torch.Tensor = None
     attn_mask: Optional[torch.Tensor] = None
+
+
+@dataclass
+class DSACPContext:
+    """Context parallelism split info for DSA CP.
+
+    Each TP rank processes a different chunk of the input sequence.
+    This dataclass holds the per-rank metadata needed for local
+    Q computation and full KV processing.
+    """
+    num_tokens: int
+    num_tokens_pad: int
+    local_start: int
+    local_end: int
+    local_end_with_pad: int
+    actual_seq_lengths_query: torch.Tensor
+    actual_seq_lengths_key: torch.Tensor
 
 
 @dataclass
@@ -226,6 +125,9 @@ class AscendDSAMetadata:
 
     start_pos: Optional[torch.Tensor] = None
 
+    # Context parallelism sequence sharding context
+    dsa_cp_context: Optional[DSACPContext] = None
+
     def __post_init__(self):
         pass
 
@@ -233,7 +135,7 @@ class AscendDSAMetadata:
 M = TypeVar("M", bound=AscendDSAMetadata)
 
 
-class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
+class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
     # Does this backend/builder support ACL Graphs for attention (default: no).
     aclgraph_support: ClassVar[AttentionCGSupport] = \
         AttentionCGSupport.UNIFORM_BATCH
@@ -296,7 +198,19 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.compressor_ratio = getattr(kv_cache_spec, 'compress_ratio', 0)
         hf_config = self.model_config.hf_config
 
-        if AscendDSAMetadataBuilder.hadamard is None:
+        self.enable_dsa_cp = enable_dsa_cp()
+        if self.enable_dsa_cp:
+            max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+            self.actual_seq_lengths_query = torch.zeros(max_num_reqs + 1,
+                                                        dtype=torch.int32,
+                                                        device=self.device)
+            self.actual_seq_lengths_key = torch.empty_like(
+                self.actual_seq_lengths_query)
+        else:
+            self.actual_seq_lengths_query = torch.tensor([])
+            self.actual_seq_lengths_key = torch.tensor([])
+
+        if AscendDSACPMetadataBuilder.hadamard is None:
             if hf_config.model_type == 'deepseek_v4':
                 indexer_head_dim = hf_config.index_head_dim
                 try:
@@ -305,7 +219,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     raise ImportError("Please install scipy") from e
                 log_dim = math.ceil(math.log2(indexer_head_dim))
                 dim_padded = 2**log_dim
-                AscendDSAMetadataBuilder.hadamard = torch.tensor(
+                AscendDSACPMetadataBuilder.hadamard = torch.tensor(
                     hadamard(dim_padded, dtype=float),
                     dtype=torch.float,
                     device=self.device).to(torch.bfloat16)
@@ -320,7 +234,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
     @classmethod
     def get_cudagraph_support(
-        cls: type["AscendDSAMetadataBuilder"],
+        cls: type["AscendDSACPMetadataBuilder"],
         vllm_config: VllmConfig,
         kv_cache_spec: AttentionSpec,
     ) -> AttentionCGSupport:
@@ -447,6 +361,53 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         req_metadata = self.build_req_metadata(
             common_prefix_len, common_attn_metadata, num_reqs_actual)
 
+        # --- Build DSACPContext for sequence sharding ---
+        if self.enable_dsa_cp:
+            global_tp_size = get_tp_group().world_size
+            num_tokens = num_input_tokens
+            num_tokens_pad = cdiv(num_tokens, global_tp_size) * global_tp_size
+            num_tokens_per_device = num_tokens_pad // global_tp_size
+            local_start = get_tp_group().rank_in_group * num_tokens_per_device
+            local_end_with_pad = local_start + num_tokens_per_device
+            local_end = min(local_end_with_pad, self.num_actual_tokens)
+
+            # actual_seq_lengths_query/key: per-sequence token counting
+            # actual_seq_lengths_query follows TND convention: [0, cum_len_1, ..., total]
+            seq_lens = self.seq_lens[:num_reqs]
+            num_segs = query_start_loc.shape[0] - 1
+            last_token = 0
+            cum = 0
+            for i in range(num_segs):
+                global_start = last_token
+                global_end = query_start_loc[i + 1].item()
+                last_token = global_end
+
+                req_local_start = max(global_start, local_start)
+                req_local_end = min(global_end, local_end_with_pad)
+                num_local_tokens = max(0, req_local_end - req_local_start)
+
+                if num_local_tokens > 0:
+                    cum += num_local_tokens
+                    self.actual_seq_lengths_query[i + 1] = cum
+                    # KV is full on all ranks (from FC1 all-gather), so use full seq_lens
+                    self.actual_seq_lengths_key[i] = seq_lens[i].item()
+                else:
+                    self.actual_seq_lengths_query[i + 1] = cum
+                    # KV is full on all ranks even if rank has no local query tokens
+                    self.actual_seq_lengths_key[i] = seq_lens[i].item()
+
+            dsa_cp_context = DSACPContext(
+                num_tokens=num_tokens,
+                num_tokens_pad=num_tokens_pad,
+                local_start=local_start,
+                local_end=local_end,
+                local_end_with_pad=local_end_with_pad,
+                actual_seq_lengths_query=self.actual_seq_lengths_query[:num_reqs + 1],
+                actual_seq_lengths_key=self.actual_seq_lengths_key[:num_reqs],
+            )
+        else:
+            dsa_cp_context = None
+
         return self.metadata_cls(  # type: ignore
             num_input_tokens=common_attn_metadata.num_input_tokens,
             num_actual_tokens=self.num_actual_tokens,
@@ -464,7 +425,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             seq_lens=self.seq_lens,
             cos=cos,
             sin=sin,
-            hadamard=AscendDSAMetadataBuilder.hadamard,
+            hadamard=AscendDSACPMetadataBuilder.hadamard,
+            dsa_cp_context=dsa_cp_context,
         )
 
     def build_req_metadata(
@@ -710,7 +672,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         return attn_metadata
 
 
-class AscendDSAImpl(DSAAttentionImpl):
+class AscendDSACPImpl(DSAAttentionImpl):
     """
     NOTE: Please read the comment at the top of the file before trying to
     understand this class
@@ -745,6 +707,7 @@ class AscendDSAImpl(DSAAttentionImpl):
         self.q_lora_rank = q_lora_rank
         self.compress_ratio = compress_ratio
         self.softmax_scale = self.head_dim**-0.5
+        self.enable_dsa_cp = enable_dsa_cp()
 
         # MLA Args
         self.wq_a = kwargs['wq_a']
@@ -798,7 +761,33 @@ class AscendDSAImpl(DSAAttentionImpl):
             self.compressor_norm_eps = self.compressor.norm_eps
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
-        pass
+        if self.enable_dsa_cp:
+            tp_group = get_tp_group().device_group
+            tp_size = get_tensor_model_parallel_world_size()
+
+            # All-gather wq_b weight across TP ranks to restore full heads
+            w = self.wq_b.weight.data
+            full_w = torch.empty(w.shape[0] * tp_size, *w.shape[1:],
+                                 dtype=w.dtype, device=w.device)
+            torch.distributed.all_gather_into_tensor(full_w, w.contiguous(), group=tp_group)
+            self.wq_b.weight = torch.nn.Parameter(full_w)
+
+            # All-gather quantized weight_scale if present
+            if (hasattr(self.wq_b, 'weight_scale')
+                    and self.wq_b.weight_scale is not None):
+                ws = self.wq_b.weight_scale.data
+                full_ws = torch.empty(ws.shape[0] * tp_size, *ws.shape[1:],
+                                      dtype=ws.dtype, device=ws.device)
+                torch.distributed.all_gather_into_tensor(full_ws, ws.contiguous(), group=tp_group)
+                self.wq_b.weight_scale = full_ws
+
+            # All-gather bias if present
+            if hasattr(self.wq_b, 'bias') and self.wq_b.bias is not None:
+                b = self.wq_b.bias.data
+                full_b = torch.empty(b.shape[0] * tp_size, *b.shape[1:],
+                                     dtype=b.dtype, device=b.device)
+                torch.distributed.all_gather_into_tensor(full_b, b.contiguous(), group=tp_group)
+                self.wq_b.bias = torch.nn.Parameter(full_b)
 
     # TODO: cast to bfloat16 to speed up
     def rope_single(self, x, cos, sin, inverse=False):
@@ -837,18 +826,25 @@ class AscendDSAImpl(DSAAttentionImpl):
         if not isinstance(attn_metadata, list):
             attn_metadata = [attn_metadata]
         output_padded = output
-        forward_context = get_forward_context()
-        o_proj_input_shape = (forward_context.num_tokens, self.n_local_heads,
-                              self.head_dim)
-        o_proj_input = torch.empty(o_proj_input_shape,
-                                   dtype=hidden_states.dtype,
-                                   device=hidden_states.device)
-        o_proj_input[:hidden_states.shape[0]] = self._forward(layer_name, hidden_states,
+        attn_heads = self.num_heads if self.enable_dsa_cp else self.n_local_heads
+        o_proj_input = self._forward(layer_name, hidden_states,
                                     kv_cache, attn_metadata)
 
         cos = attn_metadata[0].cos[layer_name]
         sin = attn_metadata[0].sin[layer_name]
+        # In CP mode, slice cos/sin to local token range for inverse RoPE
+        if self.enable_dsa_cp and attn_metadata[0].dsa_cp_context is not None:
+            cp_ctx = attn_metadata[0].dsa_cp_context
+            cos = cos[cp_ctx.local_start:cp_ctx.local_end_with_pad]
+            sin = sin[cp_ctx.local_start:cp_ctx.local_end_with_pad]
         num_tokens = o_proj_input.shape[0]
+
+        # In CP mode, _forward uses full heads; extract local heads for O proj.
+        if self.enable_dsa_cp:
+            tp_rank = get_tp_group().rank_in_group
+            start_h = tp_rank * self.n_local_heads
+            end_h = start_h + self.n_local_heads
+            o_proj_input = o_proj_input[:, start_h:end_h, :]
 
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             o_proj_input.unsqueeze(1),
@@ -906,13 +902,28 @@ class AscendDSAImpl(DSAAttentionImpl):
         assert compress_common_attn_metadata.req_metadata is not None
         cos = compress_common_attn_metadata.req_metadata.cos[layer_name]
         sin = compress_common_attn_metadata.req_metadata.sin[layer_name]
-        actual_seq_lengths_query = compress_common_attn_metadata.req_metadata.query_start_loc
+        actual_seq_lengths_query_full = compress_common_attn_metadata.req_metadata.query_start_loc
         actual_seq_lengths_key = compress_common_attn_metadata.req_metadata.seq_lens
 
-        # --- q ---
+        # In CP mode: FC1 all-gather gives full hidden_states.
+        # Q uses local tokens (slice hidden_states), KV uses full hidden_states.
+        if self.enable_dsa_cp:
+            cp_ctx = compress_common_attn_metadata.dsa_cp_context
+            hidden_states_q = hidden_states[cp_ctx.local_start:cp_ctx.local_end_with_pad]
+            cos_q = cos[cp_ctx.local_start:cp_ctx.local_end_with_pad]
+            sin_q = sin[cp_ctx.local_start:cp_ctx.local_end_with_pad]
+            actual_seq_lengths_query = cp_ctx.actual_seq_lengths_query
+        else:
+            hidden_states_q = hidden_states
+            cos_q = cos
+            sin_q = sin
+            actual_seq_lengths_query = actual_seq_lengths_query_full
+
+        # --- q (local tokens in CP mode) ---
+        q_heads = self.num_heads if self.enable_dsa_cp else self.n_local_heads
         if (not isinstance(self.wq_b.quant_method, AscendUnquantizedLinearMethod)) and \
                 isinstance(self.wq_b.quant_method.quant_method, AscendW8A8DynamicLinearMethod):
-            q_a = self.wq_a(hidden_states)
+            q_a = self.wq_a(hidden_states_q)
             qr, qr_pertoken_scale = torch.ops._C_ascend.npu_rms_norm_dynamic_quant(
                 q_a, self.q_norm.weight, epsilon=self.eps)
             q = torch_npu.npu_quant_matmul(
@@ -922,23 +933,23 @@ class AscendDSAImpl(DSAAttentionImpl):
                 pertoken_scale=qr_pertoken_scale,
                 bias=self.wq_b.bias,
                 output_dtype=hidden_states.dtype,
-            ).unflatten(-1, (self.n_local_heads, self.head_dim))
+            ).unflatten(-1, (q_heads, self.head_dim))
         else:
-            qr = self.q_norm(self.wq_a(hidden_states))
-            q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
+            qr = self.q_norm(self.wq_a(hidden_states_q))
+            q = self.wq_b(qr).unflatten(-1, (q_heads, self.head_dim))
             qr_pertoken_scale = None
 
         q = triton_q_rms(q, self.eps)
 
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             q.unsqueeze(1),
-            cos,
-            sin,
+            cos_q,
+            sin_q,
             rotary_mode="interleave",
             partial_slice=[self.nope_head_dim, self.head_dim],
         )
 
-        # --- kv ---
+        # --- kv (full hidden_states in both CP and non-CP) ---
         kv = self.wkv(hidden_states)
         kv = self.kv_norm(kv)
         assert self.rope_head_dim is not None
@@ -968,11 +979,12 @@ class AscendDSAImpl(DSAAttentionImpl):
                     qr=qr,
                     kv_cache=kv_cache,
                     attn_metadata=attn_metadata,
-                    cos=cos,
-                    sin=sin,
+                    cos=cos_q,
+                    sin=sin_q,
                     compressed_cos=compress_cos,
                     compressed_sin=compress_sin,
-                    actual_seq_lengths_query=actual_seq_lengths_query,
+                    # Pass FULL query_start_loc for KV compressor inside indexer
+                    actual_seq_lengths_query=actual_seq_lengths_query_full,
                     actual_seq_lengths_key=actual_seq_lengths_key,
                     qr_pertoken_scale=qr_pertoken_scale)
 
@@ -988,7 +1000,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 compress_sin.view(-1, compress_sin.shape[-1]),
                 compress_cos.view(-1, compress_cos.shape[-1]),
                 state_block_table=compressor_kv_state_metadata.req_metadata.block_table,
-                cu_seqlens=actual_seq_lengths_query,
+                cu_seqlens=actual_seq_lengths_query_full,
                 seqused=None,
                 start_pos=compress_common_attn_metadata.req_metadata.start_pos,
                 rope_head_dim=self.rope_head_dim,
@@ -1167,13 +1179,19 @@ class AscendDSAImpl(DSAAttentionImpl):
                 indexer_k_cache,
                 indexer_kv_scale_metadata.req_metadata.slot_mapping,
                 kv)
-            torch.ops._C_ascend.npu_scatter_nd_update_v2(
-                indexer_scale_cache,
-                indexer_kv_scale_metadata.req_metadata.slot_mapping,
-                kv_scale)
+            if kv_scale is not None:
+                torch.ops._C_ascend.npu_scatter_nd_update_v2(
+                    indexer_scale_cache,
+                    indexer_kv_scale_metadata.req_metadata.slot_mapping,
+                    kv_scale)
 
         assert indexer_kv_scale_metadata.req_metadata is not None
-        qlens = indexer_kv_scale_metadata.req_metadata.query_start_loc[1:]
+        # In CP mode, use local cumulative query lengths for the indexer attention
+        if self.enable_dsa_cp and indexer_kv_scale_metadata.dsa_cp_context is not None:
+            cp_ctx = indexer_kv_scale_metadata.dsa_cp_context
+            qlens = cp_ctx.actual_seq_lengths_query[1:]
+        else:
+            qlens = indexer_kv_scale_metadata.req_metadata.query_start_loc[1:]
         kvlens = indexer_kv_scale_metadata.req_metadata.seq_lens
         block_table = indexer_kv_scale_metadata.req_metadata.block_table
         qli_metadata = indexer_kv_scale_metadata.req_metadata.qli_metadata
