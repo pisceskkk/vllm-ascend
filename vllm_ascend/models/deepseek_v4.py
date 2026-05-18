@@ -34,6 +34,10 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 from torch import nn
+
+# Force re-evaluate enable_sp() — _ENABLE_SP may be cached as False
+import vllm_ascend.utils as _vu
+_vu._ENABLE_SP = None
 from transformers import DeepseekV2Config, DeepseekV3Config
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
@@ -1379,5 +1383,20 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP,
                         weight_loader(param, loaded_weight)
             if not is_fusion_moe_shared_experts_layer:
                 loaded_params.add(name)
+
+        # DSA-CP: all-gather Attention weights (wq_b, wo_a, wo_b) that need
+        # full heads/output-dim because CP disables TP head sharding during
+        # attention.  Must run INSIDE load_weights (before quant
+        # post-processing transposes weights to NZ layout) so that the
+        # all-gather operates on standard-layout tensors.
+        from vllm_ascend.models.layer.attention.layer import DSAAttention
+        n_processed = 0
+        for _, module in self.named_modules():
+            if (isinstance(module, DSAAttention)
+                    and hasattr(module, "process_weights_after_loading")
+                    and not getattr(module, "_dsa_cp_weights_processed", False)):
+                module.process_weights_after_loading(torch.bfloat16)
+                module._dsa_cp_weights_processed = True
+                n_processed += 1
 
         return loaded_params

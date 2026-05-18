@@ -8,7 +8,9 @@ import torch_npu
 import vllm.envs as envs_vllm
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
+from vllm.distributed import (get_tensor_model_parallel_world_size,
+                               get_tp_group,
+                               tensor_model_parallel_reduce_scatter)
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON
@@ -22,7 +24,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.dsa_v1 import rotate_activation 
+from vllm_ascend.attention.dsa_v1 import rotate_activation
 from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
                                          split_decodes_and_prefills)
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
@@ -30,6 +32,7 @@ from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
 from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import (AscendDeviceType,
                                enable_dsa_cp,
+                               enable_dsa_cp_with_o_proj_tp,
                                get_ascend_device_type, get_dsv4_compress_ratio, extract_dsv4_layer_index,
                                olora_tp_enable)
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
@@ -760,34 +763,124 @@ class AscendDSACPImpl(DSAAttentionImpl):
             self.compressor_norm = self.compressor.norm
             self.compressor_norm_eps = self.compressor.norm_eps
 
-    def process_weights_after_loading(self, act_dtype: torch.dtype):
-        if self.enable_dsa_cp:
-            tp_group = get_tp_group().device_group
-            tp_size = get_tensor_model_parallel_world_size()
+    @staticmethod
+    def _all_gather_weight(w: torch.Tensor, tp_size: int,
+                           tp_group: torch.distributed.ProcessGroup,
+                           shard_dim_size: int) -> torch.Tensor:
+        """All-gather a TP-sharded weight on the sharded dimension.
 
-            # All-gather wq_b weight across TP ranks to restore full heads
-            w = self.wq_b.weight.data
+        W8A8 quant post-processing transposes the weight to NZ format
+        [in_dim, out_shard], so the sharded dimension may be dim 0 or dim 1.
+        This helper detects which dimension carries the shard and gathers
+        along that axis.
+        """
+        if w.shape[0] == shard_dim_size:
+            gather_dim = 0
+        elif len(w.shape) > 1 and w.shape[1] == shard_dim_size:
+            gather_dim = 1
+        else:
+            raise ValueError(
+                f"Cannot find shard_dim_size={shard_dim_size} in weight "
+                f"shape {tuple(w.shape)} (expected on dim 0 or 1)")
+
+        if gather_dim == 0:
             full_w = torch.empty(w.shape[0] * tp_size, *w.shape[1:],
                                  dtype=w.dtype, device=w.device)
-            torch.distributed.all_gather_into_tensor(full_w, w.contiguous(), group=tp_group)
-            self.wq_b.weight = torch.nn.Parameter(full_w)
+            torch.distributed.all_gather_into_tensor(
+                full_w, w.contiguous(), group=tp_group)
+        else:
+            # Transpose so that the sharded dim is dim 0, gather, transpose back.
+            w_t = w.transpose(0, 1).contiguous()
+            full_w_t = torch.empty(w_t.shape[0] * tp_size, *w_t.shape[1:],
+                                   dtype=w_t.dtype, device=w_t.device)
+            torch.distributed.all_gather_into_tensor(
+                full_w_t, w_t, group=tp_group)
+            full_w = full_w_t.transpose(0, 1).contiguous()
+        return full_w
 
-            # All-gather quantized weight_scale if present
-            if (hasattr(self.wq_b, 'weight_scale')
-                    and self.wq_b.weight_scale is not None):
-                ws = self.wq_b.weight_scale.data
-                full_ws = torch.empty(ws.shape[0] * tp_size, *ws.shape[1:],
-                                      dtype=ws.dtype, device=ws.device)
-                torch.distributed.all_gather_into_tensor(full_ws, ws.contiguous(), group=tp_group)
-                self.wq_b.weight_scale = full_ws
+    def process_weights_after_loading(self, act_dtype: torch.dtype):
+        tp_group = get_tp_group().device_group
+        tp_size = get_tensor_model_parallel_world_size()
 
-            # All-gather bias if present
-            if hasattr(self.wq_b, 'bias') and self.wq_b.bias is not None:
-                b = self.wq_b.bias.data
-                full_b = torch.empty(b.shape[0] * tp_size, *b.shape[1:],
-                                     dtype=b.dtype, device=b.device)
-                torch.distributed.all_gather_into_tensor(full_b, b.contiguous(), group=tp_group)
-                self.wq_b.bias = torch.nn.Parameter(full_b)
+        # All-gather wq_b weight (ColumnParallel: output = n_local_heads * head_dim)
+        self.wq_b.weight = torch.nn.Parameter(
+            self._all_gather_weight(
+                self.wq_b.weight.data, tp_size, tp_group,
+                shard_dim_size=self.n_local_heads * self.head_dim),
+            requires_grad=False)
+
+        # All-gather quantized weight_scale if present
+        if (hasattr(self.wq_b, 'weight_scale')
+                and self.wq_b.weight_scale is not None):
+            ws = self.wq_b.weight_scale.data
+            full_ws = torch.empty(ws.shape[0] * tp_size, *ws.shape[1:],
+                                  dtype=ws.dtype, device=ws.device)
+            torch.distributed.all_gather_into_tensor(
+                full_ws, ws.contiguous(), group=tp_group)
+            self.wq_b.weight_scale = torch.nn.Parameter(
+                full_ws, requires_grad=False)
+
+        # All-gather bias if present
+        if hasattr(self.wq_b, 'bias') and self.wq_b.bias is not None:
+            b = self.wq_b.bias.data
+            full_b = torch.empty(b.shape[0] * tp_size, *b.shape[1:],
+                                 dtype=b.dtype, device=b.device)
+            torch.distributed.all_gather_into_tensor(
+                full_b, b.contiguous(), group=tp_group)
+            self.wq_b.bias = torch.nn.Parameter(full_b, requires_grad=False)
+
+        # Solution A: all-gather wo_a/wo_b so O-proj runs on full heads.
+        # Only for PD-disaggregated P-side or when full-weight O-proj is desired.
+        if not enable_dsa_cp_with_o_proj_tp():
+            # wo_a: ColumnParallel — output dim is n_local_groups * o_lora_rank
+            self.wo_a.weight = torch.nn.Parameter(
+                self._all_gather_weight(
+                    self.wo_a.weight.data, tp_size, tp_group,
+                    shard_dim_size=self.n_local_groups * self.o_lora_rank),
+                requires_grad=False)
+            if hasattr(self.wo_a, 'gather_output'):
+                self.wo_a.gather_output = False
+
+            # wo_b: RowParallel — input dim is the sharded dim.
+            # The input to wo_b is [T, n_groups * o_lora_rank], and
+            # RowParallel shards the INPUT dimension across TP ranks.
+            # The shard size is (n_groups * o_lora_rank) / tp = n_local_groups * o_lora_rank.
+            wo_b_input_shard = self.n_local_groups * self.o_lora_rank
+            self.wo_b.weight = torch.nn.Parameter(
+                self._all_gather_weight(
+                    self.wo_b.weight.data, tp_size, tp_group,
+                    shard_dim_size=wo_b_input_shard),
+                requires_grad=False)
+            self.wo_b.reduce_results = False
+
+    @staticmethod
+    def _apply_rotary_interleaved(x: torch.Tensor, cos: torch.Tensor,
+                                   sin: torch.Tensor) -> torch.Tensor:
+        """Pure-PyTorch interleaved RoPE.  x: [T, N, rope_dim].
+        cos/sin: [T, rope_dim] (2-D).  Uses broadcasting over heads.
+        """
+        # x may be 2-D [T, D] (KV single-head) or 3-D [T, N, D] (Q).
+        if x.dim() == 2:
+            T, D = x.shape; N = 1
+        elif x.dim() == 3:
+            T, N, D = x.shape
+        else:
+            x = x.reshape(-1, x.shape[-1])
+            T, D = x.shape; N = 1
+        assert D % 2 == 0, f"rope_dim must be even, got {D}"
+        # Flatten cos/sin to [*, D] then take up to T rows
+        cos = cos.reshape(-1, D)[:T].view(T, D)
+        sin = sin.reshape(-1, D)[:T].view(T, D)
+        # Interleaved: pairs (2i, 2i+1) share one frequency.
+        # cos is [T, D]; reshape to [T, D/2, 2] and take the first
+        # element of each pair as the frequency for that pair.
+        x_pairs = x.reshape(T, N, D // 2, 2)       # [T, N, D/2, 2]
+        cos_f = cos.reshape(T, 1, D // 2, 2)[..., 0:1]  # [T, 1, D/2, 1]
+        sin_f = sin.reshape(T, 1, D // 2, 2)[..., 0:1]
+        a, b = x_pairs[..., 0], x_pairs[..., 1]
+        a_r = a * cos_f.squeeze(-1) - b * sin_f.squeeze(-1)
+        b_r = a * sin_f.squeeze(-1) + b * cos_f.squeeze(-1)
+        return torch.stack([a_r, b_r], dim=-1).reshape(T, N, D)
 
     # TODO: cast to bfloat16 to speed up
     def rope_single(self, x, cos, sin, inverse=False):
@@ -826,52 +919,99 @@ class AscendDSACPImpl(DSAAttentionImpl):
         if not isinstance(attn_metadata, list):
             attn_metadata = [attn_metadata]
         output_padded = output
-        attn_heads = self.num_heads if self.enable_dsa_cp else self.n_local_heads
         o_proj_input = self._forward(layer_name, hidden_states,
                                     kv_cache, attn_metadata)
 
         cos = attn_metadata[0].cos[layer_name]
         sin = attn_metadata[0].sin[layer_name]
-        # In CP mode, slice cos/sin to local token range for inverse RoPE
         if self.enable_dsa_cp and attn_metadata[0].dsa_cp_context is not None:
             cp_ctx = attn_metadata[0].dsa_cp_context
-            cos = cos[cp_ctx.local_start:cp_ctx.local_end_with_pad]
-            sin = sin[cp_ctx.local_start:cp_ctx.local_end_with_pad]
+            if enable_dsa_cp_with_o_proj_tp():
+                tp_size = get_tp_group().world_size
+                send = (o_proj_input
+                        .view(-1, tp_size, self.n_local_heads, self.head_dim)
+                        .permute(1, 0, 2, 3)
+                        .reshape(-1, self.n_local_heads * self.head_dim))
+                o_proj_input = torch.empty_like(send)
+                torch.distributed.all_to_all_single(
+                    o_proj_input, send, group=get_tp_group().device_group)
+            else:
+                # Solution A: pad cos/sin then slice to local token range.
+                if hasattr(cos, "get_tensor"):
+                    cos = cos.get_tensor("default")
+                    sin = sin.get_tensor("default")
+                # squeeze dims 1,2 to get [T, rope_dim]
+                while cos.dim() > 2 and cos.shape[1] == 1:
+                    cos = cos.squeeze(1); sin = sin.squeeze(1)
+                num_pad = cp_ctx.num_tokens_pad - cos.shape[0]
+                if num_pad > 0:
+                    cos = F.pad(cos, (0, 0, 0, num_pad))
+                    sin = F.pad(sin, (0, 0, 0, num_pad))
+                cos = cos[cp_ctx.local_start:cp_ctx.local_end_with_pad]
+                sin = sin[cp_ctx.local_start:cp_ctx.local_end_with_pad]
         num_tokens = o_proj_input.shape[0]
 
-        # In CP mode, _forward uses full heads; extract local heads for O proj.
+        # Inverse RoPE — always use pure-PyTorch (CANN kernel has 64-head limit).
         if self.enable_dsa_cp:
-            tp_rank = get_tp_group().rank_in_group
-            start_h = tp_rank * self.n_local_heads
-            end_h = start_h + self.n_local_heads
-            o_proj_input = o_proj_input[:, start_h:end_h, :]
-
-        torch.ops._C_ascend.inplace_partial_rotary_mul(
-            o_proj_input.unsqueeze(1),
-            cos,
-            -sin,
-            rotary_mode="interleave",
-            partial_slice=[self.nope_head_dim, self.head_dim],
-        )
-
-        # o
-        o_proj_input = o_proj_input.view(num_tokens, self.n_local_groups, -1)
-        if olora_tp_enable():
-            o_proj_input = self.wo_a(o_proj_input)
+            op_nope = o_proj_input[..., :self.nope_head_dim]
+            op_rope = self._apply_rotary_interleaved(
+                o_proj_input[..., self.nope_head_dim:self.head_dim], cos, -sin)
+            # Ensure shapes match for cat: op_nope [T,N,D_nope], op_rope [T,N,D_rope]
+            if op_rope.dim() != op_nope.dim():
+                op_rope = op_rope.reshape(op_nope.shape[:-1] + (-1,))
+            o_proj_input = torch.cat([op_nope.contiguous(), op_rope.contiguous()], dim=-1)
         else:
-            # wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-            # o = torch.einsum("tgd,grd->tgr", o, wo_a)
-            o_proj_input = torch_npu.npu_transpose_batchmatmul(
-                o_proj_input,
-                self.wo_a.weight,
-                bias=None,
-                scale=None,
-                perm_x1=(1, 0, 2),
-                perm_x2=(0, 1, 2),
-                perm_y=(1, 0, 2),
-                batch_split_factor=1)
-            o_proj_input = o_proj_input.reshape(num_tokens, -1)
-        output[...] = self.wo_b(o_proj_input)
+            torch.ops._C_ascend.inplace_partial_rotary_mul(
+                o_proj_input.unsqueeze(1).contiguous(),
+                cos,
+                -sin,
+                rotary_mode="interleave",
+                partial_slice=[self.nope_head_dim, self.head_dim],
+            )
+
+        # o — V-up proj. CP mode same as non-CP for Solution B (TP weights).
+        if self.enable_dsa_cp and not enable_dsa_cp_with_o_proj_tp():
+            # Solution A (full weights): reshape and use F.linear
+            o_proj_input = o_proj_input.view(num_tokens, self.n_group, -1)
+            w = self.wo_a.weight
+            inp_flat = o_proj_input.flatten(1, -1)
+            o_proj_input = F.linear(inp_flat, w.reshape(w.shape[-2], w.shape[-1]),
+                                    self.wo_a.bias)
+        else:
+            o_proj_input = o_proj_input.view(num_tokens, self.n_local_groups, -1)
+            # npu_transpose_batchmatmul doesn't handle NZ weights for
+            # multi-token input.  Use npu_quant_matmul which does.
+            # weight_scale is registered as a Parameter but AscendColumnParallel
+            # may hide it; access via _parameters dict.
+            import sys; print(f"DSA-CP V-up: _params={list(self.wo_a._parameters.keys())}", file=sys.stderr, flush=True)
+            ws = (self.wo_a._parameters.get('weight_scale', None) or
+                  self.wo_a._parameters.get('weight_scale_fp32', None))
+            if ws is not None:
+                x_flat = o_proj_input.reshape(num_tokens, -1)
+                x_q, x_s = torch_npu.npu_dynamic_quant(x_flat)
+                o_proj_input = torch_npu.npu_quant_matmul(
+                    x_q, self.wo_a.weight, ws,
+                    pertoken_scale=x_s,
+                    bias=None,
+                    output_dtype=x_flat.dtype)
+            else:
+                o_proj_input = torch_npu.npu_transpose_batchmatmul(
+                    o_proj_input, self.wo_a.weight,
+                    bias=None, scale=None,
+                    perm_x1=(1, 0, 2), perm_x2=(0, 1, 2),
+                    perm_y=(1, 0, 2), batch_split_factor=1)
+                o_proj_input = o_proj_input.reshape(num_tokens, -1)
+
+        if self.enable_dsa_cp and enable_dsa_cp_with_o_proj_tp():
+            # Solution B: wo_b all-reduce → [T, dim], then reduce-scatter → [T/tp, dim]
+            wo_b_out = self.wo_b(o_proj_input)
+            wo_b_out = wo_b_out[0] if isinstance(wo_b_out, tuple) else wo_b_out
+            output[...] = tensor_model_parallel_reduce_scatter(wo_b_out, dim=0)
+        else:
+            # Non-CP / Solution A:
+            #   Non-CP: wo_b all-reduce → [T, dim], reduce-scatter in decoder layer
+            #   Solution A: wo_b full weight, no all-reduce → [T/tp, dim]
+            output[...] = self.wo_b(o_proj_input)
 
         return output_padded
 
@@ -900,18 +1040,50 @@ class AscendDSACPImpl(DSAAttentionImpl):
             compress_common_attn_metadata = swa_metadata
 
         assert compress_common_attn_metadata.req_metadata is not None
-        cos = compress_common_attn_metadata.req_metadata.cos[layer_name]
-        sin = compress_common_attn_metadata.req_metadata.sin[layer_name]
+        # Compute cos/sin as 2-D [T, rope_dim] from static RoPE cache
+        # to avoid RopeDataProxy multi-group issues for compressed layers.
+        if self.enable_dsa_cp and self.rope_head_dim is not None:
+            from vllm_ascend.ops.rope_dsv4 import _ROPE_STATE
+            cos = sin = None
+            for _cfg, (sc, ss) in _ROPE_STATE.static_cache.items():
+                if sc.shape[-1] == self.rope_head_dim:
+                    pos = compress_common_attn_metadata.req_metadata.input_positions
+                    if pos.numel() > 0:
+                        cos = sc[pos.long()].reshape(-1, sc.shape[-1])
+                        sin = ss[pos.long()].reshape(-1, ss.shape[-1])
+                    else:
+                        cos = torch.zeros(0, sc.shape[-1], dtype=hidden_states.dtype, device=hidden_states.device)
+                        sin = torch.zeros_like(cos)
+                    break
+            if cos is None:
+                cos = compress_common_attn_metadata.cos[layer_name]
+                sin = compress_common_attn_metadata.sin[layer_name]
+        else:
+            cos = compress_common_attn_metadata.cos[layer_name]
+            sin = compress_common_attn_metadata.sin[layer_name]
         actual_seq_lengths_query_full = compress_common_attn_metadata.req_metadata.query_start_loc
         actual_seq_lengths_key = compress_common_attn_metadata.req_metadata.seq_lens
 
-        # In CP mode: FC1 all-gather gives full hidden_states.
-        # Q uses local tokens (slice hidden_states), KV uses full hidden_states.
         if self.enable_dsa_cp:
             cp_ctx = compress_common_attn_metadata.dsa_cp_context
-            hidden_states_q = hidden_states[cp_ctx.local_start:cp_ctx.local_end_with_pad]
+            num_pad = cp_ctx.num_tokens_pad - hidden_states.shape[0]
+            if num_pad > 0:
+                hs_for_q = F.pad(hidden_states, (0, 0, 0, num_pad))
+            else:
+                hs_for_q = hidden_states
+            hidden_states_q = hs_for_q[cp_ctx.local_start:cp_ctx.local_end_with_pad]
+            # Pad cos/sin to TP multiple, slice for local Q.
+            # NOTE: cos has num_actual_tokens entries, hidden_states has
+            # num_input_tokens. Pad each to their own target.
+            cos_pad = cp_ctx.num_tokens_pad - cos.shape[0]
+            if cos_pad > 0:
+                cos = F.pad(cos, (0, 0, 0, cos_pad))
+                sin = F.pad(sin, (0, 0, 0, cos_pad))
             cos_q = cos[cp_ctx.local_start:cp_ctx.local_end_with_pad]
             sin_q = sin[cp_ctx.local_start:cp_ctx.local_end_with_pad]
+            # Restore original for KV RoPE.
+            if cos_pad > 0:
+                cos = cos[:-cos_pad]; sin = sin[:-cos_pad]
             actual_seq_lengths_query = cp_ctx.actual_seq_lengths_query
         else:
             hidden_states_q = hidden_states
@@ -941,13 +1113,21 @@ class AscendDSACPImpl(DSAAttentionImpl):
 
         q = triton_q_rms(q, self.eps)
 
-        torch.ops._C_ascend.inplace_partial_rotary_mul(
-            q.unsqueeze(1),
-            cos_q,
-            sin_q,
-            rotary_mode="interleave",
-            partial_slice=[self.nope_head_dim, self.head_dim],
-        )
+        # CP mode: use pure-PyTorch interleaved RoPE (CANN kernels have
+        # head-count and RopeDataProxy limitations with full 64 heads).
+        if self.enable_dsa_cp:
+            q_nope = q[..., :self.nope_head_dim]
+            q_rope = self._apply_rotary_interleaved(
+                q[..., self.nope_head_dim:self.head_dim], cos_q, sin_q)
+            q = torch.cat([q_nope, q_rope], dim=-1)
+        else:
+            torch.ops._C_ascend.inplace_partial_rotary_mul(
+                q.unsqueeze(1).contiguous(),
+                cos_q,
+                sin_q,
+                rotary_mode="interleave",
+                partial_slice=[self.nope_head_dim, self.head_dim],
+            )
 
         # --- kv (full hidden_states in both CP and non-CP) ---
         kv = self.wkv(hidden_states)
@@ -955,13 +1135,22 @@ class AscendDSACPImpl(DSAAttentionImpl):
         assert self.rope_head_dim is not None
         kv = kv.view(-1, 1, self.nope_head_dim + self.rope_head_dim)
 
-        torch.ops._C_ascend.inplace_partial_rotary_mul(
-            kv.unsqueeze(1),
-            cos,
-            sin,
-            rotary_mode="interleave",
-            partial_slice=[self.nope_head_dim, self.head_dim],
-        )
+        # KV RoPE — cos/sin already 2-D [T, rope_dim] from unwrap above.
+        kv = kv.reshape(-1, self.nope_head_dim + self.rope_head_dim)
+        kv_nope = kv[..., :self.nope_head_dim]
+        kv_rope = kv[..., self.nope_head_dim:]
+        if self.enable_dsa_cp:
+            kv_rope = self._apply_rotary_interleaved(
+                kv_rope.unsqueeze(1), cos, sin).squeeze(1)
+            kv = torch.cat([kv_nope, kv_rope], dim=-1).unsqueeze(1)
+        else:
+            torch.ops._C_ascend.inplace_partial_rotary_mul(
+                kv.unsqueeze(1).contiguous(),
+                cos,
+                sin,
+                rotary_mode="interleave",
+                partial_slice=[self.nope_head_dim, self.head_dim],
+            )
 
         # swa exec kv
         torch.ops._C_ascend.npu_scatter_nd_update_v2(

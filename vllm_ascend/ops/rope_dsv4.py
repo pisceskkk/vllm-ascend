@@ -27,6 +27,22 @@ class RopeDataProxy:
         self._data = data_map
         self.idx = 0 if is_cos else 1
 
+    def get_tensor(self, group: str = "default") -> torch.Tensor:
+        """Return the raw cos/sin tensor for *group*.
+
+        After layer-name filtering via __getitem__ there is typically
+        a single config-key.  This extracts the cos (self.idx==0) or sin
+        (self.idx==1) 2-D tensor.
+        """
+        for config_data in self._data.values():
+            if group in config_data:
+                return config_data[group][self.idx]
+        # Fallback: first group
+        for config_data in self._data.values():
+            for item in config_data.values():
+                return item[self.idx]
+        raise KeyError(f"No tensor found for group={group}")
+
     def __getitem__(self, index):
         if not isinstance(index, str):
             new_map = {}
