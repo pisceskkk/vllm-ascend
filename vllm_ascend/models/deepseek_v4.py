@@ -78,7 +78,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ops.dsa import AscendDeepseekSparseAttention, DSAModules
 from vllm_ascend.ops.rope_dsv4 import ComplexExpRotaryEmbedding
 from vllm_ascend.ops.triton.mul_add import muls_add_triton
-from vllm_ascend.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
+from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 
 logger = init_logger(__name__)
 
