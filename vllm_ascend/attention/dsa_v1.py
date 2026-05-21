@@ -145,6 +145,10 @@ class AscendDSABackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls():
+        from vllm_ascend.utils import enable_dsa_cp
+        if enable_dsa_cp():
+            from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
+            return AscendDSACPMetadataBuilder
         return AscendDSAMetadataBuilder
 
     @staticmethod
@@ -159,6 +163,10 @@ class AscendDSABackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls() -> Type["DSAAttentionImpl"]:
+        from vllm_ascend.utils import enable_dsa_cp
+        if enable_dsa_cp():
+            from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPImpl
+            return AscendDSACPImpl
         return AscendDSAImpl
 
     @staticmethod
