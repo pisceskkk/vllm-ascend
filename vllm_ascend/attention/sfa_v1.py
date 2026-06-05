@@ -7,9 +7,8 @@ import torch_npu
 import vllm.envs as envs_vllm
 from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size, get_tp_group
 from vllm.distributed.utils import get_pp_indices
-from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size, get_tp_group
 from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
@@ -122,6 +121,8 @@ class DSACPContext:
     slot_mapping_cp: torch.Tensor
     actual_seq_lengths_query: torch.Tensor
     actual_seq_lengths_key: torch.Tensor
+    sin_cp: torch.Tensor
+    cos_cp: torch.Tensor
 
 
 @dataclass
@@ -157,7 +158,12 @@ class AscendSFAMetadata:
     attn_state: AscendAttentionState = AscendAttentionState.ChunkedPrefill
     dsa_cp_context: DSACPContext | None = None
     reshape_cache_event: torch.npu.Event = None
+    prefill_allgather_kli_event: torch.npu.Event = None
+    prefill_allgather_kv_event: torch.npu.Event = None
+    prefill_kli_cache_event: torch.npu.Event = None
+    prefill_kv_cache_event: torch.npu.Event = None
     sfa_cp_metadata: AscendPCPMetadata | None = None
+    prefill_slot_mapping: torch.Tensor | None = None
     num_decodes: int = 0
     num_decode_tokens: int = 0
     num_prefills: int = 0
@@ -207,6 +213,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
         self.rope_dim = self.model_config.hf_text_config.qk_rope_head_dim
         self.enable_dsa_cp = enable_dsa_cp()
+        self.enable_sp = enable_sp()
 
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.actual_seq_lengths_query = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
@@ -259,7 +266,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         cos, sin = get_cos_and_sin_mla(input_positions, True)
 
         dsa_cp_context = None
-        if self.enable_dsa_cp:
+        if self.enable_sp:
             global_tp_size = get_tp_group().world_size
             num_tokens = num_input_tokens
             num_tokens_pad = _round_up(num_tokens, global_tp_size)
@@ -282,6 +289,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 slot_mapping = slot_mapping[:num_tokens_pad]
             slot_mapping_cp = slot_mapping[local_start:local_end_with_pad]
 
+            cos_cp, sin_cp = cos, sin
             cos = cos[local_start:local_end_with_pad]
             sin = sin[local_start:local_end_with_pad]
 
@@ -335,6 +343,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 slot_mapping_cp=slot_mapping_cp,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
+                sin_cp=sin_cp,
+                cos_cp=cos_cp,
             )
 
         return self.metadata_cls(  # type: ignore
@@ -1127,6 +1137,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         else:
             actual_seq_lengths_query = attn_metadata.cum_query_lens
             actual_seq_lengths_key = attn_metadata.seq_lens
+            if self.enable_sp:
+                assert attn_metadata.dsa_cp_context is not None
+                cos = attn_metadata.dsa_cp_context.cos_cp
+                sin = attn_metadata.dsa_cp_context.sin_cp
 
         # Inputs and outputs may be padded for CUDA graphs
         num_input_tokens = attn_metadata.num_input_tokens
