@@ -1107,7 +1107,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li_shape_ori,
             weights,
             kv_cache,
-            attn_metadata,
+            attn_metadata.block_table,
             actual_seq_lengths_query,
             actual_seq_lengths_key,
             self.use_sparse_c8_indexer,

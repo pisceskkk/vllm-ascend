@@ -11,10 +11,12 @@ from vllm.triton_utils import HAS_TRITON
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
 from vllm_ascend.attention.sfa_v1 import AscendSFAImpl, AscendSFAMetadata, AscendSFAMetadataBuilder
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, enabling_mlapo, split_decodes_and_prefills
+from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.triton.rope import rope_forward_triton_siso
 from vllm_ascend.utils import (
     get_weight_prefetch_method,
 )
+from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
 from vllm_ascend.distributed.utils import all_gather_async
 from vllm_ascend.attention.utils import (
     maybe_save_kv_layer_to_connector,
@@ -482,7 +484,7 @@ class AscendSFACPImpl(AscendSFAImpl):
 
     def indexer_select_post_process(
         self,
-        weights: torch.Tensor,
+        x: torch.Tensor,
         q_c: torch.Tensor,
         prefill_key: torch.Tensor,
         decode_key: torch.Tensor,
@@ -493,7 +495,29 @@ class AscendSFACPImpl(AscendSFAImpl):
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
     ):
-        q_li, _ = self.wq_b(q_c)  # [b,s,1536] @ [1536,64*128] = [b,s,64*128]
+        kw, _ = self.wk_weights_proj(x)
+        weights = kw[:, self.head_dim :]
+        if isinstance(q_c, tuple):
+            # MLAPO in C8 scenario already quantizes q_c to MXFP8 (fp8) with a per-token scale.
+            # Skip wq_b's internal npu_dynamic_mx_quant and directly use the
+            # pre-quantized values in npu_quant_matmul to avoid double quantization.
+            q_c_tensor, q_c_scale = q_c
+            q_c_tensor = q_c_tensor.view(-1, q_c_tensor.shape[-1])
+            if q_c_scale.dim() == 2:
+                q_c_scale = q_c_scale.view(q_c_scale.shape[0], -1, 2)
+            q_li = torch_npu.npu_quant_matmul(
+                q_c_tensor,
+                self.wq_b.weight,
+                self.wq_b.weight_scale,
+                scale_dtype=FLOAT8_E8M0FNU_DTYPE,
+                pertoken_scale=q_c_scale,
+                pertoken_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
+                bias=None,
+                output_dtype=x.dtype,
+                group_sizes=[1, 1, getattr(self.wq_b.quant_method.quant_method, "group_size", 32)],
+            )
+        else:
+            q_li, _ = self.wq_b(q_c)  # [b,s,1536] @ [1536,64*128] = [b,s,64*128]
         q_li = q_li.view(-1, self.n_head, self.head_dim)  # [n_toks,64,128]
         if HAS_TRITON:
             q_li = rope_forward_triton_siso(
@@ -509,6 +533,16 @@ class AscendSFACPImpl(AscendSFAImpl):
             q_li_pe = q_li_pe.squeeze(2)
             q_li = torch.cat([q_li_pe, q_li_nope], dim=-1)  # [b*s,64,128]
 
+        q_li_scale = None
+        q_li_decode_shape_ori = None
+        q_li_prefill_shape_ori = None
+        if self.use_sparse_c8_indexer:
+            q_li_decode_shape_ori = q_li[:num_decode_tokens].shape
+            q_li_prefill_shape_ori = q_li[num_decode_tokens:].shape
+            q_li = q_li @ AscendSFAImpl.q_hadamard
+            q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
+            q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
+
         q = q_li
 
         assert attn_metadata.sfa_cp_metadata is not None
@@ -522,13 +556,18 @@ class AscendSFACPImpl(AscendSFAImpl):
             decode_block_table = self.gather_block_table(
                 decode_block_num, decode_block_table_src, sfa_cp_metadata.block_arange
             )
-            decode_topk_indices = self._execute_indexer_select(
+            decode_topk_indices = DeviceOperator.indexer_select_post_process(
+                self,
                 q[:num_decode_tokens],
-                decode_key,
+                q_li_scale[:num_decode_tokens] if q_li_scale is not None else None,
+                q_li_decode_shape_ori,
                 weights[:num_decode_tokens],
+                decode_key,
+                decode_block_table,
                 actual_seq_lengths_query[:num_decodes],
                 actual_seq_lengths_key[:num_decodes],
-                decode_block_table,
+                self.use_sparse_c8_indexer,
+                self.use_torch_npu_lightning_indexer,
             )
         # prefill compute
         if num_prefills == 0:
@@ -542,13 +581,18 @@ class AscendSFACPImpl(AscendSFAImpl):
         if attn_metadata.prefill_allgather_kli_event is not None:
             attn_metadata.prefill_allgather_kli_event.wait()
         if self.pcp_size == 1:
-            prefill_topk_indices = self._execute_indexer_select(
+            prefill_topk_indices = DeviceOperator.indexer_select_post_process(
+                self,
                 prefill_q,
-                prefill_key,
+                q_li_scale[num_decode_tokens:] if q_li_scale is not None else None,
+                q_li_prefill_shape_ori,
                 prefill_weights,
+                prefill_key,
+                prefill_block_table,
                 sfa_cp_metadata.prefill_q_cum_seqlens,
                 prefill_actual_seq_lengths_key,
-                prefill_block_table,
+                self.use_sparse_c8_indexer,
+                self.use_torch_npu_lightning_indexer,
             )
             if decode_topk_indices is not None:
                 prefill_topk_indices = torch.cat([decode_topk_indices, prefill_topk_indices], dim=0)
@@ -559,48 +603,24 @@ class AscendSFACPImpl(AscendSFAImpl):
 
         # q head/tail compute
         full_overall_attn_seq_lens = sfa_cp_metadata.full_overall_attn_seq_lens
-        q_head_tail_topk_indices = self._execute_indexer_select(
-            q=torch.index_select(prefill_q, 0, q_head_tail_idx),
-            key=prefill_key,
-            weights=torch.index_select(prefill_weights, 0, q_head_tail_idx),
-            actual_seq_lengths_query=sfa_cp_metadata.attn_mask_full_seqlens,
-            actual_seq_lengths_key=full_overall_attn_seq_lens,
-            block_table=prefill_block_table_cp
+        q_head_tail_topk_indices = DeviceOperator.indexer_select_post_process(
+            self,
+            torch.index_select(prefill_q, 0, q_head_tail_idx),
+            torch.index_select(q_li_scale[num_decode_tokens:], 0, q_head_tail_idx) if q_li_scale is not None else None,
+            q_li_prefill_shape_ori,
+            torch.index_select(prefill_weights, 0, q_head_tail_idx),
+            prefill_key,
+            prefill_block_table_cp,
+            sfa_cp_metadata.attn_mask_full_seqlens,
+            full_overall_attn_seq_lens,
+            self.use_sparse_c8_indexer,
+            self.use_torch_npu_lightning_indexer,
         )
         q_full_idx = sfa_cp_metadata.q_full_idx
         topk_indices = torch.index_select(q_head_tail_topk_indices, 0, q_full_idx)
 
         if decode_topk_indices is not None:
             topk_indices = torch.cat([decode_topk_indices, topk_indices], dim=0)
-        return topk_indices
-
-    def _execute_indexer_select(self, q, key, weights, actual_seq_lengths_query, actual_seq_lengths_key, block_table):
-        if self.use_torch_npu_lightning_indexer:
-            topk_indices, _ = torch_npu.npu_lightning_indexer(
-                query=q,
-                key=key,
-                weights=weights,
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=block_table,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=2048,
-                sparse_mode=3,
-            )
-        else:
-            topk_indices, _ = torch.ops._C_ascend.npu_lightning_indexer(
-                query=q,
-                key=key,
-                weights=weights,
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=block_table,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=2048,
-                sparse_mode=3,
-            )
         return topk_indices
 
     def exec_kv_pre(
@@ -872,7 +892,7 @@ class AscendSFACPImpl(AscendSFAImpl):
             topk_indices = self._get_indexcache_topk_indices(topk_num_tokens)
         else:
             topk_indices = self.indexer_select_post_process(
-                weights=weight,
+                x=weight,
                 q_c=q_c,
                 prefill_key=prefill_key,
                 decode_key=decode_key,

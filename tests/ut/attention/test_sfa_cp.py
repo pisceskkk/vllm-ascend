@@ -1183,7 +1183,7 @@ class TestAscendSFACPImpl(TestBase):
             return_value=(torch.tensor([[0]] * 2), None),
         ):
             result = self.impl.indexer_select_post_process(
-                x, q_c, kv_cache, attn_metadata, cos, sin, actual_seq_lengths_query, actual_seq_lengths_key
+                x, q_c, kv_cache, attn_metadata.block_table, cos, sin, actual_seq_lengths_query, actual_seq_lengths_key
             )
         self.assertIsNotNone(result)
 
@@ -1235,7 +1235,7 @@ class TestAscendSFACPImpl(TestBase):
             return_value=(torch.tensor([[0]] * 2), None),
         ):
             result = self.impl.indexer_select_post_process(
-                x, q_c, kv_cache, attn_metadata, cos, sin, actual_seq_lengths_query, actual_seq_lengths_key
+                x, q_c, kv_cache, attn_metadata.block_table, cos, sin, actual_seq_lengths_query, actual_seq_lengths_key
             )
         self.assertIsNotNone(result)
 
@@ -1289,7 +1289,7 @@ class TestAscendSFACPImpl(TestBase):
             return_value=(torch.tensor([[0]] * 2), None),
         ):
             result = self.impl.indexer_select_post_process(
-                x, q_c, kv_cache, attn_metadata, cos, sin, actual_seq_lengths_query, actual_seq_lengths_key
+                x, q_c, kv_cache, attn_metadata.block_table, cos, sin, actual_seq_lengths_query, actual_seq_lengths_key
             )
         self.assertIsNotNone(result)
 
@@ -1349,7 +1349,7 @@ class TestAscendSFACPImpl(TestBase):
             side_effect=fake_indexer,
         ):
             result = self.impl.indexer_select_post_process(
-                x, q_c, kv_cache, attn_metadata, cos, sin, actual_seq_lengths_query, actual_seq_lengths_key
+                x, q_c, kv_cache, attn_metadata.block_table, cos, sin, actual_seq_lengths_query, actual_seq_lengths_key
             )
         self.assertIsNotNone(result)
         self.assertEqual(result.shape[0], 3)
@@ -1413,7 +1413,7 @@ class TestAscendSFACPImpl(TestBase):
             side_effect=fake_indexer,
         ):
             result = self.impl.indexer_select_post_process(
-                x, q_c, kv_cache, attn_metadata, cos, sin, actual_seq_lengths_query, actual_seq_lengths_key
+                x, q_c, kv_cache, attn_metadata.block_table, cos, sin, actual_seq_lengths_query, actual_seq_lengths_key
             )
         self.assertIsNotNone(result)
         self.assertEqual(result.shape[0], 4)
@@ -1477,7 +1477,7 @@ class TestAscendSFACPImpl(TestBase):
             side_effect=fake_indexer,
         ):
             result = self.impl.indexer_select_post_process(
-                x, q_c, kv_cache, attn_metadata, cos, sin, actual_seq_lengths_query, actual_seq_lengths_key
+                x, q_c, kv_cache, attn_metadata.block_table, cos, sin, actual_seq_lengths_query, actual_seq_lengths_key
             )
         self.assertIsNotNone(result)
         self.assertEqual(result.shape[0], 5)
