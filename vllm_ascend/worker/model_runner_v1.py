@@ -2061,7 +2061,8 @@ class NPUModelRunner(GPUModelRunner):
             if self.pcp_size > 1:
                 # NOTE we must `slice` hidden_states because pcp_allgather_restore_idx
                 # ignores the padding from CUDA Graph.
-                hidden_states = self.pcp_manager.get_restore_hidden_states(hidden_states)
+                if not isinstance(hidden_states, IntermediateTensors):
+                    hidden_states = self.pcp_manager.get_restore_hidden_states(hidden_states)
                 if aux_hidden_states is not None:
                     aux_hidden_states = [
                         self.pcp_manager.get_restore_hidden_states(aux_hidden_states_pcp)
