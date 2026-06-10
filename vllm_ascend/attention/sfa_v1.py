@@ -1052,21 +1052,21 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li = torch.cat([q_li_pe, q_li_nope], dim=-1)  # [b*s,64,128]
 
         q_li_scale = None
-        q_li_shape_ori = None
         if self.use_sparse_c8_indexer:
             q_li_shape_ori = q_li.shape
             q_li = q_li @ AscendSFAImpl.q_hadamard
             q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
             q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
+            q_li = q_li.view(q_li_shape_ori)  # [b*s,64,128] -> [b*s,64,128]
+            q_li_scale = q_li_scale.view(q_li_shape_ori[:-1]) # [b*s,64]
 
         return DeviceOperator.indexer_select_post_process(
             self,
             q_li,
             q_li_scale,
-            q_li_shape_ori,
             weights,
             kv_cache,
-            attn_metadata,
+            attn_metadata.block_table,
             actual_seq_lengths_query,
             actual_seq_lengths_key,
             self.use_sparse_c8_indexer,

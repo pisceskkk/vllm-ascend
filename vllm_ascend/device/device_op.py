@@ -366,10 +366,9 @@ class BaseDeviceAdaptor:
         sfa_impl,
         q_li: torch.Tensor,
         q_li_scale: torch.Tensor | None,
-        q_li_shape_ori: tuple[Any, ...] | None,
         weights: torch.Tensor,
         kv_cache: tuple,
-        attn_metadata,
+        block_table: torch.Tensor,
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
         use_sparse_c8_indexer: bool,
@@ -380,18 +379,16 @@ class BaseDeviceAdaptor:
         # TODO: torch.ops._C_ascend.npu_lightning_indexer needs to be removed.
         if sfa_impl.use_sparse_c8_indexer:
             assert len(kv_cache) == 4
-            assert q_li_scale is not None
-            assert q_li_shape_ori is not None
             weights = weights.to(torch.float16)
             topk_indices = torch.ops._C_ascend.npu_lightning_indexer_quant(
-                query=q_li.view(q_li_shape_ori),
+                query=q_li,
                 key=kv_cache[2],
                 weights=weights,
-                query_dequant_scale=q_li_scale.view(q_li_shape_ori[:-1]),
+                query_dequant_scale=q_li_scale,
                 key_dequant_scale=kv_cache[3].squeeze(2),  # B S N D -> B S D
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
+                block_table=block_table,
                 query_quant_mode=0,
                 key_quant_mode=0,
                 layout_query="TND",
@@ -406,7 +403,7 @@ class BaseDeviceAdaptor:
                 weights=weights,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
+                block_table=block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
                 sparse_count=2048,
@@ -419,7 +416,7 @@ class BaseDeviceAdaptor:
                 weights=weights,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
+                block_table=block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
                 sparse_count=2048,
@@ -1413,11 +1410,10 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             assert q_li_shape_ori is not None
 
             if q_li_scale is not None:
-                q_li_scale = q_li_scale.view(q_li_shape_ori[:-1])
                 key_dequant_scale = kv_cache[2].squeeze(2)
 
                 topk_indices = torch_npu.npu_quant_lightning_indexer(
-                    query=q_li.view(q_li_shape_ori),
+                    query=q_li,
                     key=kv_cache[1],
                     weights=weights,
                     query_dequant_scale=q_li_scale,
@@ -1434,7 +1430,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                 )
             else:
                 topk_indices, _ = torch_npu.npu_lightning_indexer(
-                    query=q_li.view(q_li_shape_ori),
+                    query=q_li,
                     key=kv_cache[1],
                     weights=weights,
                     actual_seq_lengths_query=actual_seq_lengths_query,

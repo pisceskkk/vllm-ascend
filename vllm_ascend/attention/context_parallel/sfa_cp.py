@@ -20,11 +20,14 @@ from vllm_ascend.attention.utils import (
     split_decodes_and_prefills,
     wait_for_kv_layer_from_connector,
 )
+from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import all_gather_async
 from vllm_ascend.ops.layer_shard_linear import is_hidden_layer, reach_layer_for_shard_weight_series
 from vllm_ascend.ops.triton.rope import rope_forward_triton_siso
 from vllm_ascend.utils import (
+    AscendDeviceType,
     enable_dsa_cp_with_pcp_shard,
+    get_ascend_device_type,
     get_weight_prefetch_method,
 )
 
@@ -350,16 +353,17 @@ class AscendSFACPImpl(AscendSFAImpl):
         ql_nope,
         q_pe,
         decode_kv,
+        decode_block_num,
         prefill_kv,
         topk_indices,
         attn_metadata,
         actual_seq_lengths_query,
         actual_seq_lengths_key,
     ):
-        if decode_kv is not None:
-            assert len(decode_kv) == 3
-            (decode_k_nope, decode_k_rope, decode_block_num) = decode_kv
-        if prefill_kv is not None:
+        if decode_kv is not None and decode_kv[0] is not None:
+            assert len(decode_kv) == 2
+            (decode_k_nope, decode_k_rope) = decode_kv
+        if prefill_kv is not None and prefill_kv[0] is not None:
             assert len(prefill_kv) == 2
             (prefill_k_nope, prefill_k_rope) = prefill_kv
 
@@ -557,10 +561,11 @@ class AscendSFACPImpl(AscendSFAImpl):
 
     def indexer_select_cp_post_process(
         self,
+        x: torch.Tensor,
         weights: torch.Tensor,
         q_c: torch.Tensor,
-        prefill_key: torch.Tensor,
-        decode_key: torch.Tensor,
+        prefill_kvcache: torch.Tensor,
+        decode_kvcache: torch.Tensor,
         decode_block_num: int,
         attn_metadata: M,
         cos: torch.Tensor,
@@ -568,7 +573,27 @@ class AscendSFACPImpl(AscendSFAImpl):
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
     ):
-        q_li, _ = self.wq_b(q_c)  # [b,s,1536] @ [1536,64*128] = [b,s,64*128]
+        if isinstance(q_c, tuple):
+            # MLAPO in C8 scenario already quantizes q_c to MXFP8 (fp8) with a per-token scale.
+            # Skip wq_b's internal npu_dynamic_mx_quant and directly use the
+            # pre-quantized values in npu_quant_matmul to avoid double quantization.
+            q_c_tensor, q_c_scale = q_c
+            q_c_tensor = q_c_tensor.view(-1, q_c_tensor.shape[-1])
+            if q_c_scale.dim() == 2:
+                q_c_scale = q_c_scale.view(q_c_scale.shape[0], -1, 2)
+            q_li = torch_npu.npu_quant_matmul(
+                q_c_tensor,
+                self.wq_b.weight,
+                self.wq_b.weight_scale,
+                scale_dtype=FLOAT8_E8M0FNU_DTYPE,
+                pertoken_scale=q_c_scale,
+                pertoken_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
+                bias=None,
+                output_dtype=x.dtype,
+                group_sizes=[1, 1, getattr(self.wq_b.quant_method.quant_method, "group_size", 32)],
+            )
+        else:
+            q_li, _ = self.wq_b(q_c)  # [b,s,1536] @ [1536,64*128] = [b,s,64*128]
         q_li = q_li.view(-1, self.n_head, self.head_dim)  # [n_toks,64,128]
         if HAS_TRITON:
             q_li = rope_forward_triton_siso(
@@ -584,26 +609,38 @@ class AscendSFACPImpl(AscendSFAImpl):
             q_li_pe = q_li_pe.squeeze(2)
             q_li = torch.cat([q_li_pe, q_li_nope], dim=-1)  # [b*s,64,128]
 
-        q = q_li
-
         assert attn_metadata.sfa_cp_metadata is not None
         sfa_cp_metadata = attn_metadata.sfa_cp_metadata
         num_decodes = attn_metadata.num_decodes
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_prefills = attn_metadata.num_prefills
+
+        q_li_scale = None
+        if self.use_sparse_c8_indexer:
+            q_li_shape_ori = q_li.shape
+            q_li = q_li @ AscendSFAImpl.q_hadamard
+            q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
+            q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
+            q_li = q_li.view(q_li_shape_ori)
+            q_li_scale = q_li_scale.view(q_li_shape_ori[:-1])
+
         decode_topk_indices = None
         if num_decode_tokens > 0:
             decode_block_table_src = attn_metadata.block_table[:num_decodes]
             decode_block_table = self.gather_block_table(
                 decode_block_num, decode_block_table_src, sfa_cp_metadata.block_arange
             )
-            decode_topk_indices = self._execute_indexer_select(
-                q[:num_decode_tokens],
-                decode_key,
+            decode_topk_indices = DeviceOperator.indexer_select_post_process(
+                self,
+                q_li[:num_decode_tokens],
+                q_li_scale[:num_decode_tokens] if q_li_scale is not None else None,
                 weights[:num_decode_tokens],
+                decode_kvcache,
+                decode_block_table,
                 actual_seq_lengths_query[:num_decodes],
                 actual_seq_lengths_key[:num_decodes],
-                decode_block_table,
+                self.use_sparse_c8_indexer,
+                self.use_torch_npu_lightning_indexer,
             )
         # prefill compute
         if num_prefills == 0:
@@ -611,19 +648,24 @@ class AscendSFACPImpl(AscendSFAImpl):
 
         prefill_block_table = sfa_cp_metadata.block_table_cp
         prefill_block_table_cp = sfa_cp_metadata.block_table_cp_repeat
-        prefill_q = q[num_decode_tokens:]
+        prefill_q_li = q_li[num_decode_tokens:]
+        prefill_q_li_scale = q_li_scale[num_decode_tokens:] if q_li_scale is not None else None
         prefill_weights = weights[num_decode_tokens:]
         prefill_actual_seq_lengths_key = actual_seq_lengths_key[num_decodes:]
         if attn_metadata.prefill_allgather_kli_event is not None:
             attn_metadata.prefill_allgather_kli_event.wait()
         if self.pcp_size == 1:
-            prefill_topk_indices = self._execute_indexer_select(
-                prefill_q,
-                prefill_key,
+            prefill_topk_indices = DeviceOperator.indexer_select_post_process(
+                self,
+                prefill_q_li,
+                prefill_q_li_scale,
                 prefill_weights,
+                prefill_kvcache,
+                prefill_block_table,
                 sfa_cp_metadata.prefill_q_cum_seqlens,
                 prefill_actual_seq_lengths_key,
-                prefill_block_table,
+                self.use_sparse_c8_indexer,
+                self.use_torch_npu_lightning_indexer,
             )
             if decode_topk_indices is not None:
                 prefill_topk_indices = torch.cat([decode_topk_indices, prefill_topk_indices], dim=0)
@@ -634,48 +676,25 @@ class AscendSFACPImpl(AscendSFAImpl):
 
         # q head/tail compute
         full_overall_attn_seq_lens = sfa_cp_metadata.full_overall_attn_seq_lens
-        q_head_tail_topk_indices = self._execute_indexer_select(
-            q=torch.index_select(prefill_q, 0, q_head_tail_idx),
-            key=prefill_key,
-            weights=torch.index_select(prefill_weights, 0, q_head_tail_idx),
-            actual_seq_lengths_query=sfa_cp_metadata.attn_mask_full_seqlens,
-            actual_seq_lengths_key=full_overall_attn_seq_lens,
-            block_table=prefill_block_table_cp,
+        prefill_q_li = torch.index_select(prefill_q_li, 0, q_head_tail_idx)
+        prefill_q_li_scale = torch.index_select(prefill_q_li_scale, 0, q_head_tail_idx) if prefill_q_li_scale is not None else None
+        q_head_tail_topk_indices = DeviceOperator.indexer_select_post_process(
+            self,
+            prefill_q_li,
+            prefill_q_li_scale,
+            torch.index_select(prefill_weights, 0, q_head_tail_idx),
+            prefill_kvcache,
+            prefill_block_table_cp,
+            sfa_cp_metadata.attn_mask_full_seqlens,
+            full_overall_attn_seq_lens,
+            self.use_sparse_c8_indexer,
+            self.use_torch_npu_lightning_indexer,
         )
         q_full_idx = sfa_cp_metadata.q_full_idx
         topk_indices = torch.index_select(q_head_tail_topk_indices, 0, q_full_idx)
 
         if decode_topk_indices is not None:
             topk_indices = torch.cat([decode_topk_indices, topk_indices], dim=0)
-        return topk_indices
-
-    def _execute_indexer_select(self, q, key, weights, actual_seq_lengths_query, actual_seq_lengths_key, block_table):
-        if self.use_torch_npu_lightning_indexer:
-            topk_indices, _ = torch_npu.npu_lightning_indexer(
-                query=q,
-                key=key,
-                weights=weights,
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=block_table,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=2048,
-                sparse_mode=3,
-            )
-        else:
-            topk_indices, _ = torch.ops._C_ascend.npu_lightning_indexer(
-                query=q,
-                key=key,
-                weights=weights,
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=block_table,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=2048,
-                sparse_mode=3,
-            )
         return topk_indices
 
     def exec_kv_pre(
@@ -870,19 +889,30 @@ class AscendSFACPImpl(AscendSFAImpl):
             if attn_metadata.num_decodes > 0:
                 _, _ = self.exec_kv_decode(k_nope, k_pe, kv_cache, attn_metadata)
 
-            fused_kv_no_split = torch.cat(
-                [k_nope.view(-1, k_nope.shape[-1]), k_pe.view(-1, k_pe.shape[-1]), k_li.view(-1, k_li.shape[-1])],
-                dim=1,
-            )[:num_actual_tokens]
-            fused_kv_no_split, kv_pcp_ag_handle = all_gather_async(fused_kv_no_split, get_pcp_group())
+            if not self.use_sparse_c8_indexer:
+                fused_kv_no_split = torch.cat([k_nope.view(-1, k_nope.shape[-1]), k_pe.view(-1, k_pe.shape[-1]), k_li.view(-1, k_li.shape[-1]),], dim=1)[:num_actual_tokens]
+                fused_kv_no_split, kv_pcp_ag_handle = all_gather_async(fused_kv_no_split, get_pcp_group())
+            else:
+                assert k_li_scale is not None
+                fused_kv_no_split = torch.cat(
+                    [
+                        k_nope.view(-1, k_nope.shape[-1]),
+                        k_pe.view(-1, k_pe.shape[-1]),
+                    ],
+                    dim=1,
+                )[:num_actual_tokens]
+                fused_kv_no_split, _ = all_gather_async(fused_kv_no_split, get_pcp_group())
+                k_li, _ = all_gather_async(k_li.view(-1, k_li.shape[-1])[:num_actual_tokens], get_pcp_group())
+                k_li_scale, kv_pcp_ag_handle = all_gather_async(k_li_scale.view(-1, k_li_scale.shape[-1])[:num_actual_tokens], get_pcp_group())
 
             ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
             q_pe = self.rope_single(q_pe, cos_cp, sin_cp)
             if kv_pcp_ag_handle is not None:
                 kv_pcp_ag_handle.wait()
-            k_nope, k_pe, k_li = fused_kv_no_split.split(
-                [self.kv_lora_rank, self.qk_rope_head_dim, self.head_dim], dim=-1
-            )
+            if not self.use_sparse_c8_indexer:
+                k_nope, k_pe, k_li = fused_kv_no_split.split([self.kv_lora_rank, self.qk_rope_head_dim, self.head_dim], dim=-1)
+            else:
+                k_nope, k_pe = fused_kv_no_split.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
             if attn_metadata.num_prefills > 0:
                 _, _ = self.exec_kv_prefill(k_nope, k_pe, kv_cache, attn_metadata)
                 attn_metadata.prefill_kv_cache_event.record()
@@ -891,17 +921,24 @@ class AscendSFACPImpl(AscendSFAImpl):
         if kv_cache is not None:
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event = torch.npu.Event()
+            if self.use_sparse_c8_indexer and get_ascend_device_type() == AscendDeviceType.A5:
+                dsa_k_cache_idx = 1
+                dsa_k_scale_cache_idx = 2
+            else:
+                dsa_k_cache_idx = 2
+                dsa_k_scale_cache_idx = 3
             if num_decode_tokens > 0:
                 torch_npu.npu_scatter_nd_update_(
-                    kv_cache[2].view(-1, k_li.shape[-1]),
-                    slot_mapping[:num_decode_tokens].view(-1, 1),
-                    k_li[:num_decode_tokens].view(-1, k_li.shape[-1]),
+                    kv_cache[dsa_k_cache_idx].view(-1, k_li.shape[-1]), slot_mapping[:num_decode_tokens].view(-1, 1), k_li[:num_decode_tokens].view(-1, k_li.shape[-1])
                 )  # b, s, n, d
                 if self.use_sparse_c8_indexer:
-                    assert len(kv_cache) == 4
+                    if get_ascend_device_type() == AscendDeviceType.A5:
+                        assert len(kv_cache) == 3
+                    else:
+                        assert len(kv_cache) == 4
                     assert k_li_scale is not None
                     torch_npu.npu_scatter_nd_update_(
-                        kv_cache[3].view(-1, k_li_scale.shape[-1]),
+                        kv_cache[dsa_k_scale_cache_idx].view(-1, k_li_scale.shape[-1]),
                         slot_mapping[:num_decode_tokens].view(-1, 1),
                         k_li_scale[:num_decode_tokens].view(-1, k_li_scale.shape[-1]),
                     )
@@ -909,13 +946,16 @@ class AscendSFACPImpl(AscendSFAImpl):
                 assert attn_metadata.prefill_slot_mapping is not None
                 slot_mapping = attn_metadata.prefill_slot_mapping
                 torch_npu.npu_scatter_nd_update_(
-                    kv_cache[2].view(-1, k_li.shape[-1]), slot_mapping.view(-1, 1), k_li.view(-1, k_li.shape[-1])
+                    kv_cache[dsa_k_cache_idx].view(-1, k_li.shape[-1]), slot_mapping.view(-1, 1), k_li.view(-1, k_li.shape[-1])
                 )  # b, s, n, d
                 if self.use_sparse_c8_indexer:
-                    assert len(kv_cache) == 4
+                    if get_ascend_device_type() == AscendDeviceType.A5:
+                        assert len(kv_cache) == 3
+                    else:
+                        assert len(kv_cache) == 4
                     assert k_li_scale is not None
                     torch_npu.npu_scatter_nd_update_(
-                        kv_cache[3].view(-1, k_li_scale.shape[-1]),
+                        kv_cache[dsa_k_scale_cache_idx].view(-1, k_li_scale.shape[-1]),
                         slot_mapping.view(-1, 1),
                         k_li_scale.view(-1, k_li_scale.shape[-1]),
                     )
@@ -924,14 +964,17 @@ class AscendSFACPImpl(AscendSFAImpl):
                 attn_metadata.reshape_cache_event.record()
 
         # allgather kv_cache block
-        prefill_key, decode_key, decode_block_num = None, None, 0
-        prefill_kv, decode_kv = None, None
+        decode_key, decode_key_scale, decode_block_num, prefill_key, prefill_key_scale = None, None, None, None, None
+        decode_kv, prefill_kv = (None, None), (None, None)
         if attn_metadata.num_decodes > 0:
-            decode_block_table_src = attn_metadata.block_table[: attn_metadata.num_decodes]
-            decode_key, decode_block_num = self.gather_kv_cross_cp(kv_cache[2], decode_block_table_src)  # k_li
-            decode_k_nope, _ = self.gather_kv_cross_cp(kv_cache[0], decode_block_table_src)  # k_nope
-            decode_k_rope, _ = self.gather_kv_cross_cp(kv_cache[1], decode_block_table_src)  # k_rope
-            decode_kv = (decode_k_nope, decode_k_rope, decode_block_num)
+            decode_block_table_src = attn_metadata.block_table[:attn_metadata.num_decodes]
+            decode_key, decode_block_num = self.gather_kv_cross_cp(kv_cache[2], decode_block_table_src) # k_li
+            if self.use_sparse_c8_indexer:
+                assert len(kv_cache) == 4
+                decode_key_scale, _ = self.gather_kv_cross_cp(kv_cache[3], decode_block_table_src) # k_li
+            decode_k_nope, _ = self.gather_kv_cross_cp(kv_cache[0], decode_block_table_src) # k_nope
+            decode_k_rope, _ = self.gather_kv_cross_cp(kv_cache[1], decode_block_table_src) # k_rope
+            decode_kv = (decode_k_nope, decode_k_rope)
         if attn_metadata.num_prefills > 0:
             assert attn_metadata.sfa_cp_metadata is not None
             with torch_npu.npu.stream(sfa_ag_stream):
@@ -939,7 +982,10 @@ class AscendSFACPImpl(AscendSFAImpl):
                 prefill_block_table = attn_metadata.sfa_cp_metadata.block_table_cp
                 assert prefill_valid_block_ids is not None and prefill_block_table is not None
                 attn_metadata.prefill_kli_cache_event.wait()
-                prefill_key = self.gather_kv_cross_cp_compact(kv_cache[2], prefill_valid_block_ids)  # k_li
+                prefill_key = self.gather_kv_cross_cp_compact(kv_cache[2], prefill_valid_block_ids) # k_li
+                if self.use_sparse_c8_indexer:
+                    assert len(kv_cache) == 4
+                    prefill_key_scale = self.gather_kv_cross_cp_compact(kv_cache[3], prefill_valid_block_ids) # k_li
                 attn_metadata.prefill_allgather_kli_event.record()
                 attn_metadata.prefill_kv_cache_event.wait()
                 prefill_k_nope = self.gather_kv_cross_cp_compact(kv_cache[0], prefill_valid_block_ids)  # k_nope
@@ -959,11 +1005,14 @@ class AscendSFACPImpl(AscendSFAImpl):
         if self.skip_topk:
             topk_indices = self._get_indexcache_topk_indices(topk_num_tokens)
         else:
+            prefill_kvcache = (*prefill_kv, prefill_key, prefill_key_scale) if self.use_sparse_c8_indexer else (*prefill_kv, prefill_key)
+            decode_kvcache = (*decode_kv, decode_key, decode_key_scale) if self.use_sparse_c8_indexer else (*decode_kv, decode_key)
             topk_indices = self.indexer_select_cp_post_process(
+                x=hidden_states,
                 weights=weight,
                 q_c=q_c,
-                prefill_key=prefill_key,
-                decode_key=decode_key,
+                prefill_kvcache=prefill_kvcache,
+                decode_kvcache=decode_kvcache,
                 decode_block_num=decode_block_num,
                 attn_metadata=attn_metadata,
                 cos=cos_cp,
@@ -975,14 +1024,7 @@ class AscendSFACPImpl(AscendSFAImpl):
                 self._update_indexcache_topk_indices(topk_indices)
 
         attn_output = self._execute_sparse_flash_attention_cp_process(
-            ql_nope,
-            q_pe,
-            decode_kv,
-            prefill_kv,
-            topk_indices,
-            attn_metadata,
-            actual_seq_lengths_query,
-            actual_seq_lengths_key,
+            ql_nope, q_pe, decode_kv, decode_block_num, prefill_kv, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
         )
 
         attn_output = self._v_up_proj(attn_output)
