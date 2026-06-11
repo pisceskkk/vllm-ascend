@@ -115,6 +115,35 @@ class GroupPull:
     is_group_transfer_end: bool = False
 
 
+@dataclass(frozen=True)
+class RemotePortPull:
+    port: int
+    remote_tp_offset: int
+    prefill_pp_rank: int = 0
+
+
+def get_handshake_port_offset(
+    tp_rank: int,
+    tp_size: int,
+    pp_rank: int = 0,
+    pp_size: int = 1,
+    pcp_rank: int = 0,
+    pcp_size: int = 1,
+) -> int:
+    return (pp_rank * pcp_size + pcp_rank) * tp_size + tp_rank
+
+
+def get_pp_rank_from_handshake_port(
+    handshake_port: int,
+    base_port: int,
+    tp_size: int,
+    pp_size: int,
+    pcp_size: int = 1,
+) -> int:
+    rank_offset = handshake_port - base_port
+    return (rank_offset // (tp_size * pcp_size)) % pp_size
+
+
 @dataclass
 class SizedDict(OrderedDict):
     def __init__(self, max_size=16000, *args, **kwargs):
@@ -225,6 +254,7 @@ class KVCacheSendingThread(threading.Thread):
         self.prefill_tp_size = prefill_tp_size
         self.pp_rank = get_pp_group().rank_in_group
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
         self.tp_size = get_tensor_model_parallel_world_size()
         self.local_engine_id = local_engine_id
         self.side_channel_host = side_channel_host
@@ -258,7 +288,14 @@ class KVCacheSendingThread(threading.Thread):
             # to have a unique port. This hack to keeps us moving. We will
             # switch when moving to etcd or where we have a single ZMQ socket in
             # the scheduler.
-            device_index = self.pp_rank * self.tp_size + self.tp_rank + self.pcp_rank * self.prefill_tp_size
+            device_index = get_handshake_port_offset(
+                self.tp_rank,
+                self.tp_size,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                pcp_rank=self.pcp_rank,
+                pcp_size=self.pcp_size,
+            )
             handshake_port = self.side_channel_port + device_index
             path = make_zmq_path("tcp", self.side_channel_host, handshake_port)
             logger.info("Starting listening on path: %s", path)
@@ -300,7 +337,14 @@ class KVCacheSendingThread(threading.Thread):
                         if request_id not in self.port_send_num:
                             self.port_send_num[request_id] = 0
                         self.port_send_num[request_id] += 1
-                        device_index = self.pp_rank * self.tp_size + self.tp_rank + self.pcp_rank * self.prefill_tp_size
+                        device_index = get_handshake_port_offset(
+                            self.tp_rank,
+                            self.tp_size,
+                            pp_rank=self.pp_rank,
+                            pp_size=self.pp_size,
+                            pcp_rank=self.pcp_rank,
+                            pcp_size=self.pcp_size,
+                        )
                         handshake_port = self.side_channel_port + device_index
                         if self.port_send_num[request_id] >= remote_port_send_num[handshake_port]["num"]:
                             self.task_tracker.update_done_task_count(request_id)
@@ -480,10 +524,11 @@ class KVCacheRecvingThread(threading.Thread):
         with self.failed_recv_requests_lock:
             return request_id in self.failed_recv_requests
 
-    def _mark_failed_recv_request(self, request_id: str, local_block_ids: list[int]) -> None:
+    def _mark_failed_recv_request(self, request_id: str, local_block_ids: BlockIds) -> None:
         with self.failed_recv_requests_lock:
             self.failed_recv_requests.add(request_id)
-            self.invalid_block_ids.update(local_block_ids)
+            for group_block_ids in local_block_ids:
+                self.invalid_block_ids.update(group_block_ids)
 
     def _clear_failed_recv_request(self, request_id: str) -> None:
         with self.failed_recv_requests_lock:
@@ -1528,12 +1573,15 @@ class MooncakeConnectorWorker:
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self.kv_caches: dict[str, torch.Tensor] = {}
         self.side_channel_host = get_ip()
-        logger.warning("[ADDR] Worker init: pp_rank=%s tp_rank=%s side_channel_host=%s pp_size=%s",
-                       self.pp_rank, self.tp_rank, self.side_channel_host, self.pp_size)
+        logger.warning(
+            "[ADDR] Worker init: pp_rank=%s tp_rank=%s side_channel_host=%s pp_size=%s",
+            self.pp_rank,
+            self.tp_rank,
+            self.side_channel_host,
+            self.pp_size,
+        )
         self.pcp_size = get_pcp_group().world_size
         self.total_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
-        # Assert that pp_size and pcp_size cannot both be greater than 1
-        assert not (self.pp_size > 1 and self.pcp_size > 1), "pp and pcp cannot open in same time"
         self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
         self.dcp_size = get_decode_context_model_parallel_world_size()
         self.dcp_rank = get_decode_context_model_parallel_rank() if self.dcp_size > 1 else 0
@@ -1561,7 +1609,14 @@ class MooncakeConnectorWorker:
             * vllm_config.parallel_config.pipeline_parallel_size
             * self.pcp_size
         )
-        device_index = (self.pp_rank + self.pcp_rank) * self.tp_size + self.tp_rank
+        device_index = get_handshake_port_offset(
+            self.tp_rank,
+            self.tp_size,
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
+            pcp_rank=self.pcp_rank,
+            pcp_size=self.pcp_size,
+        )
         self.handshake_port = self.side_channel_port + device_index
         self.sockets: dict = {}
         self.engine = global_te.get_transfer_engine(
@@ -1586,7 +1641,7 @@ class MooncakeConnectorWorker:
             num_d_block_heads = max(1, self.num_key_value_heads // self.tp_size)
             num_p_block_heads = max(1, self.num_key_value_heads // self._prefill_tp_size)
             self.tp_num_need_pulls = num_d_block_heads // num_p_block_heads
-        self.local_remote_block_port_mapping: dict[str, list[list[int]] | None] = {}
+        self.local_remote_block_port_mapping: dict[str, list[list[RemotePortPull]] | None] = {}
         self.remote_port_send_num: dict[str, dict[int, RemotePortInfo]] = {}
 
     def _get_prefill_decode_size(self, vllm_config: VllmConfig):
@@ -1866,7 +1921,7 @@ class MooncakeConnectorWorker:
         self,
         req_id: str,
         meta: ReqMeta,
-    ) -> tuple[list[list[int]], list[BlockIds], list[BlockIds]]:
+    ) -> tuple[list[list[int]], list[BlockIds], list[BlockIds], list[list[RemotePortPull]] | None]:
         """Build per-transfer port and block-id metadata for remote KV reads.
 
         Args:
@@ -1878,15 +1933,17 @@ class MooncakeConnectorWorker:
                 token counts.
 
         Returns:
-            A tuple of three aligned lists. Index ``i`` describes one transfer
-            shard for this local D-side rank:
+            A tuple of aligned lists. Index ``i`` describes one transfer shard
+            for this local D-side rank:
             * remote_handshake_port_list[i]: remote P worker handshake ports
-              to pull from. The inner list length is the number of TP pulls
-              needed for that shard.
+              to pull from. The inner list covers the TP pulls needed for that
+              shard across all prefill PP stages.
             * local_block_ids_list[i]: local block ids, grouped by KV cache
               group, where received blocks are written.
             * remote_block_ids_list[i]: remote block ids, grouped by KV cache
               group, where blocks are read from.
+            * remote_port_pull_list[i]: optional explicit per-port TP/PP
+              metadata used when PCP/DCP expands the port list.
 
         In PCP/DCP scenarios, prompt blocks can be split across multiple remote
         P workers. This method also accounts for unequal P/D prefix-cache hits
@@ -1902,7 +1959,7 @@ class MooncakeConnectorWorker:
             remote_handshake_port_list = [[x + meta.remote_port for x in chosen_rank_list]]
             local_block_ids_list = [meta.local_block_ids for _ in remote_handshake_port_list]
             remote_block_ids_list = [meta.remote_block_ids for _ in remote_handshake_port_list]
-            return remote_handshake_port_list, local_block_ids_list, remote_block_ids_list
+            return remote_handshake_port_list, local_block_ids_list, remote_block_ids_list, None
 
         def context_parallel_parameters_check():
             assert (meta.remote_pcp_size * meta.remote_dcp_size) % (self.pcp_size * self.dcp_size) == 0
@@ -1958,13 +2015,34 @@ class MooncakeConnectorWorker:
 
             return cp_group_meta
 
+        def expand_remote_pp_pulls(remote_port: int, remote_tp_offset: int) -> list[RemotePortPull]:
+            remote_rank_offset = remote_port - meta.remote_port
+            remote_pcp_rank = remote_rank_offset // prefill_tp_size
+            remote_tp_rank = remote_rank_offset % prefill_tp_size
+            return [
+                RemotePortPull(
+                    port=meta.remote_port
+                    + get_handshake_port_offset(
+                        remote_tp_rank,
+                        prefill_tp_size,
+                        pp_rank=pp_rank,
+                        pp_size=self._prefill_pp_size,
+                        pcp_rank=remote_pcp_rank,
+                        pcp_size=meta.remote_pcp_size,
+                    ),
+                    remote_tp_offset=remote_tp_offset,
+                    prefill_pp_rank=pp_rank,
+                )
+                for pp_rank in range(self._prefill_pp_size)
+            ]
+
         def get_local_remote_block_port_mappings():
             context_parallel_parameters_check()
             p_node_cp_group_meta = get_cp_group_meta(
                 prefill_tp_size, meta.remote_pcp_size, meta.remote_dcp_size, meta.remote_port
             )
             d_node_cp_group_meta = get_cp_group_meta(self.tp_size, self.pcp_size, self.dcp_size, self.side_channel_port)
-            local_remote_block_port_mappings: dict[int, list[list[int]]] = {}
+            local_remote_block_port_mappings: dict[int, list[list[RemotePortPull]]] = {}
             for d_node_head_key in d_node_cp_group_meta:
                 for p_node_head_key in p_node_cp_group_meta:
                     if not set(p_node_head_key).issubset(set(d_node_head_key)):
@@ -1981,10 +2059,13 @@ class MooncakeConnectorWorker:
                         for d_idx, d_port in enumerate(d_cp_group):
                             if d_port not in local_remote_block_port_mappings:
                                 local_remote_block_port_mappings[d_port] = []
-                            p_port_remote_list = []
+                            p_port_remote_list: list[RemotePortPull] = []
+                            remote_tp_offset = len(
+                                local_remote_block_port_mappings[d_port]
+                            ) % self._get_tp_num_need_pulls(prefill_tp_size)
                             for p_idx, p_port in enumerate(p_cp_group):
                                 if p_idx % len(d_cp_group) == d_idx:
-                                    p_port_remote_list.append(p_port)
+                                    p_port_remote_list.extend(expand_remote_pp_pulls(p_port, remote_tp_offset))
                             local_remote_block_port_mappings[d_port].append(p_port_remote_list)
 
             logger.info(
@@ -1998,10 +2079,11 @@ class MooncakeConnectorWorker:
             return local_remote_block_port_mappings
 
         def get_remote_port_send_num(
-            local_remote_block_port_mappings: dict[int, list[list[int]]],
+            local_remote_block_port_mappings: dict[int, list[list[RemotePortPull]]],
         ) -> dict[int, RemotePortInfo]:
             remote_port_send_num: dict[int, RemotePortInfo] = {}
-            for port in range(prefill_tp_size * meta.remote_pcp_size):
+            remote_pp_tp_size = prefill_tp_size * self._prefill_pp_size
+            for port in range(remote_pp_tp_size * meta.remote_pcp_size):
                 remote_host_info = meta.remote_multi_nodes_meta_mapping.get(str(port), None)
                 if remote_host_info is None:
                     remote_host = meta.remote_host
@@ -2011,8 +2093,8 @@ class MooncakeConnectorWorker:
 
             for remote_port_head_list in local_remote_block_port_mappings.values():
                 for remote_port_list in remote_port_head_list:
-                    for remote_port in remote_port_list:
-                        remote_port_send_num[remote_port]["num"] += 1
+                    for remote_port_pull in remote_port_list:
+                        remote_port_send_num[remote_port_pull.port]["num"] += 1
             return remote_port_send_num
 
         if meta.remote_engine_id not in self.local_remote_block_port_mapping:
@@ -2080,14 +2162,30 @@ class MooncakeConnectorWorker:
             final_block_num = remote_block_nums.pop(final_block_idx)
             remote_block_nums.append(final_block_num)
             for mapping in local_remote_block_port_mapping:
-                final_block_port = mapping.pop(final_block_idx)
-                mapping.append(final_block_port)
+                pp_start = final_block_idx * self._prefill_pp_size
+                pp_end = pp_start + self._prefill_pp_size
+                final_block_ports = mapping[pp_start:pp_end]
+                del mapping[pp_start:pp_end]
+                mapping.extend(final_block_ports)
 
-        remote_handshake_port_list, local_block_ids_list, remote_block_ids_list = [], [], []
-        for idx in range(len(local_remote_block_port_mapping[0])):
+        remote_handshake_port_list, remote_port_pull_list, local_block_ids_list, remote_block_ids_list = [], [], [], []
+        for mapping in local_remote_block_port_mapping:
+            expected_mapping_len = len(remote_block_nums) * self._prefill_pp_size
+            assert len(mapping) == expected_mapping_len, (
+                f"remote mapping length({len(mapping)}) does not match expected length({expected_mapping_len}). "
+                f"remote_block_nums={remote_block_nums}, prefill_pp_size={self._prefill_pp_size}, mapping={mapping}"
+            )
+
+        for remote_kv_id in range(len(remote_block_nums)):
             mapping_list = []
+            pull_list = []
             for mapping in local_remote_block_port_mapping:
-                mapping_list.append(mapping[idx])
+                pp_start = remote_kv_id * self._prefill_pp_size
+                pp_end = pp_start + self._prefill_pp_size
+                shard_pulls = mapping[pp_start:pp_end]
+                pull_list.extend(shard_pulls)
+                mapping_list.extend(pull.port for pull in shard_pulls)
+            remote_port_pull_list.append(pull_list)
             remote_handshake_port_list.append(mapping_list)
 
         # the local_block_ids_list and remote_block_ids_list are related with remote_handshake_port_list
@@ -2116,11 +2214,13 @@ class MooncakeConnectorWorker:
             local_block_offset += num_blocks_to_pull
 
         tp_num_need_pulls = self._get_tp_num_need_pulls(prefill_tp_size)
-        assert tp_num_need_pulls == len(remote_handshake_port_list[0]), (
-            f"tp_num_need_pulls: {tp_num_need_pulls}, remote_handshake_port_list: {remote_handshake_port_list}"
+        expected_remote_ports_per_shard = tp_num_need_pulls * self._prefill_pp_size
+        assert expected_remote_ports_per_shard == len(remote_handshake_port_list[0]), (
+            f"expected_remote_ports_per_shard: {expected_remote_ports_per_shard}, "
+            f"remote_handshake_port_list: {remote_handshake_port_list}"
         )
 
-        return remote_handshake_port_list, local_block_ids_list, remote_block_ids_list
+        return remote_handshake_port_list, local_block_ids_list, remote_block_ids_list, remote_port_pull_list
 
     def _get_group_pulls_metadata(
         self,
@@ -2128,6 +2228,7 @@ class MooncakeConnectorWorker:
         remote_handshake_port_list: list[list[int]],
         prefill_tp_size: int,
         remote_base_port: int,
+        remote_port_pull_list: list[list[RemotePortPull]] | None = None,
     ) -> list[list[list[GroupPull]]]:
         """Build per-port KV cache group pull descriptors.
 
@@ -2178,13 +2279,29 @@ class MooncakeConnectorWorker:
                 for group_id in group_ids
             ]
 
+        if remote_port_pull_list is not None:
+            return [
+                [
+                    make_group_pulls(
+                        remote_port_pull.remote_tp_offset,
+                        remote_port_pull.prefill_pp_rank,
+                    )
+                    for remote_port_pull in shard_port_pulls
+                ]
+                for shard_port_pulls in remote_port_pull_list
+            ]
+
         group_pulls_list = []
         for pcp_dcp_rank, remote_ports in enumerate(remote_handshake_port_list):
             if len(remote_ports) == 1:
                 remote_tp_offsets = [pcp_dcp_rank % tp_num_need_pulls]
                 prefill_pp_ranks = [
-                    ((remote_ports[0] - remote_base_port) % (prefill_tp_size * self._prefill_pp_size))
-                    // prefill_tp_size
+                    get_pp_rank_from_handshake_port(
+                        remote_ports[0],
+                        remote_base_port,
+                        prefill_tp_size,
+                        self._prefill_pp_size,
+                    )
                 ]
             else:
                 assert len(remote_ports) % tp_num_need_pulls == 0, (
@@ -2192,7 +2309,12 @@ class MooncakeConnectorWorker:
                 )
                 remote_tp_offsets = [rank_idx % tp_num_need_pulls for rank_idx in range(len(remote_ports))]
                 prefill_pp_ranks = [
-                    ((remote_port - remote_base_port) % (prefill_tp_size * self._prefill_pp_size)) // prefill_tp_size
+                    get_pp_rank_from_handshake_port(
+                        remote_port,
+                        remote_base_port,
+                        prefill_tp_size,
+                        self._prefill_pp_size,
+                    )
                     for remote_port in remote_ports
                 ]
             group_pulls_list.append(
@@ -2302,16 +2424,18 @@ class MooncakeConnectorWorker:
                 remote_handshake_port_list,
                 local_block_ids_list,
                 remote_block_ids_list,
+                remote_port_pull_list,
             ) = self._get_kv_split_metadata(remote_req_id, meta)
             group_pulls_list = self._get_group_pulls_metadata(
                 remote_req_id,
                 remote_handshake_port_list,
                 prefill_tp_size,
                 meta.remote_port,
+                remote_port_pull_list,
             )
 
             for pcp_dcp_rank, remote_ports in enumerate(remote_handshake_port_list):
-                for remote_tp_offset, remote_handshake_port in enumerate(remote_ports):
+                for remote_port_idx, remote_handshake_port in enumerate(remote_ports):
                     assert self.kv_recv_thread is not None
                     remote_host, remote_engine_id = self._get_remote_host_info_by_port(
                         meta.remote_port,
@@ -2330,7 +2454,7 @@ class MooncakeConnectorWorker:
                         remote_request_id=remote_req_id,
                         local_block_ids=local_block_ids_list[pcp_dcp_rank],
                         remote_block_ids=remote_block_ids_list[pcp_dcp_rank],
-                        group_pulls=group_pulls_list[pcp_dcp_rank][remote_tp_offset],
+                        group_pulls=group_pulls_list[pcp_dcp_rank][remote_port_idx],
                         remote_engine_id=remote_engine_id,
                         remote_host=remote_host,
                         remote_handshake_port=remote_handshake_port,
@@ -2338,7 +2462,7 @@ class MooncakeConnectorWorker:
                         num_computed_tokens=meta.num_computed_tokens,
                         all_task_done=(
                             pcp_dcp_rank == len(remote_handshake_port_list) - 1
-                            and remote_tp_offset == len(remote_ports) - 1
+                            and remote_port_idx == len(remote_ports) - 1
                         ),
                     )
 

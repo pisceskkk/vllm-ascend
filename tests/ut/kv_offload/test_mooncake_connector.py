@@ -69,6 +69,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # n
     ReqMeta,
     ensure_zmq_recv,
     ensure_zmq_send,
+    get_handshake_port_offset,
+    get_pp_rank_from_handshake_port,
     group_concurrent_contiguous,
     string_to_int64_hash,
     zmq_ctx,
@@ -97,6 +99,65 @@ def make_agent_metadata(**overrides: Any) -> MooncakeAgentMetadata:
 
 
 class TestKVCacheTaskTrackerInit(unittest.TestCase):
+    def test_handshake_port_offset_matches_pp_major_rank_layout(self):
+        pcp_size = 16
+        pp_size = 2
+        tp_size = 1
+
+        self.assertEqual(
+            get_handshake_port_offset(
+                0,
+                tp_size,
+                pp_rank=0,
+                pp_size=pp_size,
+                pcp_rank=1,
+                pcp_size=pcp_size,
+            ),
+            1,
+        )
+        self.assertEqual(
+            get_handshake_port_offset(
+                0,
+                tp_size,
+                pp_rank=1,
+                pp_size=pp_size,
+                pcp_rank=0,
+                pcp_size=pcp_size,
+            ),
+            16,
+        )
+        self.assertEqual(
+            get_handshake_port_offset(
+                0,
+                tp_size,
+                pp_rank=1,
+                pp_size=pp_size,
+                pcp_rank=15,
+                pcp_size=pcp_size,
+            ),
+            31,
+        )
+        for pp_rank in range(pp_size):
+            for pcp_rank in range(pcp_size):
+                port = get_handshake_port_offset(
+                    0,
+                    tp_size,
+                    pp_rank=pp_rank,
+                    pp_size=pp_size,
+                    pcp_rank=pcp_rank,
+                    pcp_size=pcp_size,
+                )
+                self.assertEqual(
+                    get_pp_rank_from_handshake_port(
+                        port,
+                        0,
+                        tp_size,
+                        pp_size,
+                        pcp_size,
+                    ),
+                    pp_rank,
+                )
+
     def test_init_basic_properties(self):
         tracker = KVCacheTaskTracker()
         self.assertIsInstance(tracker.done_task_lock, type(threading.Lock()))
@@ -235,8 +296,13 @@ class TestKVCacheSendingThread(unittest.TestCase):
             pcp_rank=0,
         )
         thread.start()
-        actual_port = base_port + (
-            thread.pp_rank * thread.tp_size + thread.tp_rank + thread.pcp_rank * thread.prefill_tp_size
+        actual_port = base_port + get_handshake_port_offset(
+            thread.tp_rank,
+            thread.tp_size,
+            pp_rank=thread.pp_rank,
+            pp_size=thread.pp_size,
+            pcp_rank=thread.pcp_rank,
+            pcp_size=thread.pcp_size,
         )
         self.assertTrue(ready_event.wait(timeout=3), "Server thread startup timeout")
 
@@ -344,13 +410,14 @@ class TestKVCacheRecvingThreadBasic(unittest.TestCase):
         self.assertEqual(queued["num_computed_tokens"], 0)
 
     def test_mark_and_is_failed(self):
-        self.thread._mark_failed_recv_request("req1", [10, 20])
+        self.thread._mark_failed_recv_request("req1", ([10, 20], [30]))
         self.assertTrue(self.thread._is_failed_recv_request("req1"))
         self.assertIn(10, self.thread.invalid_block_ids)
         self.assertIn(20, self.thread.invalid_block_ids)
+        self.assertIn(30, self.thread.invalid_block_ids)
 
     def test_clear_failed_recv_request(self):
-        self.thread._mark_failed_recv_request("req2", [30])
+        self.thread._mark_failed_recv_request("req2", ([30],))
         self.thread._clear_failed_recv_request("req2")
         self.assertFalse(self.thread._is_failed_recv_request("req2"))
 
@@ -1462,7 +1529,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
             meta.remote_host = "localhost"
             meta.remote_multi_nodes_meta_mapping = {}
 
-            remote_handshake_port_list, local_block_ids_list, remote_block_ids_list = worker._get_kv_split_metadata(
+            remote_handshake_port_list, local_block_ids_list, remote_block_ids_list, _ = worker._get_kv_split_metadata(
                 "0", cast(ReqMeta, meta)
             )
 
@@ -1579,14 +1646,21 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         worker.local_remote_block_port_mapping = {}
         worker.remote_port_send_num = {}
         worker.side_channel_port = 5000
-        worker.handshake_port = worker.side_channel_port + (worker.pp_rank + pcp_rank) * worker.tp_size + tp_rank
+        worker.handshake_port = worker.side_channel_port + get_handshake_port_offset(
+            tp_rank,
+            worker.tp_size,
+            pp_rank=worker.pp_rank,
+            pp_size=1,
+            pcp_rank=pcp_rank,
+            pcp_size=worker.pcp_size,
+        )
         worker.kv_group2layeridx = {
             0: ({"kv_cache_spec_type": "FullAttentionSpec"}, [0]),
             1: ({"kv_cache_spec_type": "FullAttentionSpec"}, [1]),
         }
         return worker
 
-    def _assert_group_pull_finish_flags(self, ports, group_pulls, expected_group_ids):
+    def _assert_group_pull_finish_flags(self, ports, group_pulls, expected_group_ids, port_pulls=None):
         self.assertEqual(len(group_pulls), len(ports))
         finish_count_by_group = {group_id: 0 for group_id in expected_group_ids}
 
@@ -1608,6 +1682,10 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
                     expected_offset = pcp_dcp_rank % pulls[0].num_group_pulls
                 else:
                     expected_offset = remote_port_idx % pulls[0].num_group_pulls
+                if port_pulls is not None:
+                    expected_offset = port_pulls[pcp_dcp_rank][remote_port_idx].remote_tp_offset
+                    expected_pp_rank = port_pulls[pcp_dcp_rank][remote_port_idx].prefill_pp_rank
+                    self.assertTrue(all(pull.prefill_pp_rank == expected_pp_rank for pull in pulls))
                 self.assertTrue(all(pull.remote_tp_offset == expected_offset for pull in pulls))
 
         self.assertTrue(
@@ -1673,6 +1751,22 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
                 "num_prompt_blocks": 5,
                 "num_external_blocks": 4,
             },
+            {
+                "name": "gqa_remote_pcp_pp_to_decode_pcp",
+                "use_mla": False,
+                "num_key_value_heads": 4,
+                "prefill_tp_size": 4,
+                "decode_tp_size": 2,
+                "prefill_pp_size": 2,
+                "remote_pcp_size": 2,
+                "remote_dcp_size": 1,
+                "pcp_size": 2,
+                "dcp_size": 1,
+                "remote_block_ids": ([10, 11, 12, 13], [10, 11, 12, 13]),
+                "local_block_ids": ([20, 21], [20, 21]),
+                "num_prompt_blocks": 4,
+                "num_external_blocks": 4,
+            },
         ]
 
         for case in cases:
@@ -1700,9 +1794,9 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
                                 remote_multi_nodes_meta_mapping={},
                             )
 
-                            ports, local_ids, remote_ids = worker._get_kv_split_metadata("req_pd", meta)
+                            ports, local_ids, remote_ids, port_pulls = worker._get_kv_split_metadata("req_pd", meta)
                             group_pulls = worker._get_group_pulls_metadata(
-                                "req_pd", ports, case["prefill_tp_size"], 30000
+                                "req_pd", ports, case["prefill_tp_size"], 30000, port_pulls
                             )
 
                             self.assertEqual(len(ports), len(local_ids))
@@ -1711,7 +1805,41 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
                                 sum(len(ids[0]) for ids in local_ids),
                                 case["num_external_blocks"] // (case["pcp_size"] * case["dcp_size"]),
                             )
-                            self._assert_group_pull_finish_flags(ports, group_pulls, {0, 1})
+                            self.assertEqual(
+                                len(worker.remote_port_send_num[meta.remote_engine_id]),
+                                case["prefill_tp_size"] * case["prefill_pp_size"] * case["remote_pcp_size"],
+                            )
+                            if (
+                                case["name"] == "gqa_tp_unequal_remote_cp_pp_unequal"
+                                and tp_rank == 0
+                                and pcp_rank == 0
+                                and dcp_rank == 0
+                            ):
+                                self.assertEqual(ports, [[30000, 30016], [30008, 30024]])
+                                self.assertEqual(
+                                    [[pull.remote_tp_offset for pull in shard_pulls] for shard_pulls in port_pulls],
+                                    [[0, 0], [0, 0]],
+                                )
+                                self.assertEqual(
+                                    [[pull.prefill_pp_rank for pull in shard_pulls] for shard_pulls in port_pulls],
+                                    [[0, 1], [0, 1]],
+                                )
+                            if (
+                                case["name"] == "gqa_remote_pcp_pp_to_decode_pcp"
+                                and tp_rank == 0
+                                and pcp_rank == 0
+                                and dcp_rank == 0
+                            ):
+                                self.assertEqual(ports, [[30000, 30008, 30001, 30009]])
+                                self.assertEqual(
+                                    [[pull.remote_tp_offset for pull in shard_pulls] for shard_pulls in port_pulls],
+                                    [[0, 0, 1, 1]],
+                                )
+                                self.assertEqual(
+                                    [[pull.prefill_pp_rank for pull in shard_pulls] for shard_pulls in port_pulls],
+                                    [[0, 1, 0, 1]],
+                                )
+                            self._assert_group_pull_finish_flags(ports, group_pulls, {0, 1}, port_pulls)
 
     def test_pd_disaggregated_hybrid_prefix_tp_and_pp_unequal(self):
         for tp_rank in range(2):
@@ -1765,7 +1893,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
                     remote_multi_nodes_meta_mapping={},
                 )
 
-                ports, local_ids, remote_ids = worker._get_kv_split_metadata("req_hybrid", cast(ReqMeta, meta))
+                ports, local_ids, remote_ids, _ = worker._get_kv_split_metadata("req_hybrid", cast(ReqMeta, meta))
                 group_pulls = worker._get_group_pulls_metadata("req_hybrid", ports, 4, 31000)
 
                 self.assertEqual(local_ids, [meta.local_block_ids])
@@ -1836,7 +1964,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
                     remote_multi_nodes_meta_mapping={},
                 )
 
-                ports, local_ids, remote_ids = worker._get_kv_split_metadata("req_hybrid_pcp", cast(ReqMeta, meta))
+                ports, local_ids, remote_ids, _ = worker._get_kv_split_metadata("req_hybrid_pcp", cast(ReqMeta, meta))
                 group_pulls = worker._get_group_pulls_metadata("req_hybrid_pcp", ports, 4, 31000)
 
                 self.assertEqual(len(ports), 2)
