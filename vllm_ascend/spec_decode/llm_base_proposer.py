@@ -1602,10 +1602,20 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         if self.pcp_size * self.dcp_size > 1:
             kv_cache_spec = self.draft_attn_groups[0].kv_cache_spec
-            if isinstance(kv_cache_spec, MLAAttentionSpec):
+            if isinstance(kv_cache_spec, MLAAttentionSpec) and getattr(attn_metadata, "decode", None) is not None:
                 attn_metadata.decode.cp_seq_len = cp_seq_len
-            else:
+            elif getattr(attn_metadata, "decode_meta", None) is not None:
                 attn_metadata.decode_meta.num_computed_tokens_of_pcp_dcp = num_computed_tokens_of_pcp_dcp.numpy()
+            elif getattr(attn_metadata, "sfa_cp_metadata", None) is not None:
+                # SFA-CP gathers decode KV blocks across PCP ranks before
+                # sparse attention, so seq_lens must keep the global KV length.
+                # cp_seq_len is rank-local and is only valid for attention
+                # backends that consume per-rank KV directly.
+                pass
+            else:
+                raise AttributeError(
+                    f"Unsupported attention metadata type for PCP/DCP MTP drafting: {type(attn_metadata).__name__}"
+                )
 
         return common_attn_metadata, attn_metadata
 
