@@ -1493,11 +1493,38 @@ def enable_dsa_cp_with_o_proj_tp() -> bool:
 
     vllm_config = get_current_vllm_config()
     kv_transfer_config = vllm_config.kv_transfer_config
+    if _uses_w4a8_dynamic_quantization(vllm_config):
+        return False
 
     # In PD-mixed mode, keep the original TP o_proj weight when:
     # 1) KV pooling is disabled, or
     # 2) KV pooling is enabled with kv_role == "kv_both".
     return kv_transfer_config is None or kv_transfer_config.kv_role == "kv_both"
+
+
+def _uses_w4a8_dynamic_quantization(vllm_config) -> bool:
+    quant_config = getattr(vllm_config, "quant_config", None)
+    if quant_config is None:
+        return False
+
+    quant_description = getattr(quant_config, "quant_description", None)
+    if isinstance(quant_description, dict):
+        for quant_type in quant_description.values():
+            if isinstance(quant_type, str) and quant_type.upper() == "W4A8_DYNAMIC":
+                return True
+
+    target_scheme_map = getattr(quant_config, "target_scheme_map", None)
+    if not isinstance(target_scheme_map, dict):
+        return False
+
+    for target_scheme in target_scheme_map.values():
+        if not isinstance(target_scheme, dict):
+            continue
+        weights = target_scheme.get("weights")
+        input_activations = target_scheme.get("input_activations")
+        if getattr(weights, "num_bits", None) == 4 and getattr(input_activations, "num_bits", None) == 8:
+            return True
+    return False
 
 
 @lru_cache(maxsize=1)
@@ -1514,6 +1541,8 @@ def enable_dsa_cp_with_pcp_shard() -> bool:
 
     vllm_config = get_current_vllm_config()
     kv_transfer_config = vllm_config.kv_transfer_config
+    if _uses_w4a8_dynamic_quantization(vllm_config):
+        return False
 
     tp_size = vllm_config.parallel_config.tensor_parallel_size
     pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
