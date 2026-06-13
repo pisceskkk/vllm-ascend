@@ -194,6 +194,48 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
 
 
+def _trim_incomplete_spec_decode_tokens(scheduler_output: SchedulerOutput) -> SchedulerOutput:
+    """Drop draft tokens that do not have a target bonus logit slot.
+
+    SpecDecodeMetadata is built with one bonus logit per request, so each
+    request can verify at most ``num_scheduled_tokens - 1`` draft tokens.
+    Async MTP can produce a pure one-token verify layout. In that case keeping
+    one draft token would make logits_indices start at -1.
+    """
+    scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+    if not scheduled_spec_tokens:
+        return scheduler_output
+
+    trimmed_spec_tokens: dict[str, list[int]] = {}
+    changed = False
+    for req_id, spec_token_ids in scheduled_spec_tokens.items():
+        max_draft_tokens = max(
+            scheduler_output.num_scheduled_tokens.get(req_id, 0) - 1,
+            0,
+        )
+        if len(spec_token_ids) > max_draft_tokens:
+            changed = True
+            spec_token_ids = spec_token_ids[:max_draft_tokens]
+        if spec_token_ids:
+            trimmed_spec_tokens[req_id] = spec_token_ids
+
+    if not changed:
+        return scheduler_output
+
+    logger.warning_once(
+        "Trimmed incomplete speculative decode tokens to keep one target "
+        "bonus logit slot per request. num_scheduled_tokens=%s "
+        "original_spec_tokens=%s trimmed_spec_tokens=%s",
+        scheduler_output.num_scheduled_tokens,
+        scheduled_spec_tokens,
+        trimmed_spec_tokens,
+    )
+    return replace(
+        scheduler_output,
+        scheduled_spec_decode_tokens=trimmed_spec_tokens,
+    )
+
+
 @dataclass
 class GraphCaptureContext:
     stream: torch.npu.Stream
@@ -1476,7 +1518,12 @@ class NPUModelRunner(GPUModelRunner):
         # We assume it is the decode stage, where prefill occurs but only one token is not hit in cache.
         elif np.all(num_scheduled_tokens == 1):
             attn_state = AscendAttentionState.DecodeOnly
-            if self.speculative_config and self.speculative_config.method == "mtp":
+            has_draft_tokens = np.any(num_valid_tokens[:num_reqs] < num_scheduled_tokens[:num_reqs])
+            if (
+                self.speculative_config
+                and self.speculative_config.method == "mtp"
+                and has_draft_tokens
+            ):
                 # SpecDecoding now supports seq_len=1 and seq_len=2
                 # In Prefilling Decoding Disaggregation scenario, SpecDecoding need to supports seq_len=1
                 attn_state = AscendAttentionState.SpecDecoding
@@ -1519,6 +1566,22 @@ class NPUModelRunner(GPUModelRunner):
 
         # Compute the logits indices.
         # [4, 1, 3, 1, 2]
+        num_scheduled_tokens = np.diff(
+            np.concatenate(([0], cu_num_scheduled_tokens))
+        )
+        max_draft_tokens = np.maximum(num_scheduled_tokens - 1, 0)
+        if np.any(num_draft_tokens > max_draft_tokens):
+            logger.warning_once(
+                "Clipping speculative draft tokens because target logits do "
+                "not include a bonus slot. num_scheduled_tokens=%s "
+                "num_draft_tokens=%s",
+                num_scheduled_tokens.tolist(),
+                num_draft_tokens.tolist(),
+            )
+            num_draft_tokens = np.minimum(
+                num_draft_tokens,
+                max_draft_tokens,
+            )
         num_sampled_tokens = num_draft_tokens + 1
         # Step 1.
         # cu_num_sampled_tokens: [4, 5, 8, 9, 11]
@@ -1926,6 +1989,10 @@ class NPUModelRunner(GPUModelRunner):
             and not self.model_config.is_encoder_decoder
         )):
             scheduler_output = deepcopy(scheduler_output)
+        if self.speculative_config is not None:
+            scheduler_output = _trim_incomplete_spec_decode_tokens(
+                scheduler_output
+            )
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
