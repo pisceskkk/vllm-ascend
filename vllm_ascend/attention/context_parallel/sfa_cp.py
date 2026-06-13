@@ -6,6 +6,7 @@ import torch_npu
 from vllm.config import VllmConfig
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -33,6 +34,59 @@ from vllm_ascend.utils import (
 
 M = TypeVar("M", bound=AscendSFAMetadata)
 sfa_ag_stream = torch_npu.npu.Stream()
+_SFA_CP_MTP_DEBUG_LOG_LIMIT = 64
+_sfa_cp_mtp_debug_log_count = 0
+_SFA_CP_MAIN_DECODE_METADATA_DEBUG_LOG_LIMIT = 128
+_sfa_cp_main_decode_metadata_debug_log_count = 0
+
+
+def _debug_tensor_summary(tensor: torch.Tensor | None, limit: int = 8) -> str:
+    if tensor is None:
+        return "None"
+    summary = f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, device={tensor.device}"
+    try:
+        flat = tensor.detach().reshape(-1)
+        values = flat[: min(limit, flat.numel())].to("cpu").tolist()
+        summary += f", head={values}"
+    except Exception as exc:  # pragma: no cover - debug only
+        summary += f", head=<unavailable:{exc}>"
+    return summary
+
+
+def _log_sfa_cp_mtp_debug(message: str, *args) -> None:
+    global _sfa_cp_mtp_debug_log_count
+    if _sfa_cp_mtp_debug_log_count >= _SFA_CP_MTP_DEBUG_LOG_LIMIT:
+        return
+    _sfa_cp_mtp_debug_log_count += 1
+    logger.warning("[SFA-CP-MTP-DEBUG] " + message, *args)
+
+
+def _log_sfa_cp_main_decode_metadata_debug(message: str, *args) -> None:
+    global _sfa_cp_main_decode_metadata_debug_log_count
+    if _sfa_cp_main_decode_metadata_debug_log_count >= _SFA_CP_MAIN_DECODE_METADATA_DEBUG_LOG_LIMIT:
+        return
+    _sfa_cp_main_decode_metadata_debug_log_count += 1
+    logger.warning("[SFA-CP-MAIN-DECODE-METADATA-DEBUG] " + message, *args)
+
+
+def _safe_is_draft_model() -> bool:
+    try:
+        forward_context = get_forward_context()
+    except Exception:  # pragma: no cover - debug-only guard
+        return False
+    if forward_context is None:
+        return False
+    additional_kwargs = getattr(forward_context, "additional_kwargs", None)
+    if additional_kwargs is not None and additional_kwargs.get("is_draft_model"):
+        return True
+    return bool(getattr(forward_context, "is_draft_model", False))
+
+
+def _safe_forward_context():
+    try:
+        return get_forward_context()
+    except Exception:  # pragma: no cover - debug-only guard
+        return None
 
 
 class AscendSFACPMetadataBuilder(AscendSFAMetadataBuilder):
@@ -118,6 +172,31 @@ class AscendSFACPMetadataBuilder(AscendSFAMetadataBuilder):
         assert num_decodes + num_prefills == num_reqs
         assert num_decode_tokens + num_prefill_tokens == common_attn_metadata.num_actual_tokens
 
+        if self.speculative_config is not None and num_decode_tokens > num_decodes:
+            long_seq_metadata = common_attn_metadata.prefill_context_parallel_metadata
+            _log_sfa_cp_mtp_debug(
+                "builder layer_names=%s num_reqs=%s num_decodes=%s num_decode_tokens=%s "
+                "num_prefills=%s num_prefill_tokens=%s max_query_len=%s attn_state=%s "
+                "num_actual_tokens=%s num_input_tokens=%s qsl_cpu=%s seq_lens=%s "
+                "query_lens_pcp_full=%s dcp_mtp_mask=%s",
+                getattr(self, "layer_names", None),
+                num_reqs,
+                num_decodes,
+                num_decode_tokens,
+                num_prefills,
+                num_prefill_tokens,
+                common_attn_metadata.max_query_len,
+                common_attn_metadata.attn_state,
+                common_attn_metadata.num_actual_tokens,
+                common_attn_metadata.num_input_tokens,
+                _debug_tensor_summary(common_attn_metadata.query_start_loc_cpu),
+                _debug_tensor_summary(metadata_cls.seq_lens),
+                _debug_tensor_summary(
+                    long_seq_metadata.query_lens_pcp_full_cpu if long_seq_metadata is not None else None
+                ),
+                long_seq_metadata.dcp_mtp_attn_mask is not None if long_seq_metadata is not None else None,
+            )
+
         sfa_cp_metadata = self.build_cp_metadata(
             self.block_arange_buffer, metadata_cls.seq_lens, common_attn_metadata, num_decodes
         )
@@ -153,6 +232,28 @@ class AscendSFACPMetadataBuilder(AscendSFAMetadataBuilder):
             self.slot_mapping_buf[:num_actual_tokens_pcp_padded].copy_(
                 common_attn_metadata.slot_mapping[:num_actual_tokens_pcp_padded], non_blocking=True
             )
+            if (
+                self.speculative_config is not None
+                and not _safe_is_draft_model()
+                and num_decode_tokens > num_decodes
+            ):
+                _log_sfa_cp_main_decode_metadata_debug(
+                    "builder_before_slot_compact layer_names=%s num_reqs=%s "
+                    "num_decodes=%s num_decode_tokens=%s num_actual_tokens_pcp_padded=%s "
+                    "common_slot_mapping=%s copied_slot_mapping=%s query_lens_full=%s "
+                    "restore_idx=%s dcp_mtp_mask=%s block_table=%s",
+                    getattr(self, "layer_names", None),
+                    num_reqs,
+                    num_decodes,
+                    num_decode_tokens,
+                    num_actual_tokens_pcp_padded,
+                    _debug_tensor_summary(common_attn_metadata.slot_mapping),
+                    _debug_tensor_summary(self.slot_mapping_buf[:num_actual_tokens_pcp_padded]),
+                    _debug_tensor_summary(long_seq_metadata.query_lens_pcp_full_cpu),
+                    _debug_tensor_summary(long_seq_metadata.pcp_allgather_restore_idx),
+                    _debug_tensor_summary(long_seq_metadata.dcp_mtp_attn_mask),
+                    _debug_tensor_summary(metadata_cls.block_table),
+                )
             self.slot_mapping_buf[:num_decode_tokens] = self.slot_mapping_buf[
                 : num_decode_tokens * self.pcp_size : self.pcp_size
             ]
@@ -171,6 +272,15 @@ class AscendSFACPMetadataBuilder(AscendSFAMetadataBuilder):
                     decode_slot_mapping,
                     decode_query_lens,
                 )
+                if not _safe_is_draft_model() and num_decode_tokens > num_decodes:
+                    _log_sfa_cp_main_decode_metadata_debug(
+                        "builder_after_slot_compact layer_names=%s decode_query_lens=%s "
+                        "decode_slot_mapping=%s full_slot_mapping_buf=%s",
+                        getattr(self, "layer_names", None),
+                        _debug_tensor_summary(decode_query_lens),
+                        _debug_tensor_summary(decode_slot_mapping),
+                        _debug_tensor_summary(self.slot_mapping_buf[:num_actual_tokens_pcp_padded]),
+                    )
             # prefill slot mapping
             self.prefill_slot_mapping = None
             if num_prefills > 0:
@@ -196,6 +306,32 @@ class AscendSFACPMetadataBuilder(AscendSFAMetadataBuilder):
             metadata_cls.prefill_slot_mapping = (
                 self.prefill_slot_mapping if hasattr(self, "prefill_slot_mapping") else None
             )
+            if (
+                self.speculative_config is not None
+                and not _safe_is_draft_model()
+                and num_decode_tokens > num_decodes
+            ):
+                _log_sfa_cp_main_decode_metadata_debug(
+                    "builder_final_metadata layer_names=%s num_decodes=%s "
+                    "num_decode_tokens=%s num_prefills=%s metadata_slot_mapping=%s "
+                    "prefill_slot_mapping=%s sfa_cp_full_overall=%s "
+                    "sfa_cp_head_nomask=%s sfa_cp_tail_nomask=%s",
+                    getattr(self, "layer_names", None),
+                    metadata_cls.num_decodes,
+                    metadata_cls.num_decode_tokens,
+                    metadata_cls.num_prefills,
+                    _debug_tensor_summary(metadata_cls.slot_mapping),
+                    _debug_tensor_summary(metadata_cls.prefill_slot_mapping),
+                    _debug_tensor_summary(
+                        sfa_cp_metadata.full_overall_attn_seq_lens if sfa_cp_metadata is not None else None
+                    ),
+                    _debug_tensor_summary(
+                        sfa_cp_metadata.head_attn_nomask_seqlens if sfa_cp_metadata is not None else None
+                    ),
+                    _debug_tensor_summary(
+                        sfa_cp_metadata.tail_attn_nomask_seqlens if sfa_cp_metadata is not None else None
+                    ),
+                )
         metadata_cls.sfa_cp_metadata = sfa_cp_metadata
         return metadata_cls
 
@@ -242,6 +378,31 @@ class AscendSFACPMetadataBuilder(AscendSFAMetadataBuilder):
             device=full_overall_attn_seq_lens.device,
             dtype=full_overall_attn_seq_lens.dtype,
         )
+
+        if (
+            self.speculative_config is not None
+            and not _safe_is_draft_model()
+            and common_attn_metadata.attn_state == AscendAttentionState.SpecDecoding
+        ):
+            _log_sfa_cp_main_decode_metadata_debug(
+                "build_cp_metadata layer_names=%s num_reqs=%s num_decodes=%s "
+                "query_lens=%s seq_lens=%s num_computed_tokens=%s "
+                "q_head_kv_lens=%s q_tail_kv_lens=%s full_overall=%s "
+                "attn_mask_full_seqlens=%s long_query_lens_full=%s "
+                "long_num_computed_pcp_dcp=%s",
+                getattr(self, "layer_names", None),
+                num_reqs,
+                num_decodes,
+                _debug_tensor_summary(query_lens),
+                _debug_tensor_summary(seq_lens),
+                _debug_tensor_summary(num_computed_tokens),
+                _debug_tensor_summary(q_head_kv_lens),
+                _debug_tensor_summary(q_tail_kv_lens),
+                _debug_tensor_summary(full_overall_attn_seq_lens),
+                _debug_tensor_summary(attn_mask_full_seqlens),
+                _debug_tensor_summary(common_long_seq_metadata.query_lens_pcp_full_cpu),
+                common_long_seq_metadata.num_computed_tokens_of_pcp_dcp,
+            )
 
         return AscendPCPMetadata(
             q_head_idx=common_long_seq_metadata.q_head_idx_tensor,
@@ -825,6 +986,77 @@ class AscendSFACPImpl(AscendSFAImpl):
         num_input_tokens = attn_metadata.num_input_tokens
         output_padded = output
 
+        is_draft_model = _safe_is_draft_model()
+        if is_draft_model or num_decode_tokens > attn_metadata.num_decodes:
+            forward_context = _safe_forward_context()
+            _log_sfa_cp_mtp_debug(
+                "forward layer=%s is_draft=%s num_tokens_ctx=%s attn_state=%s "
+                "num_decodes=%s num_decode_tokens=%s num_prefills=%s num_actual_tokens=%s "
+                "num_input_tokens=%s cum_query_lens=%s seq_lens=%s slot_mapping=%s block_table_shape=%s",
+                layer_name,
+                is_draft_model,
+                forward_context.num_tokens if forward_context is not None else None,
+                attn_metadata.attn_state,
+                attn_metadata.num_decodes,
+                num_decode_tokens,
+                attn_metadata.num_prefills,
+                num_actual_tokens,
+                num_input_tokens,
+                _debug_tensor_summary(actual_seq_lengths_query),
+                _debug_tensor_summary(actual_seq_lengths_key),
+                _debug_tensor_summary(slot_mapping),
+                tuple(attn_metadata.block_table.shape),
+            )
+            if not is_draft_model and num_decode_tokens > attn_metadata.num_decodes:
+                sfa_cp_metadata = attn_metadata.sfa_cp_metadata
+                _log_sfa_cp_main_decode_metadata_debug(
+                    "forward_main_entry layer=%s num_tokens_ctx=%s hidden_states=%s "
+                    "output=%s kv_cache0=%s kv_cache1=%s kv_cache2=%s cos=%s sin=%s "
+                    "attn_state=%s num_decodes=%s num_decode_tokens=%s num_prefills=%s "
+                    "num_actual_tokens=%s num_input_tokens=%s cum_query_lens=%s "
+                    "seq_lens=%s slot_mapping=%s block_table=%s prefill_slot_mapping=%s "
+                    "sfa_cp_q_head_idx=%s sfa_cp_q_tail_idx=%s sfa_cp_restore_idx=%s "
+                    "sfa_cp_full_overall=%s sfa_cp_head_nomask=%s sfa_cp_tail_nomask=%s",
+                    layer_name,
+                    forward_context.num_tokens if forward_context is not None else None,
+                    _debug_tensor_summary(hidden_states),
+                    _debug_tensor_summary(output),
+                    _debug_tensor_summary(kv_cache[0] if len(kv_cache) > 0 else None),
+                    _debug_tensor_summary(kv_cache[1] if len(kv_cache) > 1 else None),
+                    _debug_tensor_summary(kv_cache[2] if len(kv_cache) > 2 else None),
+                    _debug_tensor_summary(cos),
+                    _debug_tensor_summary(sin),
+                    attn_metadata.attn_state,
+                    attn_metadata.num_decodes,
+                    num_decode_tokens,
+                    attn_metadata.num_prefills,
+                    num_actual_tokens,
+                    num_input_tokens,
+                    _debug_tensor_summary(actual_seq_lengths_query),
+                    _debug_tensor_summary(actual_seq_lengths_key),
+                    _debug_tensor_summary(slot_mapping),
+                    _debug_tensor_summary(attn_metadata.block_table),
+                    _debug_tensor_summary(getattr(attn_metadata, "prefill_slot_mapping", None)),
+                    _debug_tensor_summary(
+                        sfa_cp_metadata.q_head_idx if sfa_cp_metadata is not None else None
+                    ),
+                    _debug_tensor_summary(
+                        sfa_cp_metadata.q_tail_idx if sfa_cp_metadata is not None else None
+                    ),
+                    _debug_tensor_summary(
+                        sfa_cp_metadata.pcp_allgather_restore_idx if sfa_cp_metadata is not None else None
+                    ),
+                    _debug_tensor_summary(
+                        sfa_cp_metadata.full_overall_attn_seq_lens if sfa_cp_metadata is not None else None
+                    ),
+                    _debug_tensor_summary(
+                        sfa_cp_metadata.head_attn_nomask_seqlens if sfa_cp_metadata is not None else None
+                    ),
+                    _debug_tensor_summary(
+                        sfa_cp_metadata.tail_attn_nomask_seqlens if sfa_cp_metadata is not None else None
+                    ),
+                )
+
         # all-gather o_proj weight for prefill stage of PD mix node
         o_proj_pcp_handle = None
         # if is PD mix stage, using original TP o_proj weight, and also need to full gather for o_proj
@@ -975,6 +1207,17 @@ class AscendSFACPImpl(AscendSFAImpl):
             decode_k_nope, _ = self.gather_kv_cross_cp(kv_cache[0], decode_block_table_src) # k_nope
             decode_k_rope, _ = self.gather_kv_cross_cp(kv_cache[1], decode_block_table_src) # k_rope
             decode_kv = (decode_k_nope, decode_k_rope)
+            if num_decode_tokens > attn_metadata.num_decodes:
+                _log_sfa_cp_mtp_debug(
+                    "decode gather layer=%s decode_block_num=%s decode_block_table_src=%s "
+                    "decode_key=%s decode_k_nope=%s decode_k_rope=%s",
+                    layer_name,
+                    decode_block_num,
+                    _debug_tensor_summary(decode_block_table_src),
+                    _debug_tensor_summary(decode_key),
+                    _debug_tensor_summary(decode_k_nope),
+                    _debug_tensor_summary(decode_k_rope),
+                )
         if attn_metadata.num_prefills > 0:
             assert attn_metadata.sfa_cp_metadata is not None
             with torch_npu.npu.stream(sfa_ag_stream):

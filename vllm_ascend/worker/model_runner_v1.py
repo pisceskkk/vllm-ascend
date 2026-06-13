@@ -192,6 +192,39 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
+_MTP_PCP_DEBUG_LOG_LIMIT = 64
+_mtp_pcp_debug_log_count = 0
+_MAIN_DECODE_METADATA_DEBUG_LOG_LIMIT = 128
+_main_decode_metadata_debug_log_count = 0
+
+
+def _debug_tensor_summary(tensor: torch.Tensor | None, limit: int = 8) -> str:
+    if tensor is None:
+        return "None"
+    summary = f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, device={tensor.device}"
+    try:
+        flat = tensor.detach().reshape(-1)
+        values = flat[: min(limit, flat.numel())].to("cpu").tolist()
+        summary += f", head={values}"
+    except Exception as exc:  # pragma: no cover - debug only
+        summary += f", head=<unavailable:{exc}>"
+    return summary
+
+
+def _log_mtp_pcp_debug(message: str, *args) -> None:
+    global _mtp_pcp_debug_log_count
+    if _mtp_pcp_debug_log_count >= _MTP_PCP_DEBUG_LOG_LIMIT:
+        return
+    _mtp_pcp_debug_log_count += 1
+    logger.warning("[MTP-PCP-DEBUG] " + message, *args)
+
+
+def _log_main_decode_metadata_debug(message: str, *args) -> None:
+    global _main_decode_metadata_debug_log_count
+    if _main_decode_metadata_debug_log_count >= _MAIN_DECODE_METADATA_DEBUG_LOG_LIMIT:
+        return
+    _main_decode_metadata_debug_log_count += 1
+    logger.warning("[MAIN-DECODE-METADATA-DEBUG] " + message, *args)
 
 
 def _trim_incomplete_spec_decode_tokens(scheduler_output: SchedulerOutput) -> SchedulerOutput:
@@ -1168,6 +1201,61 @@ class NPUModelRunner(GPUModelRunner):
         )
         self.seq_lens[num_reqs:].fill_(0)
 
+        has_spec_decode_tokens = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+        if (
+            self.speculative_config
+            and self.speculative_config.method == "mtp"
+            and self.use_cp
+            and has_spec_decode_tokens
+            and attn_state == AscendAttentionState.SpecDecoding
+        ):
+            total_num_scheduled_tokens_pcp_full = sum(
+                scheduler_output.num_scheduled_tokens[req_id]
+                for req_id in self.input_batch.req_ids
+            )
+            _log_main_decode_metadata_debug(
+                "prepare_inputs_after_seq_lens num_reqs=%s total_tokens=%s "
+                "num_scheduled=%s num_valid=%s attn_state=%s query_start_cpu=%s "
+                "query_start_gpu=%s seq_lens=%s optimistic_seq_lens_cpu=%s "
+                "num_computed_gpu=%s num_computed_cpu=%s positions=%s input_ids=%s "
+                "pcp_full_qsl=%s pcp_full_input_ids=%s pcp_num_pads=%s "
+                "pcp_num_scheduled_padded=%s pcp_restore_idx=%s",
+                num_reqs,
+                total_num_scheduled_tokens,
+                num_scheduled_tokens[:num_reqs].tolist(),
+                num_valid_tokens[:num_reqs].tolist(),
+                attn_state,
+                _debug_tensor_summary(self.query_start_loc.cpu[: num_reqs + 1]),
+                _debug_tensor_summary(self.query_start_loc.gpu[: num_reqs + 1]),
+                _debug_tensor_summary(self.seq_lens[:num_reqs]),
+                _debug_tensor_summary(self.optimistic_seq_lens_cpu[:num_reqs]),
+                _debug_tensor_summary(self.num_computed_tokens[:num_reqs]),
+                self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
+                _debug_tensor_summary(self.positions[:total_num_scheduled_tokens]),
+                _debug_tensor_summary(self.input_ids.gpu[:total_num_scheduled_tokens]),
+                _debug_tensor_summary(
+                    self.pcp_manager.query_start_loc_pcp_full.cpu[: num_reqs + 1]
+                    if hasattr(self.pcp_manager, "query_start_loc_pcp_full")
+                    else None
+                ),
+                _debug_tensor_summary(
+                    self.pcp_manager.input_ids_pcp_full.gpu[:total_num_scheduled_tokens_pcp_full]
+                    if hasattr(self.pcp_manager, "input_ids_pcp_full")
+                    else None
+                ),
+                self.pcp_manager.num_pcp_pads_cpu[:num_reqs].tolist(),
+                (
+                    self.pcp_manager.num_scheduled_tokens_padded[:num_reqs].tolist()
+                    if self.pcp_manager.num_scheduled_tokens_padded is not None
+                    else None
+                ),
+                _debug_tensor_summary(
+                    self.pcp_manager.pcp_allgather_restore_idx.gpu[
+                        : max(total_num_scheduled_tokens * self.pcp_size, 0)
+                    ]
+                ),
+            )
+
         if should_rebuild_async_inputs:
             req_indices_full = self.pcp_manager.async_rebuild_req_indices_full
             cu_num_tokens_full = self.pcp_manager.async_rebuild_cu_num_tokens_full
@@ -1546,6 +1634,19 @@ class NPUModelRunner(GPUModelRunner):
         else:
             self.attn_state = attn_state  # type: ignore
 
+        if self.speculative_config and self.speculative_config.method == "mtp" and self.use_cp:
+            _log_mtp_pcp_debug(
+                "build_attn_state attn_state=%s runner_attn_state=%s decode_threshold=%s "
+                "num_reqs=%s num_scheduled_tokens=%s num_valid_tokens=%s num_computed_tokens_cpu=%s",
+                attn_state,
+                self.attn_state,
+                self.decode_threshold,
+                num_reqs,
+                num_scheduled_tokens[:num_reqs].tolist(),
+                num_valid_tokens[:num_reqs].tolist(),
+                self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
+            )
+
         return attn_state
 
     def _calc_spec_decode_metadata(
@@ -1815,6 +1916,17 @@ class NPUModelRunner(GPUModelRunner):
                 self.get_model(), "get_mtp_target_hidden_states", lambda: None
             )()
             if mtp_hidden_states is not None:
+                if self.use_cp:
+                    _log_mtp_pcp_debug(
+                        "override_hidden_states_for_mtp original_hidden=%s mtp_hidden=%s "
+                        "num_scheduled_tokens=%s num_reqs=%s num_decode_reqs=%s num_prefill_reqs=%s",
+                        _debug_tensor_summary(hidden_states),
+                        _debug_tensor_summary(mtp_hidden_states),
+                        num_scheduled_tokens,
+                        self.input_batch.num_reqs,
+                        num_decode_reqs if self.use_cp else None,
+                        num_prefill_reqs if self.use_cp else None,
+                    )
                 hidden_states = mtp_hidden_states
 
             num_rejected_tokens_gpu = None
@@ -1872,6 +1984,25 @@ class NPUModelRunner(GPUModelRunner):
                     else:
                         target_hidden_states = hidden_states[token_indices]
             assert self.drafter is not None
+            if self.use_cp:
+                _log_mtp_pcp_debug(
+                    "before_drafter_propose spec_metadata=%s target_token_ids=%s target_positions=%s "
+                    "target_hidden_states=%s token_indices_to_sample=%s common_num_actual=%s "
+                    "common_num_input=%s common_max_query_len=%s common_attn_state=%s "
+                    "common_qsl_cpu=%s common_seq_lens=%s common_slot_mapping=%s",
+                    spec_decode_metadata is not None,
+                    _debug_tensor_summary(target_token_ids),
+                    _debug_tensor_summary(target_positions),
+                    _debug_tensor_summary(target_hidden_states),
+                    _debug_tensor_summary(token_indices_to_sample),
+                    common_attn_metadata.num_actual_tokens,
+                    common_attn_metadata.num_input_tokens,
+                    common_attn_metadata.max_query_len,
+                    common_attn_metadata.attn_state,
+                    _debug_tensor_summary(common_attn_metadata.query_start_loc_cpu),
+                    _debug_tensor_summary(common_attn_metadata.seq_lens),
+                    _debug_tensor_summary(common_attn_metadata.slot_mapping),
+                )
             draft_token_ids = self.drafter._propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
@@ -3161,6 +3292,60 @@ class NPUModelRunner(GPUModelRunner):
             prefill_context_parallel_metadata=self.long_seq_metadata,
         )
 
+        if (
+            self.speculative_config
+            and self.speculative_config.method == "mtp"
+            and self.use_cp
+            and use_spec_decode
+            and self.attn_state == AscendAttentionState.SpecDecoding
+        ):
+            long_seq_metadata = self.long_seq_metadata
+            _log_main_decode_metadata_debug(
+                "build_attention_cm_base num_tokens=%s num_tokens_padded=%s "
+                "num_reqs=%s num_reqs_padded=%s max_query_len=%s max_seq_len=%s "
+                "attn_state=%s cm_qsl_cpu=%s cm_qsl_gpu=%s cm_seq_lens=%s "
+                "cm_seq_lens_cpu=%s cm__seq_lens_cpu=%s cm_num_computed_cpu=%s "
+                "cm_slot_mapping=%s cm_block_table=%s cm_is_prefilling=%s "
+                "long_num_actual_tokens_pcp_padded=%s long_query_lens_full=%s "
+                "long_restore_idx=%s long_dcp_mtp_mask=%s",
+                num_tokens,
+                num_tokens_padded,
+                num_reqs,
+                num_reqs_padded,
+                max_query_len,
+                max_seq_len,
+                self.attn_state,
+                _debug_tensor_summary(cm_base.query_start_loc_cpu),
+                _debug_tensor_summary(cm_base.query_start_loc),
+                _debug_tensor_summary(cm_base.seq_lens),
+                _debug_tensor_summary(cm_base.seq_lens_cpu),
+                _debug_tensor_summary(cm_base._seq_lens_cpu),
+                _debug_tensor_summary(cm_base.num_computed_tokens_cpu),
+                _debug_tensor_summary(cm_base.slot_mapping),
+                _debug_tensor_summary(cm_base.block_table_tensor),
+                _debug_tensor_summary(cm_base.is_prefilling),
+                (
+                    long_seq_metadata.num_actual_tokens_pcp_padded
+                    if long_seq_metadata is not None
+                    else None
+                ),
+                _debug_tensor_summary(
+                    long_seq_metadata.query_lens_pcp_full_cpu
+                    if long_seq_metadata is not None
+                    else None
+                ),
+                _debug_tensor_summary(
+                    long_seq_metadata.pcp_allgather_restore_idx
+                    if long_seq_metadata is not None
+                    else None
+                ),
+                _debug_tensor_summary(
+                    long_seq_metadata.dcp_mtp_attn_mask
+                    if long_seq_metadata is not None
+                    else None
+                ),
+            )
+
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
             cm_base.num_logits_indices = logits_indices.size(0)
             cm_base.logits_indices_padded = self._prepare_kv_sharing_fast_prefill(logits_indices)
@@ -3229,6 +3414,36 @@ class NPUModelRunner(GPUModelRunner):
                 prefill_ratio_to_sas_metadata = builder.prefill_ratio_to_sas_metadata  # type: ignore[assignment]
                 decode_ratio_to_sas_metadata = builder.decode_ratio_to_sas_metadata  # type: ignore[assignment]
                 common_ratio_to_sas_metadata = builder.common_ratio_to_sas_metadata  # type: ignore[assignment]
+
+            if (
+                self.speculative_config
+                and self.speculative_config.method == "mtp"
+                and self.use_cp
+                and use_spec_decode
+                and self.attn_state == AscendAttentionState.SpecDecoding
+            ):
+                _log_main_decode_metadata_debug(
+                    "built_attn_group_metadata kv_gid=%s attn_gid=%s ubid=%s "
+                    "builder=%s layer0=%s num_actual=%s num_input=%s "
+                    "num_decodes=%s num_decode_tokens=%s num_prefills=%s "
+                    "cum_query_lens=%s seq_lens=%s slot_mapping=%s block_table=%s "
+                    "sfa_cp_present=%s",
+                    kv_cache_gid,
+                    attn_gid,
+                    ubid,
+                    type(builder).__name__,
+                    attn_group.layer_names[0] if attn_group.layer_names else None,
+                    getattr(attn_metadata_i, "num_actual_tokens", None),
+                    getattr(attn_metadata_i, "num_input_tokens", None),
+                    getattr(attn_metadata_i, "num_decodes", None),
+                    getattr(attn_metadata_i, "num_decode_tokens", None),
+                    getattr(attn_metadata_i, "num_prefills", None),
+                    _debug_tensor_summary(getattr(attn_metadata_i, "cum_query_lens", None)),
+                    _debug_tensor_summary(getattr(attn_metadata_i, "seq_lens", None)),
+                    _debug_tensor_summary(getattr(attn_metadata_i, "slot_mapping", None)),
+                    _debug_tensor_summary(getattr(attn_metadata_i, "block_table", None)),
+                    getattr(attn_metadata_i, "sfa_cp_metadata", None) is not None,
+                )
 
             if ubid is None:
                 assert isinstance(attn_metadata, dict)
@@ -3311,6 +3526,30 @@ class NPUModelRunner(GPUModelRunner):
             # the attention metadata in directly), and therefore does not want to use
             # padded attention metadata.
             spec_decode_common_attn_metadata = spec_decode_common_attn_metadata.unpadded(num_tokens, num_reqs)
+        if self.speculative_config and self.speculative_config.method == "mtp" and self.use_cp:
+            cm = spec_decode_common_attn_metadata
+            _log_mtp_pcp_debug(
+                "build_attention_metadata use_spec_decode=%s num_tokens=%s num_tokens_padded=%s "
+                "num_reqs=%s num_reqs_padded=%s attn_state=%s cm_present=%s cm_num_actual=%s "
+                "cm_num_input=%s cm_max_query_len=%s cm_qsl_cpu=%s cm_seq_lens=%s "
+                "long_seq_query_lens=%s long_seq_dcp_mtp_mask=%s",
+                use_spec_decode,
+                num_tokens,
+                num_tokens_padded,
+                num_reqs,
+                num_reqs_padded,
+                self.attn_state,
+                cm is not None,
+                cm.num_actual_tokens if cm is not None else None,
+                cm.num_input_tokens if cm is not None else None,
+                cm.max_query_len if cm is not None else None,
+                _debug_tensor_summary(cm.query_start_loc_cpu if cm is not None else None),
+                _debug_tensor_summary(cm.seq_lens if cm is not None else None),
+                _debug_tensor_summary(
+                    self.long_seq_metadata.query_lens_pcp_full_cpu if self.long_seq_metadata is not None else None
+                ),
+                self.long_seq_metadata.dcp_mtp_attn_mask is not None if self.long_seq_metadata is not None else None,
+            )
         return attn_metadata, spec_decode_common_attn_metadata
 
     def _should_build_dummy_attn_metadata(

@@ -56,6 +56,29 @@ from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enab
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
 _PREPARE_INPUTS_BLOCK_SIZE = 4
+_MTP_PROPOSER_DEBUG_LOG_LIMIT = 64
+_mtp_proposer_debug_log_count = 0
+
+
+def _debug_tensor_summary(tensor: torch.Tensor | None, limit: int = 8) -> str:
+    if tensor is None:
+        return "None"
+    summary = f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, device={tensor.device}"
+    try:
+        flat = tensor.detach().reshape(-1)
+        values = flat[: min(limit, flat.numel())].to("cpu").tolist()
+        summary += f", head={values}"
+    except Exception as exc:  # pragma: no cover - debug only
+        summary += f", head=<unavailable:{exc}>"
+    return summary
+
+
+def _log_mtp_proposer_debug(message: str, *args) -> None:
+    global _mtp_proposer_debug_log_count
+    if _mtp_proposer_debug_log_count >= _MTP_PROPOSER_DEBUG_LOG_LIMIT:
+        return
+    _mtp_proposer_debug_log_count += 1
+    logger.warning("[MTP-PROPOSER-DEBUG] " + message, *args)
 
 
 # TODO: Remove it when the bug of fx-graph is solved
@@ -628,6 +651,31 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             num_prefill_reqs=num_prefill_reqs,
             num_decode_reqs=num_decode_reqs,
         )
+        if self.method == "mtp" and self.pcp_size * self.dcp_size > 1:
+            long_seq_metadata = getattr(common_attn_metadata, "prefill_context_parallel_metadata", None)
+            _log_mtp_proposer_debug(
+                "after_set_inputs_first_pass num_tokens=%s num_speculative_tokens=%s "
+                "num_rejected_gpu=%s token_indices_to_sample=%s target_positions=%s "
+                "target_hidden_states=%s common_num_actual=%s common_num_input=%s "
+                "common_max_query_len=%s common_attn_state=%s common_qsl_cpu=%s "
+                "common_seq_lens=%s common_slot_mapping=%s long_seq_query_lens=%s",
+                num_tokens,
+                self.num_speculative_tokens,
+                _debug_tensor_summary(num_rejected_tokens_gpu),
+                _debug_tensor_summary(token_indices_to_sample),
+                _debug_tensor_summary(target_positions),
+                _debug_tensor_summary(target_hidden_states),
+                common_attn_metadata.num_actual_tokens,
+                common_attn_metadata.num_input_tokens,
+                common_attn_metadata.max_query_len,
+                common_attn_metadata.attn_state,
+                _debug_tensor_summary(common_attn_metadata.query_start_loc_cpu),
+                _debug_tensor_summary(common_attn_metadata.seq_lens),
+                _debug_tensor_summary(common_attn_metadata.slot_mapping),
+                _debug_tensor_summary(
+                    long_seq_metadata.query_lens_pcp_full_cpu if long_seq_metadata is not None else None
+                ),
+            )
         if self.pcp_size * self.dcp_size > 1:
             assert long_seq_args is not None
             query_lens_d, ori_token_indices_to_sample = long_seq_args
@@ -762,6 +810,22 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 block_size=self.draft_attn_groups[0].kv_cache_spec.block_size,
             )
         attn_metadata = builder.build(0, common_attn_metadata, self.runner.get_model(), **extra_attn_metadata_args)
+        if self.method == "mtp" and self.pcp_size * self.dcp_size > 1:
+            _log_mtp_proposer_debug(
+                "first_step_attn_metadata type=%s num_actual=%s num_input=%s "
+                "num_decodes=%s num_decode_tokens=%s num_prefills=%s cum_query_lens=%s "
+                "seq_lens=%s slot_mapping=%s has_sfa_cp=%s",
+                type(attn_metadata).__name__,
+                getattr(attn_metadata, "num_actual_tokens", None),
+                getattr(attn_metadata, "num_input_tokens", None),
+                getattr(attn_metadata, "num_decodes", None),
+                getattr(attn_metadata, "num_decode_tokens", None),
+                getattr(attn_metadata, "num_prefills", None),
+                _debug_tensor_summary(getattr(attn_metadata, "cum_query_lens", None)),
+                _debug_tensor_summary(getattr(attn_metadata, "seq_lens", None)),
+                _debug_tensor_summary(getattr(attn_metadata, "slot_mapping", None)),
+                getattr(attn_metadata, "sfa_cp_metadata", None) is not None,
+            )
 
         if hasattr(attn_metadata, "causal") and not attn_metadata.causal:
             attn_metadata.attn_mask = None
@@ -1032,6 +1096,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
+            if self.method == "mtp" and self.pcp_size * self.dcp_size > 1:
+                _log_mtp_proposer_debug(
+                    "early_return_single_step draft_token_ids=%s batch_size=%s parallel_drafting=%s",
+                    _debug_tensor_summary(draft_token_ids),
+                    batch_size,
+                    self.parallel_drafting,
+                )
             # [batch_size, 1]
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
