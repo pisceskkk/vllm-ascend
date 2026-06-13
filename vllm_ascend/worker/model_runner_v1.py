@@ -678,7 +678,13 @@ class NPUModelRunner(GPUModelRunner):
         else:
             num_reqs_padded = batch_desc_num_reqs if batch_desc_num_reqs is not None else num_reqs
 
-        if num_tokens_padded == num_reqs_padded * self.uniform_decode_query_len:
+        # avoid corner case of cudagraph config mode FULL to enter the first padding logic
+        # e.g. 1 request with 1 token when num_spec > 1 (num_spec = 3 and cudagraph_batch_size = 4 for example)
+        # will cause tokens are padded but requests are not
+        if (
+            num_tokens_padded == num_reqs_padded * self.uniform_decode_query_len
+            and self.compilation_config.cudagraph_mode != CUDAGraphMode.FULL
+        ):
             # Uniform-batch case: num_reqs must be no greater than num_reqs_padded
             assert num_reqs <= num_reqs_padded
 
@@ -965,6 +971,9 @@ class NPUModelRunner(GPUModelRunner):
         self.num_discarded_requests = len(discard_request_indices)
         self.discard_request_indices.np[: self.num_discarded_requests] = discard_request_indices
         self.discard_request_indices.copy_to_gpu(self.num_discarded_requests)
+
+        self.discard_request_mask.np[:num_reqs] = discard_requests_mask
+        self.discard_request_mask.copy_to_gpu(num_reqs)
 
         # Sync num_accepted_tokens from CPU (set by
         # _update_states_after_model_execute for hybrid models).
@@ -2839,8 +2848,7 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 blk_table = self.input_batch.block_table[kv_cache_gid]
                 slot_mapping = blk_table.slot_mapping.gpu[:maybe_pcp_full_tokens]
-                maybe_num_reqs_padded = num_reqs_padded * self.decode_token_per_req if self.use_cp else num_reqs_padded
-                blk_table_tensor = blk_table.get_device_tensor()[:maybe_num_reqs_padded]
+                blk_table_tensor = blk_table.get_device_tensor()[:num_reqs_padded]
 
                 # Fill unused with -1. Needed for reshape_and_cache in full cuda
                 # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
@@ -2856,7 +2864,7 @@ class NPUModelRunner(GPUModelRunner):
                         # the previous real request can feed stale block-table
                         # and [block, offset] scatter indices to DSA kernels.
                         slot_mapping[:num_tokens_padded].fill_(0)
-                        blk_table_tensor[:maybe_num_reqs_padded].fill_(0)
+                        blk_table_tensor[:num_reqs_padded].fill_(0)
                     else:
                         slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
                         blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
