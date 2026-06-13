@@ -422,35 +422,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # when update. So we can use the shallow copy.
         return copy.copy(attn_metadata)
 
-    def copy_common_metadata_for_draft(self, common_attn_metadata):
-        draft_metadata = copy.copy(common_attn_metadata)
-        for attr in (
-            "query_start_loc",
-            "query_start_loc_cpu",
-            "seq_lens",
-            "seq_lens_cpu",
-            "_seq_lens_cpu",
-            "seq_lens_cpu_upper_bound",
-            "num_computed_tokens_cpu",
-            "_num_computed_tokens_cpu",
-            "block_table_tensor",
-            "slot_mapping",
-            "positions",
-            "positions_cpu",
-        ):
-            value = getattr(draft_metadata, attr, None)
-            if torch.is_tensor(value):
-                setattr(draft_metadata, attr, value.clone())
-
-        long_seq_metadata = getattr(draft_metadata, "prefill_context_parallel_metadata", None)
-        if long_seq_metadata is not None:
-            long_seq_metadata = copy.copy(long_seq_metadata)
-            for attr, value in vars(long_seq_metadata).items():
-                if torch.is_tensor(value):
-                    setattr(long_seq_metadata, attr, value.clone())
-            draft_metadata.prefill_context_parallel_metadata = long_seq_metadata
-        return draft_metadata
-
     def _freeze_draft_step_attn_metadata(self, attn_metadata):
         decode_metadata = getattr(attn_metadata, "decode", None)
         if decode_metadata is not None:
@@ -632,7 +603,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         num_scheduled_tokens: int = 0,
         num_rejected_tokens_gpu: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        common_attn_metadata = self.copy_common_metadata_for_draft(common_attn_metadata)
         batch_size = common_attn_metadata.batch_size()
 
         if token_indices_to_sample is None:
