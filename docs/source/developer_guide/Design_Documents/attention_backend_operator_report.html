@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>vLLM Ascend Attention Backend Operator Report</title>
+  <style>
+    :root {
+      --bg: #f7f8fb;
+      --panel: #ffffff;
+      --ink: #172033;
+      --muted: #5f6b7d;
+      --line: #d9dfeb;
+      --accent: #0b6f8f;
+      --accent-soft: #e7f5f9;
+      --warn: #8a5a00;
+      --warn-soft: #fff5d8;
+      --code: #eef2f7;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+      line-height: 1.58;
+    }
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 32px 24px 56px;
+    }
+    h1, h2, h3 {
+      line-height: 1.25;
+      margin: 0 0 14px;
+    }
+    h1 {
+      font-size: 32px;
+      margin-bottom: 8px;
+    }
+    h2 {
+      font-size: 23px;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 8px;
+      margin-top: 34px;
+    }
+    h3 {
+      font-size: 18px;
+      margin-top: 22px;
+    }
+    p { margin: 8px 0 12px; }
+    code {
+      background: var(--code);
+      padding: 2px 5px;
+      border-radius: 4px;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 0.94em;
+    }
+    .lead {
+      color: var(--muted);
+      font-size: 16px;
+      margin-bottom: 22px;
+    }
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin: 18px 0 26px;
+    }
+    .tile {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--accent);
+      border-radius: 8px;
+      padding: 14px;
+      min-height: 132px;
+    }
+    .tile strong {
+      display: block;
+      margin-bottom: 8px;
+      color: var(--accent);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      margin: 14px 0 20px;
+      table-layout: fixed;
+    }
+    th, td {
+      border: 1px solid var(--line);
+      padding: 10px 12px;
+      vertical-align: top;
+      word-break: break-word;
+    }
+    th {
+      background: #eef3f8;
+      text-align: left;
+      font-weight: 650;
+    }
+    ul {
+      padding-left: 22px;
+      margin: 8px 0 12px;
+    }
+    li { margin: 5px 0; }
+    .note {
+      background: var(--accent-soft);
+      border: 1px solid #b9dce7;
+      border-radius: 8px;
+      padding: 12px 14px;
+      margin: 14px 0;
+    }
+    .warn {
+      background: var(--warn-soft);
+      border: 1px solid #ead28d;
+      border-radius: 8px;
+      padding: 12px 14px;
+      color: var(--warn);
+      margin: 14px 0;
+    }
+    .small {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    @media (max-width: 900px) {
+      .summary { grid-template-columns: 1fr; }
+      main { padding: 24px 14px 42px; }
+      table { table-layout: auto; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>vLLM Ascend Attention 后端算子与输入格式分析报告</h1>
+  <p class="lead">
+    范围：当前 <code>vllm_ascend/attention/</code> 中的
+    <code>attention_v1.py</code>、<code>mla_v1.py</code>、<code>sfa_v1.py</code>、
+    <code>dsa_v1.py</code>。报告重点回答每个 backend 实际使用哪些 attention 相关算子、
+    <code>q</code> 与 <code>KV/KV cache</code> 的输入布局是什么、以及这些路径相对其他 attention
+    后端的功能差异来源。
+  </p>
+
+  <section>
+    <h2>总体结论</h2>
+    <div class="summary">
+      <div class="tile">
+        <strong>attention_v1.py</strong>
+        通用 MHA/MQA/GQA 后端。主算子是 <code>npu_fused_infer_attention_score</code>、
+        <code>npu_fused_infer_attention_score_v2</code> 和 <code>_npu_paged_attention</code>，
+        KV cache 是传统 K/V 双 cache。
+      </div>
+      <div class="tile">
+        <strong>mla_v1.py</strong>
+        MLA latent-cache 后端。KV cache 不再保存完整 K/V，而保存 latent KV 与 RoPE K；
+        decode 用 FIA v2 的 <code>query_rope/key_rope</code> 输入，输出 latent 后再做 V up-proj。
+      </div>
+      <div class="tile">
+        <strong>sfa_v1.py</strong>
+        Sparse Flash Attention 后端。沿用 MLA latent 表示，但额外维护 indexer cache，
+        用 lightning indexer 产出 top-k，再调用 sparse flash attention 只访问稀疏 KV。
+      </div>
+      <div class="tile">
+        <strong>dsa_v1.py</strong>
+        DSV4/DSA sparse shared-KV 后端。将 sliding-window 原始 KV 与压缩历史 KV 组合起来，
+        通过 shared-KV sparse attention 算子完成 SWA + compressed KV 混合注意力。
+      </div>
+    </div>
+    <div class="note">
+      <strong>核心差异：</strong>
+      <code>attention_v1</code> 是“完整 K/V + block table”的通用路径；
+      <code>mla_v1</code> 是“latent KV + RoPE split”的 MLA 路径；
+      <code>sfa_v1</code> 是“MLA latent KV + top-k sparse index”的稀疏路径；
+      <code>dsa_v1</code> 是“原始 SWA KV + 压缩 KV + sharedkv sparse metadata”的 DSV4 路径。
+      因此它们的 cache 内容、attention operator、metadata、量化与 RoPE 位置都不完全一致。
+    </div>
+  </section>
+
+  <section>
+    <h2>布局术语</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>布局/对象</th>
+          <th>含义</th>
+          <th>典型出现位置</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>TND</code></td>
+          <td><code>T</code> 是 batch 内打包后的 token 总数，<code>N</code> 是 head 数，<code>D</code> 是 head dim。</td>
+          <td>FIA prefill、普通 attention、MLA/SFA/DSA 的 query 侧。</td>
+        </tr>
+        <tr>
+          <td><code>PA</code> / paged cache</td>
+          <td>通过 <code>block_table</code> 从 request 映射到物理 block；cache 一般是 <code>[num_blocks, block_size, N, D]</code> 或同语义变体。</td>
+          <td>decode、chunked prefill、prefix cache hit。</td>
+        </tr>
+        <tr>
+          <td><code>PA_BSND</code> / <code>PA_ND</code></td>
+          <td>稀疏算子使用的 paged KV cache 布局标记。<code>PA_BSND</code> 常用于 lightning indexer 与 sparse flash；<code>PA_ND</code> 常用于 DSA shared-KV。</td>
+          <td><code>sfa_v1.py</code>、<code>dsa_v1.py</code>。</td>
+        </tr>
+        <tr>
+          <td><code>BNSD</code> / <code>BSND_NBSD</code> / <code>BNSD_NBSD</code> / <code>TND_NTD</code></td>
+          <td>decode 或图模式下为了满足 CANN/FIA v2 输入输出 layout 约束使用的变体，右侧后缀表示输出布局。</td>
+          <td>MLA decode、C8/FA quant、spec decode。</td>
+        </tr>
+        <tr>
+          <td><code>actual_seq_lengths*</code></td>
+          <td>FIA/SFA/DSA 算子需要的累计 query 长度、KV 长度或每请求长度；决定 mask、causal、block table 的有效范围。</td>
+          <td>四个 backend 都使用，但字段名和是否为 list/tensor 不同。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>算子总览</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>算子/包装</th>
+          <th>使用后端</th>
+          <th>主要用途</th>
+          <th>输入格式要点</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>torch_npu.npu_fused_infer_attention_score</code></td>
+          <td>attention_v1, mla_v1</td>
+          <td>FIA v1，普通 prefill/chunked prefill/非 sink attention；MLA prefill 和 chunked context 合并前的局部 attention。</td>
+          <td>普通路径用 <code>query/key/value</code> TND；MLA prefill 用 <code>q_nope</code> + <code>query_rope</code> 或拼接后的 full query。</td>
+        </tr>
+        <tr>
+          <td><code>torch_npu.npu_fused_infer_attention_score_v2</code></td>
+          <td>attention_v1, mla_v1</td>
+          <td>支持 learnable sink、MLA decode 的 RoPE split、图捕获 replay。</td>
+          <td>普通路径可用 TND；MLA decode 传 <code>q_nope</code>、<code>k_nope</code>、<code>value=k_nope</code>，并额外传 <code>query_rope/key_rope</code>。</td>
+        </tr>
+        <tr>
+          <td><code>torch_npu._npu_paged_attention</code></td>
+          <td>attention_v1</td>
+          <td>DecodeOnly 下的传统 paged attention 快路径。</td>
+          <td><code>query=[T,H,D]</code>，<code>key_cache/value_cache=[num_blocks,block_size,Hkv,D]</code>，配合 <code>block_table/context_lens</code>。</td>
+        </tr>
+        <tr>
+          <td><code>torch_npu.npu_fusion_attention</code></td>
+          <td>attention_v1</td>
+          <td>pooling / encoder-only 非 causal attention。</td>
+          <td>TND query/key/value，使用相同 <code>actual_seq_qlen/kvlen</code>。</td>
+        </tr>
+        <tr>
+          <td><code>torch_npu.npu_kv_rmsnorm_rope_cache</code></td>
+          <td>mla_v1, sfa_v1</td>
+          <td>MLA/SFA KV 预处理：对 latent KV 做 RMSNorm、拆出/旋转 RoPE K，并写入 paged cache。</td>
+          <td>输入 <code>kv_no_split</code> reshape 为 <code>[B,N,1,kv_lora_rank+qk_rope_head_dim]</code>，slots 为 paged cache index。</td>
+        </tr>
+        <tr>
+          <td><code>torch.ops._C_ascend.mla_preprocess</code> / <code>torch_npu.npu_mla_prolog_v2/v3</code></td>
+          <td>mla_v1, sfa_v1</td>
+          <td>MLAPO/prolog：融合 q/kv down-proj、RMSNorm、RoPE、cache 写入和 q_nope 变换。</td>
+          <td>输入 hidden states，输出 <code>q_nope/ql_nope</code>、<code>q_pe</code>、可选 <code>q_c</code>，并直接写 latent KV cache。</td>
+        </tr>
+        <tr>
+          <td><code>torch_npu.npu_sparse_flash_attention</code> / <code>torch.ops._C_ascend.npu_sparse_flash_attention</code></td>
+          <td>sfa_v1</td>
+          <td>SFA 主 attention：按 indexer top-k 稀疏读取 KV。</td>
+          <td><code>query=ql_nope</code>，<code>key=value=latent KV cache</code>，<code>query_rope=q_pe</code>，<code>key_rope=k_pe cache</code>，layout 为 <code>TND</code> + <code>PA_BSND</code>。</td>
+        </tr>
+        <tr>
+          <td><code>torch_npu.npu_kv_quant_sparse_flash_attention</code></td>
+          <td>sfa_v1</td>
+          <td>A5/C8 量化 SFA 主 attention。</td>
+          <td>将 <code>ql_nope</code> 与 <code>q_pe</code> 拼成 query；KV 是量化 cache，不再单独传 <code>key_rope</code>。</td>
+        </tr>
+        <tr>
+          <td><code>torch_npu.npu_lightning_indexer</code> / <code>torch.ops._C_ascend.npu_lightning_indexer*</code></td>
+          <td>sfa_v1, dsa_v1</td>
+          <td>根据 query/indexer key 选出 sparse top-k KV block 或 token index。</td>
+          <td>query 多为 TND，key 是 paged indexer cache，layout 常为 <code>PA_BSND</code>。</td>
+        </tr>
+        <tr>
+          <td><code>torch.ops._C_ascend.npu_sparse_attn_sharedkv*</code></td>
+          <td>dsa_v1</td>
+          <td>DSA 主 attention：同时处理 sliding-window 原始 KV 与 compressed KV。</td>
+          <td><code>q</code> 是 TND；<code>ori_kv</code> 是 SWA cache；<code>cmp_kv</code> 是压缩 cache；layout 为 <code>TND</code> + <code>PA_ND</code>。</td>
+        </tr>
+        <tr>
+          <td><code>torch.ops._C_ascend.compressor</code></td>
+          <td>dsa_v1</td>
+          <td>生成 compressed KV，并维护 compressor state cache。</td>
+          <td>输入 hidden states、compressor 权重、state cache、RoPE sin/cos、block table、start position。</td>
+        </tr>
+        <tr>
+          <td><code>_npu_reshape_and_cache</code> / <code>npu_scatter_pa_kv_cache</code> / scatter/update wrappers</td>
+          <td>全部相关路径</td>
+          <td>将当前 token 的 KV 写入 paged cache。</td>
+          <td>普通 K/V、MLA latent KV、SFA indexer KV、DSA SWA/compressed KV 的写入方式不同。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>attention_v1.py：通用 MHA/MQA/GQA</h2>
+    <h3>输入与 cache 形态</h3>
+    <ul>
+      <li><code>query</code>: <code>[num_tokens, num_heads, head_size]</code>。</li>
+      <li><code>key/value</code>: <code>[num_tokens, num_kv_heads, head_size]</code>。</li>
+      <li><code>kv_cache</code>: backend 声明为 <code>[2, num_blocks, block_size, num_kv_heads, head_size]</code>，运行时拆成 <code>key_cache=kv_cache[0]</code> 与 <code>value_cache=kv_cache[1]</code>。</li>
+      <li>PrefillNoCache 直接使用本轮 TND K/V；PrefillCacheHit、DecodeOnly、ChunkedPrefill 使用 paged cache 与 <code>block_tables</code>。</li>
+    </ul>
+    <h3>attention 算子路径</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>场景</th>
+          <th>算子</th>
+          <th>布局/参数</th>
+          <th>用途差异</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>DecodeOnly + paged attention 快路径</td>
+          <td><code>torch_npu._npu_paged_attention</code></td>
+          <td><code>query</code> + <code>key_cache/value_cache</code> + <code>block_table/context_lens</code>。</td>
+          <td>只处理 decode，避免 FIA 对短 query 的额外开销。</td>
+        </tr>
+        <tr>
+          <td>普通 causal prefill / chunked prefill / cache hit</td>
+          <td><code>npu_fused_infer_attention_score</code></td>
+          <td><code>input_layout="TND"</code>，<code>sparse_mode=3</code>，可传 <code>atten_mask</code> 与 paged <code>block_table</code>。</td>
+          <td>标准全量 causal attention，适配完整 K/V。</td>
+        </tr>
+        <tr>
+          <td>Sliding window</td>
+          <td><code>npu_fused_infer_attention_score</code></td>
+          <td><code>sparse_mode=4</code>，<code>pre_tokens=sliding_window</code>，<code>next_tokens=0</code>。</td>
+          <td>窗口 mask 由 FIA 参数表达，不改变 K/V 格式。</td>
+        </tr>
+        <tr>
+          <td>Learnable sink</td>
+          <td><code>npu_fused_infer_attention_score_v2</code></td>
+          <td><code>actual_seq_qlen/actual_seq_kvlen</code>，<code>learnable_sink</code>，TND。</td>
+          <td>FIA v1 不覆盖 sink 语义，因此切到 v2。</td>
+        </tr>
+        <tr>
+          <td>Pooling / encoder-only 非 causal</td>
+          <td><code>npu_fusion_attention</code></td>
+          <td>TND，<code>sparse_mode=0</code> 语义。</td>
+          <td>无需 causal mask 与 paged decode 逻辑。</td>
+        </tr>
+        <tr>
+          <td>C8/QuaRot INT8 KV cache</td>
+          <td><code>npu_fused_infer_attention_score</code> + antiquant 参数</td>
+          <td>decode 可用 <code>input_layout="BNSD"</code>；KV cache 以 NZ 5D view 传入，附带 <code>key/value_antiquant_scale</code>。</td>
+          <td>cache 是 INT8/NZ，必须在 attention 内反量化。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>mla_v1.py：MLA latent cache</h2>
+    <h3>输入与 cache 形态</h3>
+    <ul>
+      <li>入口输入是 <code>hidden_states</code>，不是直接传入完整 q/k/v。backend 内部先做 <code>fused_qkv_a_proj</code> 或 <code>kv_a_proj_with_mqa</code>。</li>
+      <li><code>q_c</code>: query latent，经过 <code>q_a_layernorm</code> 后用 <code>q_proj</code> 得到 <code>q_nope</code> 与 <code>q_pe</code>。</li>
+      <li><code>kv_no_split</code>: <code>[T, kv_lora_rank + qk_rope_head_dim]</code>，进入 <code>npu_kv_rmsnorm_rope_cache</code> 前 reshape 为 <code>[B, num_kv_heads, 1, kv_lora_rank + qk_rope_head_dim]</code>。</li>
+      <li><code>kv_cache[0]</code> 保存 latent KV / <code>k_nope</code> 基础，<code>kv_cache[1]</code> 保存 RoPE 部分 <code>k_pe</code>。它不是普通 attention 的完整 K/V 双 cache。</li>
+    </ul>
+    <h3>attention 算子路径</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>阶段</th>
+          <th>算子</th>
+          <th>q / KV 输入</th>
+          <th>用途差异</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>KV 预处理与写 cache</td>
+          <td><code>npu_kv_rmsnorm_rope_cache</code></td>
+          <td><code>kv_no_split=[B,N,1,L+R]</code>，slots 写入 <code>kv_cache[0/1]</code>；返回 <code>k_pe</code> 与 <code>k_nope/kv_c_normed</code>。</td>
+          <td>把 MLA 的 latent KV 与 RoPE K 在 cache 中拆开保存，降低 KV cache 成本。</td>
+        </tr>
+        <tr>
+          <td>Decode attention</td>
+          <td><code>npu_fused_infer_attention_score_v2</code></td>
+          <td><code>query=q_nope</code>，<code>key=k_nope</code>，<code>value=k_nope</code>，额外传 <code>query_rope=q_pe</code>、<code>key_rope=k_pe</code>。</td>
+          <td>attention 输出仍在 latent value 空间，之后通过 <code>W_UV</code> 做 V up-proj。</td>
+        </tr>
+        <tr>
+          <td>Prefill attention</td>
+          <td><code>npu_fused_infer_attention_score</code></td>
+          <td>若 head 数无需 padding：<code>query=q_nope</code>、<code>key=k_nope</code>、<code>value=v</code>，用 <code>query_rope/key_rope</code> 表达 RoPE；否则拼接 nope/rope。</td>
+          <td>prefill 有本轮完整 token，可直接由 <code>kv_b_proj</code> 还原 <code>k_nope/value</code>。</td>
+        </tr>
+        <tr>
+          <td>Chunked context</td>
+          <td><code>npu_paged_cache_load</code> + <code>npu_fused_infer_attention_score</code> + <code>npu_attention_update</code></td>
+          <td>从 paged latent cache 加载历史 chunk，逐 chunk 做 attention，最后用 LSE 与 output 合并。</td>
+          <td>解决长上下文 chunked prefill 中当前 chunk 与历史 context 的合并。</td>
+        </tr>
+        <tr>
+          <td>Decode-only MLAPO/FA quant 快路径</td>
+          <td><code>mla_preprocess</code> 或 <code>npu_mla_prolog_v2</code></td>
+          <td>输入 <code>hidden_states</code>，融合生成 <code>q_nope/q_pe</code> 并写 <code>k_nope/k_pe</code> cache。</td>
+          <td>减少 projection、RMSNorm、RoPE、cache write 的分散开销；受 token 数和量化条件限制。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>sfa_v1.py：Sparse Flash Attention</h2>
+    <h3>输入与 cache 形态</h3>
+    <ul>
+      <li>SFA 继承 MLA 的 latent 表示，主 query 是 <code>ql_nope</code> 与 <code>q_pe</code>，而不是普通 full q。</li>
+      <li>非 C8 常见 cache：<code>kv_cache[0]</code> 为 latent KV / <code>k_nope</code>，<code>kv_cache[1]</code> 为 <code>k_pe</code>，<code>kv_cache[2]</code> 为 indexer K cache，量化 indexer 时还有 scale cache。</li>
+      <li>A5/C8 sparse indexer 下，cache tuple 形态变化：主 sparse attention 可能直接使用量化 latent KV，indexer key/scale 也可能占用不同 cache 槽位。</li>
+      <li><code>topk_indices</code> 是 SFA 的关键输入，来自 lightning indexer 或 index cache。</li>
+    </ul>
+    <h3>attention 算子路径</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>阶段</th>
+          <th>算子</th>
+          <th>q / KV 输入</th>
+          <th>用途差异</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>MLA/SFA prolog</td>
+          <td><code>npu_kv_rmsnorm_rope_cache</code> 或 <code>mla_preprocess</code>/<code>npu_mla_prolog_v3</code></td>
+          <td>从 hidden states 产生 <code>ql_nope</code>、<code>q_pe</code>、<code>q_c</code>，并写 latent KV cache。</td>
+          <td>与 MLA 相同的 latent/RoPE split，但会保留 <code>q_c</code> 供 indexer 使用。</td>
+        </tr>
+        <tr>
+          <td>Indexer K 生成与写入</td>
+          <td><code>npu_rotary_mul</code> / <code>npu_dynamic_quant</code> / scatter 或 <code>store_kv_block</code></td>
+          <td><code>k_li</code> 是 indexer key，可能有 <code>k_li_scale</code>。写入 paged indexer cache。</td>
+          <td>SFA 需要额外的检索空间，用于后续 sparse top-k 选择。</td>
+        </tr>
+        <tr>
+          <td>Top-k 选择</td>
+          <td><code>npu_lightning_indexer</code> / <code>npu_quant_lightning_indexer</code> / <code>npu_lightning_indexer_quant</code></td>
+          <td><code>query=q_li</code>，<code>key=indexer cache</code>，layout <code>TND</code> + <code>PA_BSND</code>，附带 <code>block_table</code> 与 seq lengths。</td>
+          <td>把全量历史 KV 访问降为 top-k 稀疏访问；可被 index cache 跳过。</td>
+        </tr>
+        <tr>
+          <td>Sparse attention</td>
+          <td><code>npu_sparse_flash_attention</code></td>
+          <td><code>query=ql_nope</code>，<code>key=value=kv_cache[0]</code>，<code>query_rope=q_pe</code>，<code>key_rope=kv_cache[1]</code>，<code>sparse_indices=topk_indices</code>。</td>
+          <td>只对 top-k KV 计算 attention，输出 latent value，再做 <code>_v_up_proj</code>。</td>
+        </tr>
+        <tr>
+          <td>C8/FP8 sparse attention</td>
+          <td><code>npu_kv_quant_sparse_flash_attention</code></td>
+          <td><code>query=cat(ql_nope, q_pe)</code>，<code>key=value=quantized latent KV cache</code>，layout <code>TND</code> + <code>PA_BSND</code>。</td>
+          <td>量化 KV attention 内部处理 RoPE/反量化模式，调用参数与非 C8 分支不同。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>dsa_v1.py：DSA sparse shared-KV</h2>
+    <h3>输入与 cache 形态</h3>
+    <ul>
+      <li>入口也是 <code>hidden_states</code>，内部生成 <code>q</code> 与 <code>kv</code>。<code>q</code> 经 RMSNorm 与 partial RoPE 后形态为 <code>[T, n_local_heads, head_dim]</code>。</li>
+      <li>SWA 原始 KV：<code>kv=[T,1,nope_head_dim+rope_head_dim]</code>，写入 <code>swa_kv_cache</code>。</li>
+      <li>当 <code>compress_ratio &gt; 1</code> 时，<code>compressor</code> 生成 compressed KV，写入 <code>compress_kv_cache</code>；同时维护 compressor state cache。</li>
+      <li>当 <code>compress_ratio == 4</code> 时，额外使用 lightning indexer，维护 indexer K/scale/full cache 并产生 <code>compress_topk_idxs</code>。</li>
+    </ul>
+    <h3>attention 算子路径</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>阶段</th>
+          <th>算子</th>
+          <th>q / KV 输入</th>
+          <th>用途差异</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>DSA sparse metadata</td>
+          <td><code>npu_sparse_attn_sharedkv_metadata</code> 或 <code>npu_kv_quant_sparse_attn_sharedkv_metadata</code></td>
+          <td>输入 <code>cu_seqlens_q</code>、<code>cu_seqlens_ori_kv</code>、可选 <code>cu_seqlens_cmp_kv</code>、窗口参数、cmp ratio。</td>
+          <td>DSA 主算子需要专用 metadata 表达 SWA window、compressed KV 和 shared-KV 关系。</td>
+        </tr>
+        <tr>
+          <td>SWA KV 写入</td>
+          <td><code>dsa_kv_compress_scatter</code></td>
+          <td>非 A5 走 <code>npu_scatter_nd_update_v2</code>；A5 走 <code>kv_compress_epilog</code>。</td>
+          <td>DSA 的 KV 写入不等同普通 K/V cache 写入，A5 还融合量化/压缩。</td>
+        </tr>
+        <tr>
+          <td>Compressed KV 生成</td>
+          <td><code>torch.ops._C_ascend.compressor</code></td>
+          <td>输入 hidden states、compressor 权重、state cache、RoPE sin/cos、block table、<code>cmp_ratio</code>。</td>
+          <td>把长历史压缩成 cmp KV，用于超出 SWA window 的检索。</td>
+        </tr>
+        <tr>
+          <td>Compressed top-k</td>
+          <td><code>npu_vllm_quant_lightning_indexer</code></td>
+          <td><code>query=q_quant</code>，<code>key=indexer_k_cache</code>，带 query/key dequant scale，layout <code>TND</code> + <code>PA_BSND</code>。</td>
+          <td>ratio=4 时为 compressed KV 选择稀疏候选；ratio=128 分支不传 top-k indices。</td>
+        </tr>
+        <tr>
+          <td>DSA 主 attention</td>
+          <td><code>npu_sparse_attn_sharedkv</code> 或 <code>npu_kv_quant_sparse_attn_sharedkv</code></td>
+          <td><code>q</code> TND；<code>ori_kv=swa_kv_cache</code>；可选 <code>cmp_kv=compress_kv_cache</code>；<code>ori/cmp_block_table</code>；layout <code>TND</code> + <code>PA_ND</code>。</td>
+          <td>同一个 attention 调用融合 sliding-window 近邻 KV 与 compressed historical KV，这是它区别于 SFA/MLA 的核心。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>后端差异矩阵</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>维度</th>
+          <th>attention_v1</th>
+          <th>mla_v1</th>
+          <th>sfa_v1</th>
+          <th>dsa_v1</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>适配模型/语义</td>
+          <td>标准 self/cross/encoder attention，MHA/MQA/GQA。</td>
+          <td>DeepSeek 类 MLA，latent KV cache。</td>
+          <td>带 indexer 的 Sparse Flash Attention，MLA latent + top-k。</td>
+          <td>DSV4/DSA，SWA + compressed KV shared attention。</td>
+        </tr>
+        <tr>
+          <td>q 输入</td>
+          <td>直接 <code>[T,H,D]</code> query。</td>
+          <td><code>q_nope</code> + <code>q_pe</code>，或 padding 后拼接。</td>
+          <td><code>ql_nope</code> + <code>q_pe</code>；另有 indexer query <code>q_li</code>。</td>
+          <td>完整 <code>q=[T,H,D]</code>，partial RoPE 已原地应用。</td>
+        </tr>
+        <tr>
+          <td>KV cache 内容</td>
+          <td>完整 K cache + V cache。</td>
+          <td>latent KV / <code>k_nope</code> + <code>k_pe</code>。</td>
+          <td>latent KV + <code>k_pe</code> + indexer K/scale cache。</td>
+          <td>SWA KV + compressed KV + state cache + indexer cache。</td>
+        </tr>
+        <tr>
+          <td>主 attention 算子</td>
+          <td>FIA v1/v2 或 paged attention。</td>
+          <td>FIA v2 decode，FIA v1 prefill。</td>
+          <td>Sparse flash attention 或 KV-quant sparse flash attention。</td>
+          <td>Sparse shared-KV attention 或 KV-quant sparse shared-KV attention。</td>
+        </tr>
+        <tr>
+          <td>稀疏性来源</td>
+          <td>无；sliding-window 只由 mask/window 参数表达。</td>
+          <td>无；仍是完整 attention，但 KV 是 latent。</td>
+          <td>Lightning indexer top-k。</td>
+          <td>SWA window + compressed KV top-k/cmp ratio。</td>
+        </tr>
+        <tr>
+          <td>输出后处理</td>
+          <td>attention output 直接写 output buffer。</td>
+          <td>decode/prefill 输出需经过 <code>_v_up_proj</code> 和 <code>o_proj</code>。</td>
+          <td>sparse attention 输出 latent，先 <code>_v_up_proj</code> 再 <code>o_proj</code>。</td>
+          <td>shared-KV attention 输出进入 <code>_forward_o_proj</code>。</td>
+        </tr>
+        <tr>
+          <td>主要独立原因</td>
+          <td>完整 K/V schema 是 vLLM 标准 attention 基线。</td>
+          <td>MLA 的 latent/value-up-proj 改变了 KV cache 与 attention value 语义。</td>
+          <td>top-k sparse indexer 改变了 KV 访问集合和 cache 组成。</td>
+          <td>compressed KV 与 shared-KV metadata 改变了 attention 的数学结构。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Review 关注点</h2>
+    <ul>
+      <li>新增模型选择 backend 时，先确认模型的 KV cache 语义：完整 K/V、MLA latent、SFA sparse latent、还是 DSA compressed shared-KV。</li>
+      <li>修改 <code>slot_mapping</code>、<code>block_table</code>、<code>actual_seq_lengths*</code> 时，需要分别验证普通 FIA、MLA decode、SFA top-k、DSA shared-KV metadata。</li>
+      <li>量化路径不能只看 dtype：C8/FP8 往往同时改变 cache view、attention layout、scale cache 和 operator 参数。</li>
+      <li>MLAPO/prolog 属于性能融合路径，不是纯 attention 算子；它改变的是 attention 前的 q/kv/cache 准备方式。</li>
+      <li>SFA 与 DSA 都叫 sparse，但稀疏机制不同：SFA 是 sparse flash + top-k latent KV，DSA 是 shared-KV attention + SWA/compressed KV。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>源码索引</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>文件</th>
+          <th>关键位置</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>vllm_ascend/attention/attention_v1.py</code></td>
+          <td>backend/cache shape、FIA/PA/encoder attention、C8 attention、reshape/cache 写入。</td>
+        </tr>
+        <tr>
+          <td><code>vllm_ascend/attention/mla_v1.py</code></td>
+          <td>MLA metadata、<code>npu_kv_rmsnorm_rope_cache</code>、FIA v1/v2、MLAPO、chunked context。</td>
+        </tr>
+        <tr>
+          <td><code>vllm_ascend/attention/sfa_v1.py</code></td>
+          <td>SFA metadata、indexer pre/post process、sparse flash attention、C8 sparse branch、CP/DCP variants入口。</td>
+        </tr>
+        <tr>
+          <td><code>vllm_ascend/attention/dsa_v1.py</code></td>
+          <td>DSA metadata、compressor、lightning indexer、shared-KV sparse attention、A5/non-A5 cache helpers。</td>
+        </tr>
+        <tr>
+          <td><code>vllm_ascend/device/device_op.py</code></td>
+          <td><code>DeviceOperator</code> 对 reshape/cache、MLA/SFA preprocess、SFA sparse flash、DSA shared-KV 算子的封装。</td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="small">本报告基于当前工作区源码静态分析；未运行 NPU 端功能或性能测试。</p>
+  </section>
+</main>
+</body>
+</html>

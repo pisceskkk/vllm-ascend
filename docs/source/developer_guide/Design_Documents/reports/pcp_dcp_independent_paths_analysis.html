@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>vLLM Ascend PCP/DCP 独立路径代码分析报告</title>
+  <style>
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.6;margin:32px;color:#1f2937;background:#f8fafc}main{max-width:1180px;margin:auto;background:white;padding:32px;border-radius:14px;box-shadow:0 8px 28px rgba(15,23,42,.08)}h1,h2,h3{color:#0f172a}code{background:#eef2ff;padding:.1rem .35rem;border-radius:4px}.tag{display:inline-block;padding:.15rem .45rem;border-radius:999px;background:#dbeafe;color:#1d4ed8;font-size:.85em}.pcp{background:#fef3c7;color:#92400e}.dcp{background:#dcfce7;color:#166534}.both{background:#ede9fe;color:#5b21b6}table{width:100%;border-collapse:collapse;margin:1rem 0}th,td{border:1px solid #cbd5e1;padding:.65rem;vertical-align:top}th{background:#e2e8f0}.note{border-left:4px solid #3b82f6;background:#eff6ff;padding:1rem}.risk{border-left:4px solid #f97316;background:#fff7ed;padding:1rem}ul{padding-left:1.3rem}</style>
+</head>
+<body><main>
+<h1>vLLM Ascend PCP/DCP 独立于非 CP 路径的代码分析报告</h1>
+<p>本报告梳理 vLLM Ascend 中 PCP（Prefill Context Parallel）与 DCP（Decode Context Parallel）相对普通非 CP 路径产生独立逻辑的代码，并按“触发特性—差异原因—代码落点—风险/验证点”归类。</p>
+
+<h2>1. 总体结论</h2>
+<ul>
+  <li><span class="tag both">CP 共性</span> 独立路径的根因是 KV cache 从“每 TP rank 一份完整序列”变为按序列维度在 <code>pcp_size * dcp_size</code> 上分片，导致 block table、slot mapping、attention metadata、KV 传输和图捕获都必须理解 CP rank/interleave。</li>
+  <li><span class="tag pcp">PCP</span> 主要服务长序列 prefill 降 TTFT：需要对 query 做 head-tail 切分、padding、all-gather restore、非均匀 chunk 还原，因此在 model runner 和 attention prefill 路径引入大量独立元数据。</li>
+  <li><span class="tag dcp">DCP</span> 主要服务 decode 阶段 KV cache 去冗余：复用 TP 通信域，但 Q heads 在 DCP 组内不同，attention 结果需要跨 DCP 交换 output/LSE 并做在线 softmax 合并。</li>
+  <li>PCP 与 DCP 同时启用时，差异不是简单叠加：PCP 负责序列切分/还原，DCP 负责 head 维与 KV 分片通信，最终通过统一的 CP attention update、CP slot mapping 和 CP block table 组合起来。</li>
+</ul>
+
+<h2>2. 独立路径清单</h2>
+<table>
+<thead><tr><th>模块</th><th>代码落点</th><th>独立于非 CP 的逻辑</th><th>导致差异的特性/原因</th></tr></thead>
+<tbody>
+<tr><td>配置校验</td><td><code>vllm_ascend/platform.py</code>, <code>vllm_ascend/ascend_config.py</code></td><td>校验 PD/KV pool 场景中 <code>cp_kv_cache_interleave_size == block_size</code>；SFA 强制 block interleave；FlashComm1 下调整 batch token 对齐到 TP*PCP。</td><td>KV 传输和稀疏注意力需要块粒度分片以降低跨 rank 传输复杂度；FlashComm1/SP 的 collective 对 token 数有整除要求。</td></tr>
+<tr><td>通信域</td><td><code>vllm_ascend/distributed/parallel_state.py</code></td><td>rank layout 增加 PCP 维度；MC2、P/D TP all-to-all、EPLB/FlashComm 等 group 计算纳入 PCP 维。</td><td>PCP 引入额外设备维；DCP 复用 TP 但与 P/D disaggregation 的 head 重排耦合。</td></tr>
+<tr><td>PCP 输入调度</td><td><code>vllm_ascend/worker/pcp_utils.py</code>, <code>vllm_ascend/worker/v2/model_runner.py</code></td><td>维护 PCP padding、unpad mask、all-gather restore index、FA enter/exit index、sample slot mapping、多模态局部 schedule。</td><td>PCP 对 prefill query 进行 head-tail 切分，为负载均衡会改变 token 顺序；后续采样、logits、KV 写入必须恢复原请求顺序。</td></tr>
+<tr><td>Block table/slot mapping</td><td><code>vllm_ascend/worker/v2/block_table.py</code>, <code>vllm_ascend/worker/block_table.py</code>, <code>vllm_ascend/_310p/block_table.py</code></td><td>slot mapping 根据 <code>CP_SIZE</code>/<code>CP_INTERLEAVE</code>/<code>cp_rank</code> 判断 token 是否属于本 rank，不属于则写 PAD slot。</td><td>CP KV cache 分片后，本 rank 只持有虚拟 block 中的一部分 token；非 CP 路径可直接用 position 映射到本地 slot。</td></tr>
+<tr><td>Attention backend</td><td><code>vllm_ascend/attention/context_parallel/*.py</code></td><td>单独的 CP metadata builder、attention impl、MLA/SFA CP 实现；对 output/LSE 做 all-to-all/all-gather 后调用 NPU attention update。</td><td>本地 KV 只覆盖序列片段，局部 attention 结果必须用 LSE 合并成全局 attention 结果；不同后端（FA/MLA/SFA）需要不同索引与 mask。</td></tr>
+<tr><td>Chunked prefill/APC</td><td><code>attention_cp.py</code>, <code>pcp_utils.py</code></td><td>记录每个 request 在 PCP/DCP rank 上的 local context length，构造 chunk mask、KV recover/inverse index。</td><td>chunked prefill 和 prefix caching 使“已计算上下文”和“本次 query”混合，CP 下上下文也被分片，必须按 rank 重新拼接/恢复。</td></tr>
+<tr><td>Spec decode/MTP/EAGLE</td><td><code>vllm_ascend/spec_decode/llm_base_proposer.py</code>, <code>platform.py</code></td><td>草稿模型 DCP 合法性校验；spec decode slot mapping、block table clone、long sequence metadata 冻结/传递。</td><td>spec decode 的一次 decode query 长度变为 <code>1 + num_speculative_tokens</code>，CP 下 draft/target 的 KV layout 和 slot mapping 必须一致。</td></tr>
+<tr><td>KV transfer / PD / Mooncake / KV pool</td><td><code>vllm_ascend/distributed/kv_transfer/**</code></td><td>CP block/interleave 参与 KV send/recv、connector metadata、pool scheduler 和 ascend store 配置。</td><td>P/D 分离时 KV 在不同实例间传输，token-interleave 会显著复杂化远端恢复，因此 CP 场景要求 block interleave。</td></tr>
+<tr><td>ACL Graph</td><td><code>vllm_ascend/utils.py</code>, <code>attention_cp.py</code>, <code>spec_decode/llm_base_proposer.py</code></td><td>CP 场景减少可捕获 batch size；CP metadata/workspace 纳入图参数；spec decode CP 下更新 draft graph 参数。</td><td>PCP/DCP 引入 HCCL collective、额外 workspace 和动态索引，图数量/资源预算与非 CP 不同。</td></tr>
+<tr><td>算子适配</td><td><code>vllm_ascend/ops/triton/fla/chunk.py</code>, <code>ops/gdn.py</code>, <code>ops/fused_moe/prepare_finalize.py</code></td><td>部分 FLA/GDN/MoE prepare-finalize 根据 PCP group 或 CP metadata 分支处理。</td><td>混合 attention、状态空间/线性 attention 或 MoE dispatch 的 token layout 依赖调度顺序，PCP 改写 token layout 后需适配。</td></tr>
+</tbody></table>
+
+<h2>3. 关键差异机制</h2>
+<h3>3.1 KV cache 分片与 slot mapping</h3>
+<p>普通路径中 position 可直接定位到本地 block 的 slot；CP 路径先把 block 扩展为虚拟 block，按 <code>cp_kv_cache_interleave_size</code> 在 <code>cp_size</code> 个 rank 间交错。实现上，slot kernel 对每个 token 计算 <code>block_offsets // CP_INTERLEAVE % CP_SIZE == cp_rank</code>，只有本 rank token 才写本地 slot，否则写 PAD。这是所有 CP 差异的底层基础。</p>
+
+<h3>3.2 PCP：prefill query 切分、padding 和顺序恢复</h3>
+<p>PCP 为了让长 prefill 在多卡上均衡，把序列切成 <code>2*pcp_size</code> 份后首尾配对。这样会改变 token 顺序，并可能引入 padding。独立的 <code>PCPManager</code> 因此维护 restore index、scatter index、unpad mask、sample slot mapping、query lens full buffer 和混合 attention 标记。非 CP 路径没有这些元数据，因为非 CP token 顺序就是调度顺序。</p>
+
+<h3>3.3 DCP：decode KV 去冗余与 output/LSE 合并</h3>
+<p>DCP 复用 TP 域。由于 DCP group 内 Q head 分布不同而 KV cache 又按序列切分，本地 attention 只能得到局部上下文上的 output/LSE。CP common 路径先把 output 与 LSE 拼接，DCP 用 all-to-all 交换，PCP 再按需 all-gather，最终用 NPU attention update 按 LSE 执行在线 softmax 合并。</p>
+
+<h3>3.4 Chunked prefill 与 Prefix Cache</h3>
+<p>当开启 chunked prefill 或 APC 时，一个请求可同时包含 decode token、已缓存 context 和本轮 prefill query。CP 路径必须知道每个 PCP/DCP rank 上的 local context length，并为 chunked request 构造过滤 mask、local starts、KV recover index；否则局部 KV 与 query 的因果 mask 会错位。</p>
+
+<h3>3.5 Speculative decoding</h3>
+<p>Spec decode 把 decode query 从 1 个 token 扩展为多个草稿 token，放大了 CP slot mapping 与 block table 的一致性要求。Ascend 为 DCP 校验 draft TP/DCP 的 head 可整除关系，并在 proposer 中为 CP 分配更长的 slot mapping buffer、复制 block table、传递 long sequence metadata。</p>
+
+<h3>3.6 PD/KV transfer 与 block interleave 约束</h3>
+<p>KV transfer、KV pool、Mooncake 等场景需要跨进程/跨节点搬运 KV。若 CP 使用 token interleave，远端需要按 token 粒度重组 KV，复杂且低效；因此平台校验要求 CP 场景中 <code>cp_kv_cache_interleave_size</code> 与 <code>block_size</code> 相等，SFA 也会自动覆盖为 block interleave。</p>
+
+<h2>4. 代码级风险点与建议</h2>
+<ul>
+  <li><strong>CPU/NPU 同步：</strong> CP metadata builder 中仍有 <code>.item()</code> 与 CPU fallback；热路径应优先依赖 CPU mirror，避免 AsyncScheduler 被 D2H 同步阻塞。</li>
+  <li><strong>索引一致性：</strong> PCP 的 restore/scatter/unpad、chunk recover index、spec decode slot mapping 必须随 query layout 同步更新，新增 feature 时应先确认 token 顺序是否被 PCP 改写。</li>
+  <li><strong>通信域组合：</strong> PCP、DCP、TP、PP、DP、EP、P/D disaggregation 共同出现时，group rank layout 是正确性的第一前提，相关变更必须覆盖多维组合测试。</li>
+  <li><strong>后端一致性：</strong> FA、MLA、SFA、GDN/FLA 等后端各自有 CP 专用分支；新增 attention backend 不应只复用非 CP builder，应显式实现或声明不支持 CP。</li>
+  <li><strong>图捕获资源：</strong> CP 引入 collective 和额外 workspace，ACL Graph capture sizes 需要保守预算；spec decode + PCP/DCP + full/piecewise graph 是高风险组合。</li>
+</ul>
+
+<h2>5. 建议验证矩阵</h2>
+<table><thead><tr><th>场景</th><th>建议验证</th><th>关注点</th></tr></thead><tbody>
+<tr><td>PCP only</td><td>长 prefill accuracy、TTFT、padding/unpadding 后 logits 对齐</td><td>head-tail 切分和 restore index</td></tr>
+<tr><td>DCP only</td><td>decode accuracy、batch throughput、GQA/MQA head 组合</td><td>Q all-gather/all-to-all 与 LSE update</td></tr>
+<tr><td>PCP + DCP</td><td>长上下文 prefill+decode、一致性对比非 CP</td><td>PCP 序列维 + DCP head/TP 域组合</td></tr>
+<tr><td>CP + chunked prefill/APC</td><td>缓存命中、chunk 边界、混合 decode/prefill batch</td><td>local context lens、chunk mask、KV recover</td></tr>
+<tr><td>CP + spec decode/MTP</td><td>EAGLE/MTP accuracy、草稿模型 TP/DCP 配置</td><td>draft/target block table 与 slot mapping</td></tr>
+<tr><td>CP + PD/KV transfer</td><td>Mooncake/Ascend Store send-recv、KV pool</td><td>block interleave、远端 KV 恢复</td></tr>
+<tr><td>CP + ACL Graph</td><td>piecewise/full graph capture 与 replay</td><td>图数量预算、collective workspace</td></tr>
+</tbody></table>
+
+<h2>6. 快速定位索引</h2>
+<ul>
+  <li>设计文档：<code>docs/source/developer_guide/Design_Documents/context_parallel.md</code></li>
+  <li>用户入口：<code>docs/source/user_guide/feature_guide/context_parallel.md</code></li>
+  <li>配置约束：<code>vllm_ascend/platform.py</code>、<code>vllm_ascend/ascend_config.py</code></li>
+  <li>通信域：<code>vllm_ascend/distributed/parallel_state.py</code></li>
+  <li>PCP 调度：<code>vllm_ascend/worker/pcp_utils.py</code></li>
+  <li>Block table：<code>vllm_ascend/worker/v2/block_table.py</code>、<code>vllm_ascend/worker/block_table.py</code>、<code>vllm_ascend/_310p/block_table.py</code></li>
+  <li>Attention CP：<code>vllm_ascend/attention/context_parallel/common_cp.py</code>、<code>attention_cp.py</code>、<code>mla_cp.py</code>、<code>sfa_cp.py</code></li>
+  <li>Spec decode：<code>vllm_ascend/spec_decode/llm_base_proposer.py</code></li>
+  <li>KV transfer：<code>vllm_ascend/distributed/kv_transfer/</code></li>
+</ul>
+
+<p class="note">结论：PCP/DCP 不是单一 attention 优化，而是一组围绕“序列维分片 KV cache”和“长序列/解码通信合并”的端到端路径。新增或修改与 token layout、KV 写入、attention metadata、采样、KV 传输、图捕获相关的功能时，都需要显式审视 CP 路径。</p>
+</main></body></html>
