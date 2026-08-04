@@ -710,6 +710,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         **kwargs,
     ):
         self.vllm_config = get_current_vllm_config()
+        self.kvpp_context = None
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -1660,6 +1661,12 @@ class AscendMLAImpl(MLAAttentionImpl):
         prefill_preprocess_res = None
         if has_prefill:
             wait_for_kv_layer_from_connector(layer_name)
+        if self.kvpp_context is not None and (has_decode or has_prefill):
+            # Q/KV projections above run on the compute stream while the
+            # active historical pages are pushed on KVPP's communication
+            # stream. Cache writes wait only at the first point that consumes
+            # the cache.
+            self.kvpp_context.wait_for_current_layer(layer_name)
         # Preprocess for decode tokens
         if has_decode:
             decode_preprocess_res = self.mla_preprocess_decode(q_c, kv_no_split, kv_cache, attn_metadata)
@@ -1720,6 +1727,10 @@ class AscendMLAImpl(MLAAttentionImpl):
         )
 
         num_decode_tokens = attn_metadata.num_decode_tokens
+        if self.kvpp_context is not None and (
+            attn_metadata.num_decodes > 0 or attn_metadata.num_prefills > 0
+        ):
+            kv_cache = self.kvpp_context.begin_layer(layer_name, kv_cache)
         # Inputs and outputs may be padded for CUDA graphs
         output_padded = output
         o_proj_input_shape = (_EXTRA_CTX.num_tokens, self.num_heads * self.v_head_dim)
@@ -1732,6 +1743,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                 hidden_states.contiguous(), need_gather_q_kv
             )
+            if self.kvpp_context is not None:
+                self.kvpp_context.wait_for_current_layer(layer_name)
             decode_preprocess_res, prefill_preprocess_res = DeviceOperator.mla_preprocess_only_decode(
                 self, hidden_states, kv_cache, attn_metadata
             )

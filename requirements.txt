@@ -31,7 +31,7 @@ quart
 numba
 
 # Required for kvpool supports memcache backend
-memfabric_hybrid
+memfabric_hybrid>=1.2.0
 memcache_hybrid
 
 arctic-inference==0.1.1

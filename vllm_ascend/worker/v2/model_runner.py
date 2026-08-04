@@ -18,11 +18,13 @@
 #
 
 from contextlib import contextmanager
+from typing import Any
 
 import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.distributed import get_kvpp_group
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import model_runner as vllm_model_runner
@@ -49,6 +51,7 @@ from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
+from vllm_ascend.worker.v2.kvpp import KVPPContext
 from vllm_ascend.worker.v2.pcp_manager import maybe_build_ascend_pcp_manager
 from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
@@ -62,6 +65,9 @@ class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
+        self.kvpp_size = vllm_config.parallel_config.kvpp_size
+        self.kvpp_context: KVPPContext | None = None
+        self._kvpp_kv_caches: dict[str, Any] | None = None
         # The following features are not yet supported in Ascend NPU model runner v2:
         # - Dynamic EPLB
         if self.ascend_config.eplb_config.dynamic_eplb:
@@ -129,6 +135,12 @@ class NPUModelRunner(GPUModelRunner):
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.decode_query_len)
         set_mc2_mask(vllm_config, self.device)
 
+    def _on_kv_caches_initialized(self, kv_caches_dict: dict[str, Any]) -> None:
+        # Retain the layer mapping only through MemFabric registration. Keeping
+        # it longer would add tensor references that interfere with cache sleep.
+        if self.kvpp_size > 1:
+            self._kvpp_kv_caches = kv_caches_dict
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with graph_manager_wrapper(self):
             super().initialize_kv_cache(kv_cache_config)
@@ -142,6 +154,76 @@ class NPUModelRunner(GPUModelRunner):
                 self.req_states,
                 self.block_tables,
             )
+
+        if self.kvpp_size <= 1:
+            return
+
+        layer_owners = self.kv_cache_config.kvpp_layer_owners
+        if layer_owners is None:
+            raise RuntimeError("KVPP cache placement is missing from KVCacheConfig.")
+
+        kvpp_group = get_kvpp_group()
+        if self.kv_cache_config.kvpp_rank != kvpp_group.rank_in_group:
+            raise RuntimeError(
+                "KVPP cache placement rank does not match the worker's "
+                f"communication rank: config={self.kv_cache_config.kvpp_rank}, "
+                f"group={kvpp_group.rank_in_group}."
+            )
+
+        if len(self.kv_cache_config.kv_cache_groups) != 1:
+            raise RuntimeError("KVPP currently requires exactly one KV cache group.")
+        # Block tables index kernel blocks. Transport descriptors must use that
+        # same address space when one external block expands to multiple blocks.
+        blocks_per_kv_block = self.block_tables.blocks_per_kv_block[0]
+        num_kernel_blocks = self.kv_cache_config.num_blocks * blocks_per_kv_block
+        block_size = self.block_tables.kernel_block_sizes[0]
+        kvpp_context = KVPPContext(
+            kvpp_group,
+            layer_owners,
+            num_blocks=num_kernel_blocks,
+            block_size=block_size,
+        )
+        if self._kvpp_kv_caches is None:
+            raise RuntimeError("KVPP cache tensors were not retained during allocation.")
+        kvpp_context.initialize_transport(self._kvpp_kv_caches)
+        self._kvpp_kv_caches = None
+        self.kvpp_context = kvpp_context
+        for layer_name, module in self.compilation_config.static_forward_context.items():
+            if layer_name not in layer_owners:
+                continue
+            impl = getattr(module, "impl", None)
+            if impl is None:
+                raise RuntimeError(f"KVPP layer {layer_name} does not expose an attention impl.")
+            impl.kvpp_context = kvpp_context
+
+    def prepare_attn(
+        self, input_batch: AscendInputBatch
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        block_tables, slot_mappings = super().prepare_attn(input_batch)
+        if self.kvpp_context is not None:
+            if len(block_tables) != 1:
+                raise RuntimeError("KVPP received an unexpected KV cache group.")
+            # MemFabric consumes the same physical page IDs already gathered
+            # for attention. No KVPP-specific block table or slot mapping is
+            # constructed.
+            self.kvpp_context.prepare_batch(
+                block_tables[0],
+                input_batch.seq_lens_np[: input_batch.num_reqs],
+            )
+        return block_tables, slot_mappings
+
+    def prepare_dummy_attn(
+        self, input_batch: AscendInputBatch
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        block_tables, slot_mappings = super().prepare_dummy_attn(input_batch)
+        if self.kvpp_context is not None:
+            if len(block_tables) != 1:
+                raise RuntimeError("KVPP received an unexpected KV cache group.")
+            self.kvpp_context.prepare_batch(
+                block_tables[0],
+                input_batch.seq_lens_np[: input_batch.num_reqs],
+            )
+        return block_tables, slot_mappings
 
     @torch.inference_mode()
     def profile_run(self) -> None:

@@ -951,10 +951,11 @@ class NPUWorker(WorkerBase):
             self.parallel_config.world_size, self.rank, self.distributed_init_method, self.local_rank, "hccl"
         )
         ensure_model_parallel_initialized(
-            self.parallel_config.tensor_parallel_size,
-            self.parallel_config.pipeline_parallel_size,
-            self.parallel_config.prefill_context_parallel_size,
-            self.parallel_config.decode_context_parallel_size,
+            tensor_model_parallel_size=self.parallel_config.tensor_parallel_size,
+            pipeline_model_parallel_size=self.parallel_config.pipeline_parallel_size,
+            prefill_context_model_parallel_size=(self.parallel_config.prefill_context_parallel_size),
+            decode_context_model_parallel_size=(self.parallel_config.decode_context_parallel_size),
+            kvpp_model_parallel_size=self.parallel_config.kvpp_size,
         )
         init_ascend_model_parallel(self.parallel_config)
         ensure_ec_transfer_initialized(self.vllm_config)
