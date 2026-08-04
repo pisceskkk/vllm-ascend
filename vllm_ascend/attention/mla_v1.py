@@ -1781,6 +1781,11 @@ class AscendMLAImpl(MLAAttentionImpl):
             )
 
             o_proj_input[num_decode_tokens:num_actual_tokens] = output_prefill
+        if self.kvpp_context is not None:
+            # Historical KV is no longer consumed after the attention kernels
+            # above. previous_layer mode can safely reuse the aliased scratch
+            # now and overlap the next layer's page push with o_proj and MoE.
+            self.kvpp_context.finish_layer_attention(layer_name)
         # O proj
         output[...] = self.o_proj(o_proj_input, is_prefill=prefill_preprocess_res is not None)[0]
 

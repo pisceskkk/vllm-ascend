@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_transport import (
@@ -113,3 +114,41 @@ def test_owner_uses_persistent_cache():
 
     assert returned is cache
     context.wait_for_current_layer("layer")
+
+
+def test_previous_layer_mode_prefetches_layers_in_forward_order():
+    group = SimpleNamespace(rank_in_group=0, world_size=1)
+    context = KVPPContext(
+        group=group,
+        layer_owners={"layer.0": 0, "layer.1": 0},
+        num_blocks=10,
+        block_size=4,
+        transport=SimpleNamespace(),
+        overlap_mode="previous_layer",
+    )
+    block_table = torch.tensor([[7, 2]], dtype=torch.int32)
+    cache = (torch.zeros((10, 4, 1)),)
+    context.prepare_batch(block_table, torch.tensor([5]))
+
+    context.begin_layer("layer.0", cache)
+    context.wait_for_current_layer("layer.0")
+    context.finish_layer_attention("layer.0")
+
+    assert context._pending_layer == "layer.1"
+    context.begin_layer("layer.1", cache)
+    context.wait_for_current_layer("layer.1")
+    context.finish_layer_attention("layer.1")
+    assert context._pending_layer is None
+
+
+def test_invalid_overlap_mode_is_rejected():
+    group = SimpleNamespace(rank_in_group=0, world_size=1)
+
+    with pytest.raises(ValueError, match="ASCEND_KVPP_OVERLAP_MODE"):
+        KVPPContext(
+            group=group,
+            layer_owners={"layer": 0},
+            num_blocks=10,
+            block_size=4,
+            overlap_mode="invalid",
+        )
