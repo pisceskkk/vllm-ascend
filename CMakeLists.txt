@@ -92,7 +92,7 @@ find_path(MEMFABRIC_MTE_INCLUDE_DIR
 if(NOT (SOC_VERSION MATCHES "ascend310p.*|ascend950") AND
    MEMFABRIC_MTE_INCLUDE_DIR)
     message(STATUS "MemFabric Hybrid MTE: enabled from ${MEMFABRIC_MTE_INCLUDE_DIR}")
-    target_include_directories(vllm_ascend_kernels PRIVATE
+    ascendc_include_directories(vllm_ascend_kernels PRIVATE
         "${MEMFABRIC_MTE_INCLUDE_DIR}")
     set(VLLM_ASCEND_ENABLE_MEMFABRIC_MTE ON)
 else()

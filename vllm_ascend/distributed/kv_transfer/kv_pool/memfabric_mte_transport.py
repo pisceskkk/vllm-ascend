@@ -122,6 +122,11 @@ class MemFabricMTEKVPPTransport:
                 ) from exc
             self._shm_module = shm
         if self._copy_op is None:
+            # vllm-ascend loads its native extension lazily to avoid early RTS
+            # initialization. KVPP needs the operator during cache setup, so
+            # trigger that load before querying the dispatcher namespace.
+            import vllm_ascend.vllm_ascend_C  # type: ignore # noqa: F401
+
             namespace = getattr(torch.ops, "_C_ascend", None)
             self._copy_op = getattr(namespace, "kvpp_mte_copy", None)
             if self._copy_op is None:
