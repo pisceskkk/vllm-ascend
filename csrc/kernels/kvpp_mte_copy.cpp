@@ -20,6 +20,8 @@ extern "C" __global__ __aicore__ void kvpp_mte_copy_bytes(
     AscendC::TBuf<AscendC::QuePosition::VECCALC> buffer;
     pipe.InitBuffer(buffer, KVPP_MTE_TILE_BYTES);
     AscendC::LocalTensor<uint8_t> local = buffer.Get<uint8_t>();
+    __ubuf__ uint8_t* local_address =
+        (__ubuf__ uint8_t*)local.GetPhyAddr();
 
     uint64_t offset = 0;
     while (offset < length) {
@@ -27,12 +29,12 @@ extern "C" __global__ __aicore__ void kvpp_mte_copy_bytes(
             (length - offset) > KVPP_MTE_TILE_BYTES
                 ? KVPP_MTE_TILE_BYTES
                 : (length - offset));
-        smem_shm_copy_gm2ub<uint8_t>(local.GetPhyAddr(), source + offset,
+        smem_shm_copy_gm2ub<uint8_t>(local_address, source + offset,
                                      bytes, false);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(KVPP_MTE_EVENT_ID);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(KVPP_MTE_EVENT_ID);
         smem_shm_copy_ub2gm<uint8_t>(destination + offset,
-                                     local.GetPhyAddr(), bytes, false);
+                                     local_address, bytes, false);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(KVPP_MTE_EVENT_ID);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(KVPP_MTE_EVENT_ID);
         offset += bytes;
