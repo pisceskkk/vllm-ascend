@@ -3,6 +3,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_mte_transport import (
+    KVPPMTEPeerMetadata,
+    MemFabricMTEKVPPTransport,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_sdma_transport import (
     KVPPPeerMetadata,
     MemFabricSDMAKVPPTransport,
@@ -123,6 +127,9 @@ def test_transport_factory_accepts_registered_mte_backend(monkeypatch):
         def push_active_pages(self, layer_name, pages, stream):
             pass
 
+        def receive_active_pages(self, layer_name, pages, stream):
+            pass
+
         def close(self):
             pass
 
@@ -142,8 +149,72 @@ def test_unavailable_transport_has_actionable_error(monkeypatch):
 
     with pytest.raises(RuntimeError, match="ASCEND_KVPP_TRANSPORT_CLASS"):
         create_kvpp_transport(
-            SimpleNamespace(), {"layer": 0}, num_blocks=10, backend="mte"
+            SimpleNamespace(), {"layer": 0}, num_blocks=10, backend="unknown"
         )
+
+
+def test_mte_owner_stages_and_consumer_unpacks_same_active_pages(monkeypatch):
+    class FakeEvent:
+        def record(self, stream):
+            self.stream = stream
+
+        def synchronize(self):
+            pass
+
+    monkeypatch.setattr(torch.npu, "Event", FakeEvent)
+    calls = []
+
+    def copy_op(anchor, sources, destinations, lengths):
+        calls.append(
+            (
+                anchor,
+                tuple(sources.tolist()),
+                tuple(destinations.tolist()),
+                tuple(lengths.tolist()),
+            )
+        )
+
+    stream = SimpleNamespace()
+    owner_anchor = torch.empty(1)
+    owner = MemFabricMTEKVPPTransport(
+        SimpleNamespace(rank_in_group=0, world_size=2),
+        {"layer": 0},
+        10,
+        copy_op=copy_op,
+    )
+    owner._layers = {"layer": (KVPPBufferMetadata(2000, 16, 16),)}
+    owner._anchors = {"layer": owner_anchor}
+    owner._local_metadata = KVPPMTEPeerMetadata(8000, 1024)
+    owner._peer_metadata = [
+        owner._local_metadata,
+        KVPPMTEPeerMetadata(10000, 1024),
+    ]
+
+    owner.push_active_pages("layer", (2, 3, 7), stream)
+    assert calls == [
+        (owner_anchor, (2032, 2112), (10000, 10032), (32, 16))
+    ]
+
+    calls.clear()
+    consumer_anchor = torch.empty(1)
+    consumer = MemFabricMTEKVPPTransport(
+        SimpleNamespace(rank_in_group=1, world_size=2),
+        {"layer": 0},
+        10,
+        copy_op=copy_op,
+    )
+    consumer._layers = {"layer": (KVPPBufferMetadata(1000, 16, 16),)}
+    consumer._anchors = {"layer": consumer_anchor}
+    consumer._local_metadata = KVPPMTEPeerMetadata(10000, 1024)
+    consumer._peer_metadata = [
+        KVPPMTEPeerMetadata(8000, 1024),
+        consumer._local_metadata,
+    ]
+
+    consumer.receive_active_pages("layer", (2, 3, 7), stream)
+    assert calls == [
+        (consumer_anchor, (10000, 10032), (1032, 1112), (32, 16))
+    ]
 
 
 def test_owner_uses_persistent_cache():

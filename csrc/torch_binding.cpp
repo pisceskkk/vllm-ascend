@@ -242,6 +242,48 @@ void swap_blocks_batch(const torch::Tensor& src_ptrs,
     }
 }
 
+#ifdef VLLM_ASCEND_ENABLE_MEMFABRIC_MTE
+void kvpp_mte_copy(const torch::Tensor& anchor,
+                   const torch::Tensor& source_addrs,
+                   const torch::Tensor& destination_addrs,
+                   const torch::Tensor& lengths)
+{
+    TORCH_CHECK(anchor.is_privateuseone(), "anchor must be an NPU tensor");
+    TORCH_CHECK(source_addrs.device().is_cpu(),
+                "source_addrs must be on CPU");
+    TORCH_CHECK(destination_addrs.device().is_cpu(),
+                "destination_addrs must be on CPU");
+    TORCH_CHECK(lengths.device().is_cpu(), "lengths must be on CPU");
+    TORCH_CHECK(source_addrs.dtype() == torch::kInt64,
+                "source_addrs must be int64");
+    TORCH_CHECK(destination_addrs.dtype() == torch::kInt64,
+                "destination_addrs must be int64");
+    TORCH_CHECK(lengths.dtype() == torch::kInt64, "lengths must be int64");
+    TORCH_CHECK(source_addrs.dim() == 1 && destination_addrs.dim() == 1 &&
+                    lengths.dim() == 1,
+                "KVPP MTE descriptors must be one-dimensional");
+    const int64_t count = source_addrs.numel();
+    TORCH_CHECK(destination_addrs.numel() == count && lengths.numel() == count,
+                "KVPP MTE descriptor lengths must match");
+
+    const c10_npu::OptionalNPUGuard npu_guard(anchor.device());
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    const int64_t* sources = source_addrs.data_ptr<int64_t>();
+    const int64_t* destinations = destination_addrs.data_ptr<int64_t>();
+    const int64_t* sizes = lengths.data_ptr<int64_t>();
+    for (int64_t index = 0; index < count; ++index) {
+        TORCH_CHECK(sources[index] != 0 && destinations[index] != 0,
+                    "KVPP MTE addresses must be nonzero at descriptor ", index);
+        TORCH_CHECK(sizes[index] > 0,
+                    "KVPP MTE length must be positive at descriptor ", index);
+        kvpp_mte_copy_impl(stream,
+                           reinterpret_cast<void*>(sources[index]),
+                           reinterpret_cast<void*>(destinations[index]),
+                           static_cast<uint64_t>(sizes[index]));
+    }
+}
+#endif
+
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
 // Direct kernel wrappers depend on vllm_ascend_kernels, which is skipped on
 // 310P and A5 builds.
@@ -2126,6 +2168,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
     // Direct kernel custom ops
+#ifdef VLLM_ASCEND_ENABLE_MEMFABRIC_MTE
+    ops.def(
+        "kvpp_mte_copy(Tensor anchor, Tensor source_addrs, "
+        "Tensor destination_addrs, Tensor lengths) -> ()");
+    ops.impl("kvpp_mte_copy", torch::kPrivateUse1,
+             &vllm_ascend::kvpp_mte_copy);
+#endif
+
     ops.def("bgmv_shrink(Tensor! x, Tensor! weight, Tensor! indices, Tensor! y, float scale) -> ()");
     ops.impl("bgmv_shrink", torch::kPrivateUse1, &vllm_ascend::bgmv_shrink);
 

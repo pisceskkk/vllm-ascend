@@ -184,6 +184,19 @@ class KVPPTransport(Protocol):
     ) -> KVPPCompletion:
         """Enqueue selected pages and return remote-visible completion."""
 
+    def receive_active_pages(
+        self,
+        layer_name: str,
+        pages: tuple[int, ...],
+        stream: Any,
+    ) -> KVPPCompletion:
+        """Materialize remotely pushed pages in the local scratch cache.
+
+        Direct transports such as SDMA return an already-complete local event.
+        Staged transports use this hook to unpack their backend-owned receive
+        buffer into the original physical page IDs.
+        """
+
     def close(self) -> None:
         """Release backend-owned sessions and memory metadata."""
 
@@ -229,6 +242,18 @@ def _sdma_factory(
     return MemFabricSDMAKVPPTransport(group, layer_owners, num_blocks)
 
 
+def _mte_factory(
+    group: GroupCoordinator,
+    layer_owners: dict[str, int],
+    num_blocks: int,
+) -> KVPPTransport:
+    from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_mte_transport import (
+        MemFabricMTEKVPPTransport,
+    )
+
+    return MemFabricMTEKVPPTransport(group, layer_owners, num_blocks)
+
+
 def create_kvpp_transport(
     group: GroupCoordinator,
     layer_owners: dict[str, int],
@@ -237,10 +262,9 @@ def create_kvpp_transport(
 ) -> KVPPTransport:
     """Create the selected KVPP data plane.
 
-    ``sdma`` is built in.  An MTE implementation can either call
-    :func:`register_kvpp_transport` during optional-module initialization or be
-    selected explicitly with ``ASCEND_KVPP_TRANSPORT_CLASS=module:attribute``.
-    The latter keeps experimental MTE operator bindings outside the scheduler.
+    ``sdma`` and ``mte`` are built in. Out-of-tree implementations can call
+    :func:`register_kvpp_transport` or use
+    ``ASCEND_KVPP_TRANSPORT_CLASS=module:attribute``.
     """
     name = (
         backend
@@ -253,6 +277,8 @@ def create_kvpp_transport(
         factory = _load_transport_factory(class_path)
     elif name == "sdma":
         factory = _sdma_factory
+    elif name == "mte":
+        factory = _mte_factory
     else:
         factory = _TRANSPORT_FACTORIES.get(name)
         if factory is None:
@@ -266,7 +292,7 @@ def create_kvpp_transport(
     if not isinstance(transport, KVPPTransport):
         raise TypeError(
             f"KVPP transport {name!r} must implement initialize(), "
-            "push_active_pages(), and close()."
+            "push_active_pages(), receive_active_pages(), and close()."
         )
     logger.info(
         "KVPP transport selected: backend=%s, implementation=%s.%s",

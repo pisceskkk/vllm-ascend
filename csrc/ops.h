@@ -24,6 +24,14 @@
 #include "torch_npu/csrc/aten/common/from_blob.h"
 
 namespace vllm_ascend {
+#ifdef VLLM_ASCEND_ENABLE_MEMFABRIC_MTE
+    extern void kvpp_mte_copy_impl(
+        void* stream,
+        void* source,
+        void* destination,
+        uint64_t length);
+#endif
+
   extern void bgmv_shrink_impl(
         AscendType type,
         void *stream,

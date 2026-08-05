@@ -291,6 +291,15 @@ class MemFabricSDMAKVPPTransport:
 
         return MemFabricSDMACompletion.record(stream)
 
+    def receive_active_pages(
+        self,
+        layer_name: str,
+        pages: tuple[int, ...],
+        stream: Any,
+    ) -> KVPPCompletion:
+        """SDMA writes directly into scratch, so no receive-side unpack exists."""
+        return MemFabricSDMACompletion.record(stream)
+
     def close(self) -> None:
         """Drop backend metadata and TransferEngine references.
 

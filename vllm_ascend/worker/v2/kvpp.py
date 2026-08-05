@@ -162,9 +162,9 @@ class KVPPContext:
             current_stream.synchronize()
             dist.barrier(group=self.group.cpu_group)
 
+        if self._comm_stream is None:
+            self._comm_stream = torch.npu.Stream()
         if owner_rank == self.group.rank_in_group:
-            if self._comm_stream is None:
-                self._comm_stream = torch.npu.Stream()
             with torch.npu.stream(self._comm_stream):
                 self._transfer_completion = self.transport.push_active_pages(
                     layer_name, self._selected_pages, self._comm_stream
@@ -201,6 +201,16 @@ class KVPPContext:
                     # rendezvous: the backend must confirm remote visibility.
                     self._transfer_completion.wait()
                 dist.barrier(group=self.group.cpu_group)
+                assert self._comm_stream is not None
+                assert self._selected_pages is not None
+                with torch.npu.stream(self._comm_stream):
+                    receive_completion = self.transport.receive_active_pages(
+                        layer_name, self._selected_pages, self._comm_stream
+                    )
+                # SDMA records an immediate event because its push targets the
+                # final scratch addresses. MTE waits here for receive-side
+                # staging unpack before this rank enters attention.
+                receive_completion.wait()
         self._transfer_submitted = False
         self._transfer_completion = None
         self._current_layer = None
@@ -301,6 +311,16 @@ class KVPPContext:
                         group=self.group.cpu_group,
                         tag=done_tag,
                     )
+                with torch.profiler.record_function(
+                    f"kvpp.transport_receive.layer_{layer_index}"
+                ):
+                    with torch.npu.stream(self._comm_stream):
+                        receive_completion = (
+                            self.transport.receive_active_pages(
+                                layer_name, pages, self._comm_stream
+                            )
+                        )
+                    receive_completion.wait()
                 return
 
             with torch.profiler.record_function(

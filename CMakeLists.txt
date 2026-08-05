@@ -74,9 +74,25 @@ endif()
 if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
     message(STATUS "Hardware ${SOC_VERSION} detected: skip vllm_ascend_kernels compile")
 else()
-    ascendc_library(vllm_ascend_kernels SHARED
+ascendc_library(vllm_ascend_kernels SHARED
         ${VLLM_ASCEND_CUSTOM_OP}
     )
+endif()
+
+# MemFabric Hybrid exposes the MTE data plane only as an AscendC device API.
+# Build the optional KVPP kernel when the serving image has its headers; normal
+# community builds remain independent of MemFabric.
+set(MEMFABRIC_HYBRID_HOME_PATH "$ENV{MEMFABRIC_HYBRID_HOME_PATH}")
+set(MEMFABRIC_MTE_HEADER
+    "${MEMFABRIC_HYBRID_HOME_PATH}/include/smem/device/smem_shm_aicore_base_api.h")
+if(NOT (SOC_VERSION MATCHES "ascend310p.*|ascend950") AND
+   EXISTS "${MEMFABRIC_MTE_HEADER}")
+    message(STATUS "MemFabric Hybrid MTE: enabled from ${MEMFABRIC_HYBRID_HOME_PATH}")
+    target_include_directories(vllm_ascend_kernels PRIVATE
+        "${MEMFABRIC_HYBRID_HOME_PATH}/include")
+    set(VLLM_ASCEND_ENABLE_MEMFABRIC_MTE ON)
+else()
+    message(STATUS "MemFabric Hybrid MTE: disabled (device header not found)")
 endif()
 
 message("TORCH_NPU_PATH is ${TORCH_NPU_PATH}")
@@ -158,6 +174,11 @@ endif()
 
 if(NOT (SOC_VERSION MATCHES "ascend310p.*|ascend950"))
     target_compile_definitions(vllm_ascend_C PRIVATE -DVLLM_ENABLE_ATB_AND_DIRECT_KERNELS)
+endif()
+
+if(VLLM_ASCEND_ENABLE_MEMFABRIC_MTE)
+    target_compile_definitions(vllm_ascend_C PRIVATE
+        -DVLLM_ASCEND_ENABLE_MEMFABRIC_MTE)
 endif()
 
 target_link_directories(
