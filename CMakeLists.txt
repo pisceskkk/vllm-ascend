@@ -82,14 +82,18 @@ endif()
 # MemFabric Hybrid exposes the MTE data plane only as an AscendC device API.
 # Build the optional KVPP kernel when the serving image has its headers; normal
 # community builds remain independent of MemFabric.
-set(MEMFABRIC_HYBRID_HOME_PATH "$ENV{MEMFABRIC_HYBRID_HOME_PATH}")
-set(MEMFABRIC_MTE_HEADER
-    "${MEMFABRIC_HYBRID_HOME_PATH}/include/smem/device/smem_shm_aicore_base_api.h")
+file(GLOB MEMFABRIC_HYBRID_INCLUDE_CANDIDATES
+    LIST_DIRECTORIES true
+    "/usr/local/memfabric_hybrid/*/include")
+find_path(MEMFABRIC_MTE_INCLUDE_DIR
+    NAMES smem/device/smem_shm_aicore_base_api.h
+    HINTS "$ENV{MEMFABRIC_HYBRID_HOME_PATH}/include"
+          ${MEMFABRIC_HYBRID_INCLUDE_CANDIDATES})
 if(NOT (SOC_VERSION MATCHES "ascend310p.*|ascend950") AND
-   EXISTS "${MEMFABRIC_MTE_HEADER}")
-    message(STATUS "MemFabric Hybrid MTE: enabled from ${MEMFABRIC_HYBRID_HOME_PATH}")
+   MEMFABRIC_MTE_INCLUDE_DIR)
+    message(STATUS "MemFabric Hybrid MTE: enabled from ${MEMFABRIC_MTE_INCLUDE_DIR}")
     target_include_directories(vllm_ascend_kernels PRIVATE
-        "${MEMFABRIC_HYBRID_HOME_PATH}/include")
+        "${MEMFABRIC_MTE_INCLUDE_DIR}")
     set(VLLM_ASCEND_ENABLE_MEMFABRIC_MTE ON)
 else()
     message(STATUS "MemFabric Hybrid MTE: disabled (device header not found)")
