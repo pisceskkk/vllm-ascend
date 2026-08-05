@@ -29,7 +29,10 @@ namespace vllm_ascend {
         void* stream,
         void* source,
         void* destination,
-        uint64_t length);
+        uint64_t length,
+        int32_t source_rank,
+        int32_t destination_rank,
+        uint32_t shm_id);
 #endif
 
   extern void bgmv_shrink_impl(

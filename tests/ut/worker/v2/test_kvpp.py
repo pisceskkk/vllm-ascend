@@ -164,13 +164,24 @@ def test_mte_owner_stages_and_consumer_unpacks_same_active_pages(monkeypatch):
     monkeypatch.setattr(torch.npu, "Event", FakeEvent)
     calls = []
 
-    def copy_op(anchor, sources, destinations, lengths):
+    def copy_op(
+        anchor,
+        sources,
+        destinations,
+        lengths,
+        source_ranks,
+        destination_ranks,
+        shm_id,
+    ):
         calls.append(
             (
                 anchor,
                 tuple(sources.tolist()),
                 tuple(destinations.tolist()),
                 tuple(lengths.tolist()),
+                tuple(source_ranks.tolist()),
+                tuple(destination_ranks.tolist()),
+                shm_id,
             )
         )
 
@@ -184,15 +195,23 @@ def test_mte_owner_stages_and_consumer_unpacks_same_active_pages(monkeypatch):
     )
     owner._layers = {"layer": (KVPPBufferMetadata(2000, 16, 16),)}
     owner._anchors = {"layer": owner_anchor}
-    owner._local_metadata = KVPPMTEPeerMetadata(8000, 1024)
+    owner._local_metadata = KVPPMTEPeerMetadata(8000, 1024, 0)
     owner._peer_metadata = [
         owner._local_metadata,
-        KVPPMTEPeerMetadata(10000, 1024),
+        KVPPMTEPeerMetadata(8000, 1024, 1),
     ]
 
     owner.push_active_pages("layer", (2, 3, 7), stream)
     assert calls == [
-        (owner_anchor, (2032, 2112), (10000, 10032), (32, 16))
+        (
+            owner_anchor,
+            (2032, 2112),
+            (8000, 8032),
+            (32, 16),
+            (-1, -1),
+            (1, 1),
+            31,
+        )
     ]
 
     calls.clear()
@@ -205,15 +224,23 @@ def test_mte_owner_stages_and_consumer_unpacks_same_active_pages(monkeypatch):
     )
     consumer._layers = {"layer": (KVPPBufferMetadata(1000, 16, 16),)}
     consumer._anchors = {"layer": consumer_anchor}
-    consumer._local_metadata = KVPPMTEPeerMetadata(10000, 1024)
+    consumer._local_metadata = KVPPMTEPeerMetadata(8000, 1024, 1)
     consumer._peer_metadata = [
-        KVPPMTEPeerMetadata(8000, 1024),
+        KVPPMTEPeerMetadata(8000, 1024, 0),
         consumer._local_metadata,
     ]
 
     consumer.receive_active_pages("layer", (2, 3, 7), stream)
     assert calls == [
-        (consumer_anchor, (10000, 10032), (1032, 1112), (32, 16))
+        (
+            consumer_anchor,
+            (8000, 8032),
+            (1032, 1112),
+            (32, 16),
+            (1, 1),
+            (-1, -1),
+            31,
+        )
     ]
 
 

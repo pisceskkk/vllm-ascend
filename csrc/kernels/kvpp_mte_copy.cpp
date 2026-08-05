@@ -14,8 +14,19 @@ constexpr int32_t KVPP_MTE_EVENT_ID = 0;
 } // namespace
 
 extern "C" __global__ __aicore__ void kvpp_mte_copy_bytes(
-    __gm__ uint8_t* source, __gm__ uint8_t* destination, uint64_t length)
+    __gm__ uint8_t* source, __gm__ uint8_t* destination, uint64_t length,
+    int32_t source_rank, int32_t destination_rank, uint32_t shm_id)
 {
+    const uint64_t symmetric_size =
+        (source_rank >= 0 || destination_rank >= 0)
+            ? smem_shm_get_symmetric_size(shm_id)
+            : 0;
+    if (source_rank >= 0) {
+        source += symmetric_size * static_cast<uint64_t>(source_rank);
+    }
+    if (destination_rank >= 0) {
+        destination += symmetric_size * static_cast<uint64_t>(destination_rank);
+    }
     AscendC::TPipe pipe;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> buffer;
     pipe.InitBuffer(buffer, KVPP_MTE_TILE_BYTES);
@@ -43,9 +54,11 @@ extern "C" __global__ __aicore__ void kvpp_mte_copy_bytes(
 
 namespace vllm_ascend {
 void kvpp_mte_copy_impl(void* stream, void* source, void* destination,
-                        uint64_t length)
+                        uint64_t length, int32_t source_rank,
+                        int32_t destination_rank, uint32_t shm_id)
 {
-    kvpp_mte_copy_bytes<<<1, nullptr, stream>>>(source, destination, length);
+    kvpp_mte_copy_bytes<<<1, nullptr, stream>>>(
+        source, destination, length, source_rank, destination_rank, shm_id);
 }
 } // namespace vllm_ascend
 #endif

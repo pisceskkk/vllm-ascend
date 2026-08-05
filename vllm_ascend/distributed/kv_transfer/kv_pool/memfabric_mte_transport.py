@@ -42,6 +42,7 @@ class KVPPMTEPeerMetadata:
 
     staging_addr: int
     staging_bytes: int
+    rank: int
 
 
 @dataclass(frozen=True)
@@ -106,6 +107,7 @@ class MemFabricMTEKVPPTransport:
         self._peer_metadata: list[KVPPMTEPeerMetadata] = []
         self._layers: dict[str, tuple[KVPPBufferMetadata, ...]] = {}
         self._anchors: dict[str, torch.Tensor] = {}
+        self._shm_id = _DEFAULT_SHM_ID
 
     def initialize(self, kv_caches: dict[str, Any]) -> None:
         if not os.getenv("MEMFABRIC_HYBRID_HOME_PATH"):
@@ -135,9 +137,14 @@ class MemFabricMTEKVPPTransport:
                     "vllm-ascend after sourcing MemFabric Hybrid 1.2.0."
                 )
 
-        store_url = os.getenv("ASCEND_MF_STORE_URL")
+        store_url = os.getenv("MF_CONFIG_STORE_URL") or os.getenv(
+            "ASCEND_MF_STORE_URL"
+        )
         if not store_url:
-            raise RuntimeError("KVPP MTE requires ASCEND_MF_STORE_URL.")
+            raise RuntimeError(
+                "KVPP MTE requires MF_CONFIG_STORE_URL (or the deprecated "
+                "ASCEND_MF_STORE_URL compatibility variable)."
+            )
         staging_bytes = int(
             os.getenv("ASCEND_KVPP_MTE_STAGING_BYTES", _DEFAULT_STAGING_BYTES)
         )
@@ -152,6 +159,7 @@ class MemFabricMTEKVPPTransport:
                 f"ASCEND_KVPP_MTE_SHM_ID must be in [0, {_SHM_ID_LIMIT}), "
                 f"got {shm_id}."
             )
+        self._shm_id = shm_id
 
         config = self._shm_module.ShmConfig()
         config.start_store = self.group.rank_in_group == 0
@@ -192,15 +200,14 @@ class MemFabricMTEKVPPTransport:
             layer_name: flatten_kvpp_cache(cache)[0]
             for layer_name, cache in kv_caches.items()
         }
-        # ``gva`` is the common symmetric base. Rank i owns the i-th equally
-        # sized segment; publish the resolved local address so peers need not
-        # duplicate this backend-specific address rule.
+        # ``gva`` is the common symmetric base. MemFabric may align each
+        # rank's segment to an internal symmetric size larger than the local
+        # contribution. That size is intentionally queried inside the
+        # AscendC kernel; the Python binding does not expose it.
         self._local_metadata = KVPPMTEPeerMetadata(
-            staging_addr=(
-                int(self._memory.gva)
-                + self.group.rank_in_group * staging_bytes
-            ),
+            staging_addr=int(self._memory.gva),
             staging_bytes=staging_bytes,
+            rank=self.group.rank_in_group,
         )
         peers: list[KVPPMTEPeerMetadata | None] = [None] * self.group.world_size
         dist.all_gather_object(
@@ -224,13 +231,28 @@ class MemFabricMTEKVPPTransport:
         buffers = self._layers[layer_name]
         return build_kvpp_page_transfer_batch(pages, buffers, buffers)
 
-    def _launch(self, layer_name: str, batch: KVPPTransferBatch) -> None:
+    def _launch(
+        self,
+        layer_name: str,
+        batch: KVPPTransferBatch,
+        *,
+        source_rank: int = -1,
+        destination_rank: int = -1,
+    ) -> None:
         assert self._copy_op is not None
+        descriptor_count = len(batch.lengths)
         self._copy_op(
             self._anchors[layer_name],
             torch.tensor(batch.source_addrs, dtype=torch.int64),
             torch.tensor(batch.destination_addrs, dtype=torch.int64),
             torch.tensor(batch.lengths, dtype=torch.int64),
+            torch.full(
+                (descriptor_count,), source_rank, dtype=torch.int32
+            ),
+            torch.full(
+                (descriptor_count,), destination_rank, dtype=torch.int32
+            ),
+            self._shm_id,
         )
 
     def push_active_pages(
@@ -249,7 +271,9 @@ class MemFabricMTEKVPPTransport:
             staged = _compact_staging_batch(
                 local_batch, peer.staging_addr, peer.staging_bytes
             )
-            self._launch(layer_name, staged)
+            self._launch(
+                layer_name, staged, destination_rank=peer.rank
+            )
         return MemFabricMTECompletion.record(stream)
 
     def receive_active_pages(
@@ -272,7 +296,11 @@ class MemFabricMTEKVPPTransport:
             destination_addrs=local_batch.destination_addrs,
             lengths=local_batch.lengths,
         )
-        self._launch(layer_name, unpack)
+        self._launch(
+            layer_name,
+            unpack,
+            source_rank=self._local_metadata.rank,
+        )
         return MemFabricMTECompletion.record(stream)
 
     def close(self) -> None:
