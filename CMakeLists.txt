@@ -53,6 +53,9 @@ include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 
 file(GLOB KERNEL_FILES
 ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/*.cpp)
+set(KVPP_MTE_KERNEL
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/kvpp_mte_copy.cpp)
+list(REMOVE_ITEM KERNEL_FILES ${KVPP_MTE_KERNEL})
 
 set(VLLM_ASCEND_CUSTOM_OP
     ${KERNEL_FILES}
@@ -73,6 +76,11 @@ endif()
 
 if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
     message(STATUS "Hardware ${SOC_VERSION} detected: skip vllm_ascend_kernels compile")
+elseif(VLLM_ASCEND_PREBUILT_KERNELS)
+    message(STATUS "Using prebuilt base kernels: ${VLLM_ASCEND_PREBUILT_KERNELS}")
+    add_library(vllm_ascend_kernels SHARED IMPORTED)
+    set_target_properties(vllm_ascend_kernels PROPERTIES
+        IMPORTED_LOCATION "${VLLM_ASCEND_PREBUILT_KERNELS}")
 else()
 ascendc_library(vllm_ascend_kernels SHARED
         ${VLLM_ASCEND_CUSTOM_OP}
@@ -92,7 +100,9 @@ find_path(MEMFABRIC_MTE_INCLUDE_DIR
 if(NOT (SOC_VERSION MATCHES "ascend310p.*|ascend950") AND
    MEMFABRIC_MTE_INCLUDE_DIR)
     message(STATUS "MemFabric Hybrid MTE: enabled from ${MEMFABRIC_MTE_INCLUDE_DIR}")
-    ascendc_include_directories(vllm_ascend_kernels PRIVATE
+    ascendc_library(vllm_ascend_kvpp_mte_kernels SHARED
+        ${KVPP_MTE_KERNEL})
+    ascendc_include_directories(vllm_ascend_kvpp_mte_kernels PRIVATE
         "${MEMFABRIC_MTE_INCLUDE_DIR}")
     set(VLLM_ASCEND_ENABLE_MEMFABRIC_MTE ON)
 else()
@@ -212,10 +222,15 @@ if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
     ${VLLM_ASCEND_C_COMMON_LIBS}
   )
 else()
+  set(VLLM_ASCEND_DIRECT_KERNEL_LIBS vllm_ascend_kernels)
+  if(VLLM_ASCEND_ENABLE_MEMFABRIC_MTE)
+    list(APPEND VLLM_ASCEND_DIRECT_KERNEL_LIBS
+      vllm_ascend_kvpp_mte_kernels)
+  endif()
   target_link_libraries(
     vllm_ascend_C
     PUBLIC
-    vllm_ascend_kernels
+    ${VLLM_ASCEND_DIRECT_KERNEL_LIBS}
     ${VLLM_ASCEND_C_COMMON_LIBS}
   )
 endif()
@@ -225,5 +240,14 @@ target_link_options(vllm_ascend_C PRIVATE "-Wl,-rpath,$ORIGIN:$ORIGIN/lib:$ORIGI
 if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
   install(TARGETS vllm_ascend_C DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
 else()
-  install(TARGETS vllm_ascend_C vllm_ascend_kernels DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
+  set(VLLM_ASCEND_INSTALL_TARGETS vllm_ascend_C)
+  if(NOT VLLM_ASCEND_PREBUILT_KERNELS)
+    list(APPEND VLLM_ASCEND_INSTALL_TARGETS vllm_ascend_kernels)
+  endif()
+  if(VLLM_ASCEND_ENABLE_MEMFABRIC_MTE)
+    list(APPEND VLLM_ASCEND_INSTALL_TARGETS
+      vllm_ascend_kvpp_mte_kernels)
+  endif()
+  install(TARGETS ${VLLM_ASCEND_INSTALL_TARGETS}
+    DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
 endif()
