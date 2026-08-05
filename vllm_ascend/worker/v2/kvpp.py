@@ -7,8 +7,10 @@ import torch
 import torch.distributed as dist
 from vllm.distributed.parallel_state import GroupCoordinator
 
-from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_transport import (
-    MemFabricKVPPTransport,
+from vllm_ascend.distributed.kv_transfer.kv_pool.kvpp_transport import (
+    KVPPCompletion,
+    KVPPTransport,
+    create_kvpp_transport,
 )
 
 
@@ -20,9 +22,9 @@ def _active_pages(
 ) -> tuple[int, ...]:
     """Return sorted physical pages read by the current batch.
 
-    MemFabric needs host-side address descriptors. Reuse the physical block
-    table already gathered for attention and materialize only the columns
-    covered by this batch.
+    Descriptor-based transports need the active physical pages. Reuse the
+    block table already gathered for attention and materialize only the
+    columns covered by this batch.
     """
     lengths = seq_lens.tolist()
     max_pages = max(
@@ -54,11 +56,11 @@ class KVPPContext:
     layer_owners: dict[str, int]
     num_blocks: int
     block_size: int
-    transport: Any | None = None
+    transport: KVPPTransport | None = None
     overlap_mode: str | None = None
     _selected_pages: tuple[int, ...] | None = None
     _comm_stream: Any | None = None
-    _transfer_event: Any | None = None
+    _transfer_completion: KVPPCompletion | None = None
     _transfer_submitted: bool = False
     _current_layer: str | None = None
     _ordered_layers: tuple[str, ...] = field(init=False)
@@ -92,7 +94,7 @@ class KVPPContext:
 
     def initialize_transport(self, kv_caches: dict[str, Any]) -> None:
         if self.transport is None:
-            self.transport = MemFabricKVPPTransport(
+            self.transport = create_kvpp_transport(
                 self.group, self.layer_owners, self.num_blocks
             )
         self.transport.initialize(kv_caches)
@@ -102,7 +104,7 @@ class KVPPContext:
             # One transfer may be in flight. Serializing jobs also preserves
             # point-to-point notification order when layer ownership changes.
             self._executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="kvpp-memfabric"
+                max_workers=1, thread_name_prefix="kvpp-transport"
             )
 
     def prepare_batch(
@@ -121,7 +123,7 @@ class KVPPContext:
         if self._selected_pages is None:
             raise RuntimeError("KVPP batch metadata was not prepared before forward.")
         if self.transport is None:
-            raise RuntimeError("KVPP MemFabric transport was not initialized.")
+            raise RuntimeError("KVPP transport was not initialized.")
         if self._current_layer is not None:
             raise RuntimeError(
                 f"KVPP layer {self._current_layer} was not completed before {layer_name}."
@@ -140,7 +142,7 @@ class KVPPContext:
             return kv_cache
 
         self._current_layer = layer_name
-        self._transfer_event = None
+        self._transfer_completion = None
         owner_rank = self.layer_owners[layer_name]
         self._transfer_submitted = bool(
             self._selected_pages and self.group.world_size > 1
@@ -163,12 +165,10 @@ class KVPPContext:
         if owner_rank == self.group.rank_in_group:
             if self._comm_stream is None:
                 self._comm_stream = torch.npu.Stream()
-            self._transfer_event = torch.npu.Event()
             with torch.npu.stream(self._comm_stream):
-                self.transport.push_active_pages(
+                self._transfer_completion = self.transport.push_active_pages(
                     layer_name, self._selected_pages, self._comm_stream
                 )
-                self._transfer_event.record(self._comm_stream)
         return kv_cache
 
     def wait_for_current_layer(self, layer_name: str) -> None:
@@ -196,13 +196,13 @@ class KVPPContext:
             with torch.profiler.record_function(
                 f"kvpp.baseline.transfer_wait.layer_{layer_index}"
             ):
-                if self._transfer_event is not None:
-                    # A device-side wait is insufficient before the CPU group
-                    # rendezvous: the owner must publish remote completion first.
-                    self._transfer_event.synchronize()
+                if self._transfer_completion is not None:
+                    # A local device dependency is insufficient before the CPU
+                    # rendezvous: the backend must confirm remote visibility.
+                    self._transfer_completion.wait()
                 dist.barrier(group=self.group.cpu_group)
         self._transfer_submitted = False
-        self._transfer_event = None
+        self._transfer_completion = None
         self._current_layer = None
 
     def finish_layer_attention(self, layer_name: str) -> None:
@@ -316,19 +316,17 @@ class KVPPContext:
                         tag=ready_tag,
                     )
 
-            transfer_done = torch.npu.Event()
             with torch.profiler.record_function(
-                f"kvpp.memfabric_push.layer_{layer_index}"
+                f"kvpp.transport_push.layer_{layer_index}"
             ):
                 with torch.npu.stream(self._comm_stream):
-                    self.transport.push_active_pages(
+                    completion = self.transport.push_active_pages(
                         layer_name, pages, self._comm_stream
                     )
-                    transfer_done.record(self._comm_stream)
                 # Only the communication worker waits on the host. The compute
                 # thread continues until this layer first writes/reads its
                 # paged KV cache.
-                transfer_done.synchronize()
+                completion.wait()
 
             with torch.profiler.record_function(
                 f"kvpp.done_send.layer_{layer_index}"
@@ -342,3 +340,12 @@ class KVPPContext:
                         group=self.group.cpu_group,
                         tag=done_tag,
                     )
+
+    def close(self) -> None:
+        """Drain overlap work and release transport-owned resources."""
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
+        if self.transport is not None:
+            self.transport.close()
+            self.transport = None

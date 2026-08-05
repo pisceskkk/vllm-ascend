@@ -3,11 +3,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_transport import (
-    KVPPBufferMetadata,
+from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_sdma_transport import (
     KVPPPeerMetadata,
-    MemFabricKVPPTransport,
-    _append_page_transfers,
+    MemFabricSDMAKVPPTransport,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.kvpp_transport import (
+    KVPPBufferMetadata,
+    build_kvpp_page_transfer_batch,
+    create_kvpp_transport,
+    register_kvpp_transport,
 )
 from vllm_ascend.worker.v2.kvpp import KVPPContext, _active_pages
 
@@ -24,33 +28,23 @@ def test_active_pages_uses_only_pages_covered_by_sequence_lengths():
 def test_contiguous_pages_are_coalesced_without_remapping():
     local = KVPPBufferMetadata(1000, 16, 16)
     remote = KVPPBufferMetadata(2000, 16, 16)
-    local_addrs: list[int] = []
-    remote_addrs: list[int] = []
-    lengths: list[int] = []
-
-    _append_page_transfers(
-        (2, 3, 7), local, remote, local_addrs, remote_addrs, lengths
+    transfers = build_kvpp_page_transfer_batch(
+        (2, 3, 7), (local,), (remote,)
     )
 
-    assert local_addrs == [1032, 1112]
-    assert remote_addrs == [2032, 2112]
-    assert lengths == [32, 16]
+    assert transfers.source_addrs == (1032, 1112)
+    assert transfers.destination_addrs == (2032, 2112)
+    assert transfers.lengths == (32, 16)
 
 
 def test_padded_page_layout_keeps_one_descriptor_per_page():
     local = KVPPBufferMetadata(1000, 32, 16)
     remote = KVPPBufferMetadata(2000, 32, 16)
-    local_addrs: list[int] = []
-    remote_addrs: list[int] = []
-    lengths: list[int] = []
+    transfers = build_kvpp_page_transfer_batch((2, 3), (local,), (remote,))
 
-    _append_page_transfers(
-        (2, 3), local, remote, local_addrs, remote_addrs, lengths
-    )
-
-    assert local_addrs == [1064, 1096]
-    assert remote_addrs == [2064, 2096]
-    assert lengths == [16, 16]
+    assert transfers.source_addrs == (1064, 1096)
+    assert transfers.destination_addrs == (2064, 2096)
+    assert transfers.lengths == (16, 16)
 
 
 class _FakeEngine:
@@ -66,10 +60,23 @@ class _FakeEngine:
         return 0
 
 
-def test_memfabric_owner_push_targets_original_physical_page_ids():
+def test_memfabric_owner_push_targets_original_physical_page_ids(monkeypatch):
+    class FakeEvent:
+        def __init__(self):
+            self.recorded_stream = None
+            self.synchronized = False
+
+        def record(self, stream):
+            self.recorded_stream = stream
+
+        def synchronize(self):
+            self.synchronized = True
+
+    event = FakeEvent()
+    monkeypatch.setattr(torch.npu, "Event", lambda: event)
     group = SimpleNamespace(rank_in_group=0, world_size=2)
     engine = _FakeEngine()
-    transport = MemFabricKVPPTransport(
+    transport = MemFabricSDMAKVPPTransport(
         group=group,
         layer_owners={"layer": 0},
         num_blocks=10,
@@ -87,13 +94,56 @@ def test_memfabric_owner_push_targets_original_physical_page_ids():
         ),
     ]
 
-    transport.push_active_pages(
-        "layer", (2, 3, 7), SimpleNamespace(npu_stream=123)
-    )
+    transfer_stream = SimpleNamespace(npu_stream=123)
+    completion = transport.push_active_pages("layer", (2, 3, 7), transfer_stream)
 
     assert engine.calls == [
         ("peer-destination", [2032, 2112], [1032, 1112], [32, 16], 123)
     ]
+    assert completion.event is event
+    assert event.recorded_stream is transfer_stream
+    completion.wait()
+    assert event.synchronized
+
+    waited_events = []
+    completion.wait_on_stream(SimpleNamespace(wait_event=waited_events.append))
+    assert waited_events == [event]
+
+
+def test_transport_factory_accepts_registered_mte_backend(monkeypatch):
+    calls = []
+
+    class FakeMTETransport:
+        def __init__(self, group, layer_owners, num_blocks):
+            calls.append((group, layer_owners, num_blocks))
+
+        def initialize(self, kv_caches):
+            pass
+
+        def push_active_pages(self, layer_name, pages, stream):
+            pass
+
+        def close(self):
+            pass
+
+    register_kvpp_transport("test-mte", FakeMTETransport)
+    monkeypatch.delenv("ASCEND_KVPP_TRANSPORT_CLASS", raising=False)
+    monkeypatch.setenv("ASCEND_KVPP_TRANSPORT", "test-mte")
+    group = SimpleNamespace(rank_in_group=0, world_size=2)
+
+    transport = create_kvpp_transport(group, {"layer": 0}, num_blocks=10)
+
+    assert isinstance(transport, FakeMTETransport)
+    assert calls == [(group, {"layer": 0}, 10)]
+
+
+def test_unavailable_transport_has_actionable_error(monkeypatch):
+    monkeypatch.delenv("ASCEND_KVPP_TRANSPORT_CLASS", raising=False)
+
+    with pytest.raises(RuntimeError, match="ASCEND_KVPP_TRANSPORT_CLASS"):
+        create_kvpp_transport(
+            SimpleNamespace(), {"layer": 0}, num_blocks=10, backend="mte"
+        )
 
 
 def test_owner_uses_persistent_cache():

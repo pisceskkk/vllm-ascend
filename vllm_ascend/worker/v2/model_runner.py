@@ -512,6 +512,12 @@ class NPUModelRunner(GPUModelRunner):
         # worker, implement it in the future.
         pass
 
+    def shutdown(self) -> None:
+        if self.kvpp_context is not None:
+            self.kvpp_context.close()
+            self.kvpp_context = None
+        super().shutdown()
+
     def _pad_query_start_loc_for_fia(
         self,
         num_tokens_padded: int,
