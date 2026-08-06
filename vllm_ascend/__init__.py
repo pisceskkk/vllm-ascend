@@ -105,13 +105,18 @@ def register_service_profiling():
 
 
 def register_model():
-    from vllm_ascend.patch.hunyuan_vl_processor_compat import (
-        install_hunyuan_vl_processor_compat,
-    )
-
     from .models import register_model
 
-    install_hunyuan_vl_processor_compat()
+    # HunYuanVLProcessor is optional across supported transformers releases.
+    # Do not prevent unrelated models from registering when it is unavailable.
+    import transformers
+
+    if hasattr(transformers, "HunYuanVLProcessor"):
+        from vllm_ascend.patch.hunyuan_vl_processor_compat import (
+            install_hunyuan_vl_processor_compat,
+        )
+
+        install_hunyuan_vl_processor_compat()
 
     register_model()
 
