@@ -14,7 +14,7 @@ constexpr uint32_t KVPP_MTE_MAX_CORES = 32;
 constexpr int32_t KVPP_MTE_EVENT_ID = 0;
 } // namespace
 
-extern "C" __global__ __aicore__ void kvpp_mte_copy_bytes(
+extern "C" __global__ __aicore__ void kvpp_mte_batch_copy_pages(
     __gm__ uint8_t* local_base, __gm__ int64_t* local_offsets,
     __gm__ int64_t* staging_offsets, __gm__ int64_t* lengths,
     uint64_t descriptor_count, __gm__ uint8_t* staging_base,
@@ -93,16 +93,16 @@ extern "C" __global__ __aicore__ void kvpp_mte_copy_bytes(
 }
 
 namespace vllm_ascend {
-void kvpp_mte_copy_impl(void* stream, void* local_base,
-                        void* local_offsets, void* staging_offsets,
-                        void* lengths, uint64_t descriptor_count,
-                        void* staging_base, int32_t source_rank,
-                        int32_t destination_rank, uint32_t shm_id)
+void kvpp_mte_batch_copy_pages_impl(
+    void* stream, void* local_base, void* local_offsets,
+    void* staging_offsets, void* lengths, uint64_t descriptor_count,
+    void* staging_base, int32_t source_rank, int32_t destination_rank,
+    uint32_t shm_id)
 {
     const uint32_t block_dim = descriptor_count < KVPP_MTE_MAX_CORES
         ? static_cast<uint32_t>(descriptor_count)
         : KVPP_MTE_MAX_CORES;
-    kvpp_mte_copy_bytes<<<block_dim, nullptr, stream>>>(
+    kvpp_mte_batch_copy_pages<<<block_dim, nullptr, stream>>>(
         local_base, local_offsets, staging_offsets, lengths,
         descriptor_count, staging_base,
         source_rank, destination_rank, shm_id);

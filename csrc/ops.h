@@ -25,7 +25,7 @@
 
 namespace vllm_ascend {
 #ifdef VLLM_ASCEND_ENABLE_MEMFABRIC_MTE
-    extern void kvpp_mte_copy_impl(
+    extern void kvpp_mte_batch_copy_pages_impl(
         void* stream,
         void* local_base,
         void* local_offsets,

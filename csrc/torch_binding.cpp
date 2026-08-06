@@ -289,16 +289,15 @@ void kvpp_mte_copy(const torch::Tensor& anchor,
     const c10_npu::OptionalNPUGuard npu_guard(anchor.device());
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     if (count != 0) {
-        kvpp_mte_copy_impl(stream,
-                           anchor.data_ptr(),
-                           local_offsets.data_ptr<int64_t>(),
-                           staging_offsets.data_ptr<int64_t>(),
-                           lengths.data_ptr<int64_t>(),
-                           static_cast<uint64_t>(count),
-                           reinterpret_cast<void*>(staging_base),
-                           static_cast<int32_t>(source_rank),
-                           static_cast<int32_t>(destination_rank),
-                           static_cast<uint32_t>(shm_id));
+        kvpp_mte_batch_copy_pages_impl(
+            stream, anchor.data_ptr(),
+            local_offsets.data_ptr<int64_t>(),
+            staging_offsets.data_ptr<int64_t>(),
+            lengths.data_ptr<int64_t>(), static_cast<uint64_t>(count),
+            reinterpret_cast<void*>(staging_base),
+            static_cast<int32_t>(source_rank),
+            static_cast<int32_t>(destination_rank),
+            static_cast<uint32_t>(shm_id));
     }
 }
 #endif
