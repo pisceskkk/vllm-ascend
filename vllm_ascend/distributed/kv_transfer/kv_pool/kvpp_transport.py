@@ -36,16 +36,28 @@ class KVPPBufferMetadata:
 
 
 @dataclass(frozen=True)
-class KVPPTransferBatch:
-    """One peer's backend-neutral scatter/gather transfer descriptors."""
+class KVPPActivePages:
+    """Fixed-shape device representation of active physical KV pages.
 
-    source_addrs: tuple[int, ...]
-    destination_addrs: tuple[int, ...]
-    lengths: tuple[int, ...]
+    ``page_ids`` and ``valid_mask`` stay on the same device as vLLM's original
+    block table.  Duplicate and invalid table entries remain as masked slots,
+    so transports never need to read a dynamic page count back to the host.
+    """
 
+    page_ids: torch.Tensor
+    valid_mask: torch.Tensor
 
-# Compatibility name used by the first transport-boundary prototype.
-KVPPPageTransferBatch = KVPPTransferBatch
+    def __post_init__(self) -> None:
+        if self.page_ids.device != self.valid_mask.device:
+            raise ValueError("KVPP active page tensors must share one device.")
+        if self.page_ids.dim() != 1 or self.valid_mask.dim() != 1:
+            raise ValueError("KVPP active page tensors must be one-dimensional.")
+        if self.page_ids.numel() != self.valid_mask.numel():
+            raise ValueError("KVPP active page tensor lengths must match.")
+        if self.page_ids.dtype not in (torch.int32, torch.int64):
+            raise TypeError("KVPP page_ids must use int32 or int64.")
+        if self.valid_mask.dtype != torch.bool:
+            raise TypeError("KVPP valid_mask must use bool.")
 
 
 @runtime_checkable
@@ -116,59 +128,6 @@ def build_kvpp_layer_metadata(
     return layers
 
 
-def build_kvpp_page_transfer_batch(
-    pages: tuple[int, ...],
-    source_buffers: tuple[KVPPBufferMetadata, ...],
-    destination_buffers: tuple[KVPPBufferMetadata, ...],
-) -> KVPPTransferBatch:
-    """Build identical physical-page descriptors for every data plane."""
-    if len(source_buffers) != len(destination_buffers):
-        raise RuntimeError(
-            "KVPP owner and destination cache tensor counts differ: "
-            f"owner={len(source_buffers)}, "
-            f"destination={len(destination_buffers)}."
-        )
-
-    source_addrs: list[int] = []
-    destination_addrs: list[int] = []
-    lengths: list[int] = []
-    for source, destination in zip(source_buffers, destination_buffers):
-        if source.block_bytes != destination.block_bytes:
-            raise RuntimeError(
-                "KVPP owner and destination cache block sizes differ: "
-                f"owner={source.block_bytes}, "
-                f"destination={destination.block_bytes}."
-            )
-
-        # Coalesce adjacent pages only if neither address space has padding.
-        can_coalesce = (
-            source.block_stride_bytes == source.block_bytes
-            and destination.block_stride_bytes == destination.block_bytes
-        )
-        run_start = 0
-        while run_start < len(pages):
-            run_end = run_start + 1
-            if can_coalesce:
-                while (
-                    run_end < len(pages)
-                    and pages[run_end] == pages[run_end - 1] + 1
-                ):
-                    run_end += 1
-            page = pages[run_start]
-            source_addrs.append(
-                source.base_addr + page * source.block_stride_bytes
-            )
-            destination_addrs.append(
-                destination.base_addr + page * destination.block_stride_bytes
-            )
-            lengths.append((run_end - run_start) * source.block_bytes)
-            run_start = run_end
-
-    return KVPPTransferBatch(
-        tuple(source_addrs), tuple(destination_addrs), tuple(lengths)
-    )
-
-
 @runtime_checkable
 class KVPPTransport(Protocol):
     """Data-plane contract consumed by :class:`KVPPContext`."""
@@ -179,7 +138,7 @@ class KVPPTransport(Protocol):
     def push_active_pages(
         self,
         layer_name: str,
-        pages: tuple[int, ...],
+        pages: KVPPActivePages,
         stream: Any,
     ) -> KVPPCompletion:
         """Enqueue selected pages and return remote-visible completion."""
@@ -187,7 +146,7 @@ class KVPPTransport(Protocol):
     def receive_active_pages(
         self,
         layer_name: str,
-        pages: tuple[int, ...],
+        pages: KVPPActivePages,
         stream: Any,
     ) -> KVPPCompletion:
         """Materialize remotely pushed pages in the local scratch cache.

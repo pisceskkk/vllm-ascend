@@ -8,6 +8,7 @@ import torch.distributed as dist
 from vllm.distributed.parallel_state import GroupCoordinator
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.kvpp_transport import (
+    KVPPActivePages,
     KVPPCompletion,
     KVPPTransport,
     create_kvpp_transport,
@@ -19,27 +20,31 @@ def _active_pages(
     seq_lens: Any,
     block_size: int,
     num_blocks: int,
-) -> tuple[int, ...]:
-    """Return sorted physical pages read by the current batch.
+) -> KVPPActivePages:
+    """Return fixed-shape device pages read by the current batch.
 
-    Descriptor-based transports need the active physical pages. Reuse the
-    block table already gathered for attention and materialize only the
-    columns covered by this batch.
+    The original block table is read only. Invalid columns and duplicate page
+    IDs become masked slots instead of being compacted through the host.
     """
-    lengths = seq_lens.tolist()
-    max_pages = max(
-        ((int(seq_len) + block_size - 1) // block_size for seq_len in lengths),
-        default=0,
+    lengths = torch.as_tensor(
+        seq_lens, dtype=torch.int64, device=block_table.device
+    ).flatten()
+    table = block_table[: lengths.shape[0]].to(dtype=torch.int64)
+    columns = torch.arange(
+        table.shape[1], dtype=torch.int64, device=block_table.device
     )
-    table = block_table[: len(lengths), :max_pages].tolist()
-    pages: set[int] = set()
-    for row, seq_len in zip(table, lengths):
-        pages_in_request = (int(seq_len) + block_size - 1) // block_size
-        for page in row[:pages_in_request]:
-            page = int(page)
-            if 0 <= page < num_blocks:
-                pages.add(page)
-    return tuple(sorted(pages))
+    pages_per_request = torch.div(
+        lengths + block_size - 1, block_size, rounding_mode="floor"
+    )
+    covered = columns.unsqueeze(0) < pages_per_request.unsqueeze(1)
+    valid = covered & (table >= 0) & (table < num_blocks)
+    sentinel = torch.full_like(table, num_blocks)
+    sorted_pages = torch.sort(torch.where(valid, table, sentinel).flatten()).values
+    unique = torch.ones_like(sorted_pages, dtype=torch.bool)
+    if sorted_pages.numel() > 1:
+        unique[1:] = sorted_pages[1:] != sorted_pages[:-1]
+    valid_mask = unique & (sorted_pages < num_blocks)
+    return KVPPActivePages(sorted_pages, valid_mask)
 
 
 @dataclass
@@ -58,7 +63,7 @@ class KVPPContext:
     block_size: int
     transport: KVPPTransport | None = None
     overlap_mode: str | None = None
-    _selected_pages: tuple[int, ...] | None = None
+    _selected_pages: KVPPActivePages | None = None
     _comm_stream: Any | None = None
     _transfer_completion: KVPPCompletion | None = None
     _transfer_submitted: bool = False
@@ -144,9 +149,7 @@ class KVPPContext:
         self._current_layer = layer_name
         self._transfer_completion = None
         owner_rank = self.layer_owners[layer_name]
-        self._transfer_submitted = bool(
-            self._selected_pages and self.group.world_size > 1
-        )
+        self._transfer_submitted = self.group.world_size > 1
         if not self._transfer_submitted:
             return kv_cache
 
@@ -250,7 +253,7 @@ class KVPPContext:
             )
         self._pending_layer = layer_name
         self._transfer_future = None
-        if not self._selected_pages or self.group.world_size <= 1:
+        if self.group.world_size <= 1:
             return
         if self._executor is None or self._comm_stream is None:
             raise RuntimeError("KVPP overlap worker was not initialized.")
@@ -267,7 +270,7 @@ class KVPPContext:
     def _run_overlap_transfer(
         self,
         layer_name: str,
-        pages: tuple[int, ...],
+        pages: KVPPActivePages,
         scratch_ready: Any,
     ) -> None:
         """Run safe-point and completion notification off the compute thread."""

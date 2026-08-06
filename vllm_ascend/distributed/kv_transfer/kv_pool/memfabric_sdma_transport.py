@@ -22,10 +22,10 @@ from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.kvpp_transport import (
+    KVPPActivePages,
     KVPPBufferMetadata,
     KVPPCompletion,
     build_kvpp_layer_metadata,
-    build_kvpp_page_transfer_batch,
     flatten_kvpp_cache,
 )
 
@@ -45,6 +45,67 @@ class KVPPPeerMetadata:
 class _RegisterRegions:
     ptrs: list[int]
     lengths: list[int]
+
+
+@dataclass(frozen=True)
+class _SDMATransferBatch:
+    source_addrs: tuple[int, ...]
+    destination_addrs: tuple[int, ...]
+    lengths: tuple[int, ...]
+
+
+def _build_sdma_transfer_batch(
+    pages: KVPPActivePages,
+    source_buffers: tuple[KVPPBufferMetadata, ...],
+    destination_buffers: tuple[KVPPBufferMetadata, ...],
+) -> _SDMATransferBatch:
+    """Materialize the legacy TransferEngine host descriptor ABI.
+
+    This is deliberately SDMA-private. The common scheduler and MTE data path
+    retain the active-page representation on device.
+    """
+    if len(source_buffers) != len(destination_buffers):
+        raise RuntimeError(
+            "KVPP owner and destination cache tensor counts differ: "
+            f"owner={len(source_buffers)}, "
+            f"destination={len(destination_buffers)}."
+        )
+    page_ids = pages.page_ids[pages.valid_mask].detach().cpu().tolist()
+    source_addrs: list[int] = []
+    destination_addrs: list[int] = []
+    lengths: list[int] = []
+    for source, destination in zip(source_buffers, destination_buffers):
+        if source.block_bytes != destination.block_bytes:
+            raise RuntimeError(
+                "KVPP owner and destination cache block sizes differ: "
+                f"owner={source.block_bytes}, "
+                f"destination={destination.block_bytes}."
+            )
+        can_coalesce = (
+            source.block_stride_bytes == source.block_bytes
+            and destination.block_stride_bytes == destination.block_bytes
+        )
+        run_start = 0
+        while run_start < len(page_ids):
+            run_end = run_start + 1
+            if can_coalesce:
+                while (
+                    run_end < len(page_ids)
+                    and page_ids[run_end] == page_ids[run_end - 1] + 1
+                ):
+                    run_end += 1
+            page = page_ids[run_start]
+            source_addrs.append(
+                source.base_addr + page * source.block_stride_bytes
+            )
+            destination_addrs.append(
+                destination.base_addr + page * destination.block_stride_bytes
+            )
+            lengths.append((run_end - run_start) * source.block_bytes)
+            run_start = run_end
+    return _SDMATransferBatch(
+        tuple(source_addrs), tuple(destination_addrs), tuple(lengths)
+    )
 
 
 @dataclass(frozen=True)
@@ -232,12 +293,12 @@ class MemFabricSDMAKVPPTransport:
     def push_active_pages(
         self,
         layer_name: str,
-        pages: tuple[int, ...],
+        pages: KVPPActivePages,
         stream: Any,
     ) -> KVPPCompletion:
         """Push active owner pages into every peer's aliased scratch cache."""
         owner_rank = self.layer_owners[layer_name]
-        if owner_rank != self.group.rank_in_group or not pages:
+        if owner_rank != self.group.rank_in_group:
             return MemFabricSDMACompletion.record(stream)
         if self.local_metadata is None or not self.peer_metadata:
             raise RuntimeError("KVPP MemFabric transport was not initialized.")
@@ -249,7 +310,7 @@ class MemFabricSDMAKVPPTransport:
             if peer_rank == owner_rank:
                 continue
             destination_buffers = destination_peer.layers[layer_name]
-            transfers = build_kvpp_page_transfer_batch(
+            transfers = _build_sdma_transfer_batch(
                 pages, source_buffers, destination_buffers
             )
 
@@ -294,7 +355,7 @@ class MemFabricSDMAKVPPTransport:
     def receive_active_pages(
         self,
         layer_name: str,
-        pages: tuple[int, ...],
+        pages: KVPPActivePages,
         stream: Any,
     ) -> KVPPCompletion:
         """SDMA writes directly into scratch, so no receive-side unpack exists."""

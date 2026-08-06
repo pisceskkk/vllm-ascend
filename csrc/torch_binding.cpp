@@ -244,63 +244,60 @@ void swap_blocks_batch(const torch::Tensor& src_ptrs,
 
 #ifdef VLLM_ASCEND_ENABLE_MEMFABRIC_MTE
 void kvpp_mte_copy(const torch::Tensor& anchor,
-                   const torch::Tensor& source_addrs,
-                   const torch::Tensor& destination_addrs,
+                   const torch::Tensor& local_offsets,
+                   const torch::Tensor& staging_offsets,
                    const torch::Tensor& lengths,
-                   const torch::Tensor& source_ranks,
-                   const torch::Tensor& destination_ranks,
+                   int64_t staging_base,
+                   int64_t source_rank,
+                   int64_t destination_rank,
                    int64_t shm_id)
 {
     TORCH_CHECK(anchor.is_privateuseone(), "anchor must be an NPU tensor");
-    TORCH_CHECK(source_addrs.device().is_cpu(),
-                "source_addrs must be on CPU");
-    TORCH_CHECK(destination_addrs.device().is_cpu(),
-                "destination_addrs must be on CPU");
-    TORCH_CHECK(lengths.device().is_cpu(), "lengths must be on CPU");
-    TORCH_CHECK(source_ranks.device().is_cpu(),
-                "source_ranks must be on CPU");
-    TORCH_CHECK(destination_ranks.device().is_cpu(),
-                "destination_ranks must be on CPU");
-    TORCH_CHECK(source_addrs.dtype() == torch::kInt64,
-                "source_addrs must be int64");
-    TORCH_CHECK(destination_addrs.dtype() == torch::kInt64,
-                "destination_addrs must be int64");
+    TORCH_CHECK(local_offsets.is_privateuseone(),
+                "local_offsets must be an NPU tensor");
+    TORCH_CHECK(staging_offsets.is_privateuseone(),
+                "staging_offsets must be an NPU tensor");
+    TORCH_CHECK(lengths.is_privateuseone(),
+                "lengths must be an NPU tensor");
+    TORCH_CHECK(local_offsets.device() == anchor.device() &&
+                    staging_offsets.device() == anchor.device() &&
+                    lengths.device() == anchor.device(),
+                "KVPP MTE descriptors and anchor must share one NPU device");
+    TORCH_CHECK(local_offsets.dtype() == torch::kInt64,
+                "local_offsets must be int64");
+    TORCH_CHECK(staging_offsets.dtype() == torch::kInt64,
+                "staging_offsets must be int64");
     TORCH_CHECK(lengths.dtype() == torch::kInt64, "lengths must be int64");
-    TORCH_CHECK(source_ranks.dtype() == torch::kInt32,
-                "source_ranks must be int32");
-    TORCH_CHECK(destination_ranks.dtype() == torch::kInt32,
-                "destination_ranks must be int32");
-    TORCH_CHECK(source_addrs.dim() == 1 && destination_addrs.dim() == 1 &&
-                    lengths.dim() == 1 && source_ranks.dim() == 1 &&
-                    destination_ranks.dim() == 1,
+    TORCH_CHECK(local_offsets.dim() == 1 && staging_offsets.dim() == 1 &&
+                    lengths.dim() == 1,
                 "KVPP MTE descriptors must be one-dimensional");
-    const int64_t count = source_addrs.numel();
-    TORCH_CHECK(destination_addrs.numel() == count && lengths.numel() == count &&
-                    source_ranks.numel() == count &&
-                    destination_ranks.numel() == count,
+    const int64_t count = local_offsets.numel();
+    TORCH_CHECK(staging_offsets.numel() == count && lengths.numel() == count,
                 "KVPP MTE descriptor lengths must match");
+    TORCH_CHECK(local_offsets.is_contiguous() &&
+                    staging_offsets.is_contiguous() &&
+                    lengths.is_contiguous(),
+                "KVPP MTE descriptors must be contiguous");
+    TORCH_CHECK(source_rank >= -1 && destination_rank >= -1,
+                "KVPP MTE ranks must be -1 or non-negative");
+    TORCH_CHECK((source_rank >= 0) != (destination_rank >= 0),
+                "exactly one KVPP MTE endpoint must be SHM staging");
+    TORCH_CHECK(staging_base > 0, "staging_base must be positive");
     TORCH_CHECK(shm_id >= 0 && shm_id < 64,
                 "KVPP MTE shm_id must be in [0, 64)");
 
     const c10_npu::OptionalNPUGuard npu_guard(anchor.device());
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
-    const int64_t* sources = source_addrs.data_ptr<int64_t>();
-    const int64_t* destinations = destination_addrs.data_ptr<int64_t>();
-    const int64_t* sizes = lengths.data_ptr<int64_t>();
-    const int32_t* source_rank_data = source_ranks.data_ptr<int32_t>();
-    const int32_t* destination_rank_data =
-        destination_ranks.data_ptr<int32_t>();
-    for (int64_t index = 0; index < count; ++index) {
-        TORCH_CHECK(sources[index] != 0 && destinations[index] != 0,
-                    "KVPP MTE addresses must be nonzero at descriptor ", index);
-        TORCH_CHECK(sizes[index] > 0,
-                    "KVPP MTE length must be positive at descriptor ", index);
+    if (count != 0) {
         kvpp_mte_copy_impl(stream,
-                           reinterpret_cast<void*>(sources[index]),
-                           reinterpret_cast<void*>(destinations[index]),
-                           static_cast<uint64_t>(sizes[index]),
-                           source_rank_data[index],
-                           destination_rank_data[index],
+                           anchor.data_ptr(),
+                           local_offsets.data_ptr<int64_t>(),
+                           staging_offsets.data_ptr<int64_t>(),
+                           lengths.data_ptr<int64_t>(),
+                           static_cast<uint64_t>(count),
+                           reinterpret_cast<void*>(staging_base),
+                           static_cast<int32_t>(source_rank),
+                           static_cast<int32_t>(destination_rank),
                            static_cast<uint32_t>(shm_id));
     }
 }
@@ -2192,9 +2189,10 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     // Direct kernel custom ops
 #ifdef VLLM_ASCEND_ENABLE_MEMFABRIC_MTE
     ops.def(
-        "kvpp_mte_copy(Tensor anchor, Tensor source_addrs, "
-        "Tensor destination_addrs, Tensor lengths, Tensor source_ranks, "
-        "Tensor destination_ranks, int shm_id) -> ()");
+        "kvpp_mte_copy(Tensor anchor, Tensor local_offsets, "
+        "Tensor staging_offsets, Tensor lengths, int staging_base, "
+        "int source_rank, "
+        "int destination_rank, int shm_id) -> ()");
     ops.impl("kvpp_mte_copy", torch::kPrivateUse1,
              &vllm_ascend::kvpp_mte_copy);
 #endif
