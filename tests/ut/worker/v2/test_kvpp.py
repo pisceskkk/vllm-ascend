@@ -6,14 +6,16 @@ import torch
 from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_mte_transport import (
     KVPPMTEPeerMetadata,
     MemFabricMTEKVPPTransport,
+    _MTEDeviceBufferMetadata,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_sdma_transport import (
     KVPPPeerMetadata,
     MemFabricSDMAKVPPTransport,
+    _build_sdma_transfer_batch,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.kvpp_transport import (
+    KVPPActivePages,
     KVPPBufferMetadata,
-    build_kvpp_page_transfer_batch,
     create_kvpp_transport,
     register_kvpp_transport,
 )
@@ -24,16 +26,27 @@ def test_active_pages_uses_only_pages_covered_by_sequence_lengths():
     block_table = torch.tensor([[7, 2, 9, 0], [4, 8, 0, 0]], dtype=torch.int32)
     seq_lens = torch.tensor([5, 5], dtype=torch.int32)
 
+    original_block_table = block_table.clone()
     pages = _active_pages(block_table, seq_lens, block_size=4, num_blocks=10)
 
-    assert pages == (2, 4, 7, 8)
+    assert pages.page_ids.tolist() == [2, 4, 7, 8, 10, 10, 10, 10]
+    assert pages.valid_mask.tolist() == [True, True, True, True, False, False,
+                                        False, False]
+    assert pages.page_ids.device == block_table.device
+    assert pages.valid_mask.device == block_table.device
+    assert torch.equal(block_table, original_block_table)
+
+
+def _active_page_tensor(*page_ids: int) -> KVPPActivePages:
+    pages = torch.tensor(page_ids, dtype=torch.int32)
+    return KVPPActivePages(pages, torch.ones_like(pages, dtype=torch.bool))
 
 
 def test_contiguous_pages_are_coalesced_without_remapping():
     local = KVPPBufferMetadata(1000, 16, 16)
     remote = KVPPBufferMetadata(2000, 16, 16)
-    transfers = build_kvpp_page_transfer_batch(
-        (2, 3, 7), (local,), (remote,)
+    transfers = _build_sdma_transfer_batch(
+        _active_page_tensor(2, 3, 7), (local,), (remote,)
     )
 
     assert transfers.source_addrs == (1032, 1112)
@@ -44,7 +57,9 @@ def test_contiguous_pages_are_coalesced_without_remapping():
 def test_padded_page_layout_keeps_one_descriptor_per_page():
     local = KVPPBufferMetadata(1000, 32, 16)
     remote = KVPPBufferMetadata(2000, 32, 16)
-    transfers = build_kvpp_page_transfer_batch((2, 3), (local,), (remote,))
+    transfers = _build_sdma_transfer_batch(
+        _active_page_tensor(2, 3), (local,), (remote,)
+    )
 
     assert transfers.source_addrs == (1064, 1096)
     assert transfers.destination_addrs == (2064, 2096)
@@ -99,7 +114,9 @@ def test_memfabric_owner_push_targets_original_physical_page_ids(monkeypatch):
     ]
 
     transfer_stream = SimpleNamespace(npu_stream=123)
-    completion = transport.push_active_pages("layer", (2, 3, 7), transfer_stream)
+    completion = transport.push_active_pages(
+        "layer", _active_page_tensor(2, 3, 7), transfer_stream
+    )
 
     assert engine.calls == [
         ("peer-destination", [2032, 2112], [1032, 1112], [32, 16], 123)
@@ -166,21 +183,23 @@ def test_mte_owner_stages_and_consumer_unpacks_same_active_pages(monkeypatch):
 
     def copy_op(
         anchor,
-        sources,
-        destinations,
+        local_offsets,
+        staging_offsets,
         lengths,
-        source_ranks,
-        destination_ranks,
+        staging_base,
+        source_rank,
+        destination_rank,
         shm_id,
     ):
         calls.append(
             (
                 anchor,
-                tuple(sources.tolist()),
-                tuple(destinations.tolist()),
+                tuple(local_offsets.tolist()),
+                tuple(staging_offsets.tolist()),
                 tuple(lengths.tolist()),
-                tuple(source_ranks.tolist()),
-                tuple(destination_ranks.tolist()),
+                staging_base,
+                source_rank,
+                destination_rank,
                 shm_id,
             )
         )
@@ -195,21 +214,27 @@ def test_mte_owner_stages_and_consumer_unpacks_same_active_pages(monkeypatch):
     )
     owner._layers = {"layer": (KVPPBufferMetadata(2000, 16, 16),)}
     owner._anchors = {"layer": owner_anchor}
+    owner._device_layers = {
+        "layer": _MTEDeviceBufferMetadata(
+            torch.tensor([0]), torch.tensor([16]), torch.tensor([16]), 16
+        )
+    }
     owner._local_metadata = KVPPMTEPeerMetadata(8000, 1024, 0)
     owner._peer_metadata = [
         owner._local_metadata,
         KVPPMTEPeerMetadata(8000, 1024, 1),
     ]
 
-    owner.push_active_pages("layer", (2, 3, 7), stream)
+    owner.push_active_pages("layer", _active_page_tensor(2, 3, 7), stream)
     assert calls == [
         (
             owner_anchor,
-            (2032, 2112),
-            (8000, 8032),
-            (32, 16),
-            (-1, -1),
-            (1, 1),
+            (32, 48, 112),
+            (0, 16, 32),
+            (16, 16, 16),
+            8000,
+            -1,
+            1,
             31,
         )
     ]
@@ -224,24 +249,119 @@ def test_mte_owner_stages_and_consumer_unpacks_same_active_pages(monkeypatch):
     )
     consumer._layers = {"layer": (KVPPBufferMetadata(1000, 16, 16),)}
     consumer._anchors = {"layer": consumer_anchor}
+    consumer._device_layers = {
+        "layer": _MTEDeviceBufferMetadata(
+            torch.tensor([0]), torch.tensor([16]), torch.tensor([16]), 16
+        )
+    }
     consumer._local_metadata = KVPPMTEPeerMetadata(8000, 1024, 1)
     consumer._peer_metadata = [
         KVPPMTEPeerMetadata(8000, 1024, 0),
         consumer._local_metadata,
     ]
 
-    consumer.receive_active_pages("layer", (2, 3, 7), stream)
+    consumer.receive_active_pages(
+        "layer", _active_page_tensor(2, 3, 7), stream
+    )
     assert calls == [
         (
             consumer_anchor,
-            (8000, 8032),
-            (1032, 1112),
-            (32, 16),
-            (1, 1),
-            (-1, -1),
+            (32, 48, 112),
+            (0, 16, 32),
+            (16, 16, 16),
+            8000,
+            1,
+            -1,
             31,
         )
     ]
+
+
+def test_mte_builds_one_device_batch_for_masked_pages_and_multiple_buffers(
+    monkeypatch,
+):
+    class FakeEvent:
+        def record(self, stream):
+            self.stream = stream
+
+        def synchronize(self):
+            pass
+
+    monkeypatch.setattr(torch.npu, "Event", FakeEvent)
+    monkeypatch.setattr(torch, "_assert_async", lambda condition, message: None)
+    calls = []
+
+    def copy_op(anchor, local_offsets, staging_offsets, lengths,
+                staging_base, source_rank, destination_rank, shm_id):
+        calls.append(
+            (
+                tuple(local_offsets.tolist()),
+                tuple(staging_offsets.tolist()),
+                tuple(lengths.tolist()),
+                staging_base,
+                source_rank,
+                destination_rank,
+                shm_id,
+            )
+        )
+
+    transport = MemFabricMTEKVPPTransport(
+        SimpleNamespace(rank_in_group=0, world_size=2),
+        {"layer": 0},
+        10,
+        copy_op=copy_op,
+    )
+    transport._anchors = {"layer": torch.empty(1)}
+    transport._device_layers = {
+        "layer": _MTEDeviceBufferMetadata(
+            torch.tensor([0, 4000]),
+            torch.tensor([32, 64]),
+            torch.tensor([16, 8]),
+            24,
+        )
+    }
+    transport._local_metadata = KVPPMTEPeerMetadata(8000, 240, 0)
+    transport._peer_metadata = [
+        transport._local_metadata,
+        KVPPMTEPeerMetadata(8000, 240, 1),
+    ]
+    pages = KVPPActivePages(
+        torch.tensor([2, 2, 7, 10], dtype=torch.int32),
+        torch.tensor([True, False, True, False]),
+    )
+
+    transport.push_active_pages("layer", pages, SimpleNamespace())
+
+    assert calls == [
+        (
+            (64, 64, 224, 320, 4128, 4128, 4448, 4640),
+            (0, 0, 16, 16, 160, 160, 168, 168),
+            (16, 0, 16, 0, 8, 0, 8, 0),
+            8000,
+            -1,
+            1,
+            31,
+        )
+    ]
+
+
+def test_prepare_batch_preserves_attention_metadata():
+    block_table = torch.tensor([[7, 2, 9, 0]], dtype=torch.int32)
+    slot_mapping = torch.tensor([28, 29, 8, 9], dtype=torch.int64)
+    original_block_table = block_table.clone()
+    original_slot_mapping = slot_mapping.clone()
+    context = KVPPContext(
+        group=SimpleNamespace(rank_in_group=0, world_size=1),
+        layer_owners={"layer": 0},
+        num_blocks=10,
+        block_size=4,
+        transport=SimpleNamespace(),
+    )
+
+    context.prepare_batch(block_table, torch.tensor([5]))
+
+    assert torch.equal(block_table, original_block_table)
+    assert torch.equal(slot_mapping, original_slot_mapping)
 
 
 def test_owner_uses_persistent_cache():
