@@ -42,10 +42,14 @@ class KVPPActivePages:
     ``page_ids`` and ``valid_mask`` stay on the same device as vLLM's original
     block table.  Duplicate and invalid table entries remain as masked slots,
     so transports never need to read a dynamic page count back to the host.
+    ``count_upper_bound`` is derived only from the host-resident sequence
+    lengths and bounds the number of valid, unique pages without a device
+    reduction.
     """
 
     page_ids: torch.Tensor
     valid_mask: torch.Tensor
+    count_upper_bound: int
 
     def __post_init__(self) -> None:
         if self.page_ids.device != self.valid_mask.device:
@@ -58,6 +62,12 @@ class KVPPActivePages:
             raise TypeError("KVPP page_ids must use int32 or int64.")
         if self.valid_mask.dtype != torch.bool:
             raise TypeError("KVPP valid_mask must use bool.")
+        if not 0 <= self.count_upper_bound <= self.page_ids.numel():
+            raise ValueError(
+                "KVPP active-page count upper bound must be between zero "
+                f"and the descriptor count, got {self.count_upper_bound} "
+                f"for {self.page_ids.numel()} descriptors."
+            )
 
 
 @runtime_checkable

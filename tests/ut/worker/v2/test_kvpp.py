@@ -34,12 +34,17 @@ def test_active_pages_uses_only_pages_covered_by_sequence_lengths():
                                         False, False]
     assert pages.page_ids.device == block_table.device
     assert pages.valid_mask.device == block_table.device
+    assert pages.count_upper_bound == 4
     assert torch.equal(block_table, original_block_table)
 
 
 def _active_page_tensor(*page_ids: int) -> KVPPActivePages:
     pages = torch.tensor(page_ids, dtype=torch.int32)
-    return KVPPActivePages(pages, torch.ones_like(pages, dtype=torch.bool))
+    return KVPPActivePages(
+        pages,
+        torch.ones_like(pages, dtype=torch.bool),
+        count_upper_bound=len(page_ids),
+    )
 
 
 def test_contiguous_pages_are_coalesced_without_remapping():
@@ -288,7 +293,13 @@ def test_mte_builds_one_device_batch_for_masked_pages_and_multiple_buffers(
             pass
 
     monkeypatch.setattr(torch.npu, "Event", FakeEvent)
-    monkeypatch.setattr(torch, "_assert_async", lambda condition, message: None)
+    monkeypatch.setattr(
+        torch,
+        "_assert_async",
+        lambda *args, **kwargs: pytest.fail(
+            "MTE capacity validation must not launch a device assertion"
+        ),
+    )
     calls = []
 
     def copy_op(anchor, local_offsets, staging_offsets, lengths,
@@ -328,6 +339,7 @@ def test_mte_builds_one_device_batch_for_masked_pages_and_multiple_buffers(
     pages = KVPPActivePages(
         torch.tensor([2, 2, 7, 10], dtype=torch.int32),
         torch.tensor([True, False, True, False]),
+        count_upper_bound=2,
     )
 
     transport.push_active_pages("layer", pages, SimpleNamespace())
@@ -343,6 +355,40 @@ def test_mte_builds_one_device_batch_for_masked_pages_and_multiple_buffers(
             31,
         )
     ]
+
+
+def test_mte_rejects_host_upper_bound_larger_than_staging_capacity():
+    transport = MemFabricMTEKVPPTransport(
+        SimpleNamespace(rank_in_group=0, world_size=2),
+        {"layer": 0},
+        10,
+        copy_op=lambda *args: pytest.fail("copy must not be launched"),
+    )
+    transport._anchors = {"layer": torch.empty(1)}
+    transport._device_layers = {
+        "layer": _MTEDeviceBufferMetadata(
+            torch.tensor([0]),
+            torch.tensor([16]),
+            torch.tensor([16]),
+            16,
+        )
+    }
+    transport._local_metadata = KVPPMTEPeerMetadata(8000, 32, 0)
+    transport._peer_metadata = [
+        transport._local_metadata,
+        KVPPMTEPeerMetadata(8000, 32, 1),
+    ]
+    pages = KVPPActivePages(
+        torch.tensor([2, 3, 7], dtype=torch.int32),
+        torch.tensor([True, True, True]),
+        count_upper_bound=3,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="upper_bound=3, capacity=2",
+    ):
+        transport.push_active_pages("layer", pages, SimpleNamespace())
 
 
 def test_prepare_batch_preserves_attention_metadata():

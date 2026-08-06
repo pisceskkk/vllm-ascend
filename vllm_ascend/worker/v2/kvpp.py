@@ -26,9 +26,22 @@ def _active_pages(
     The original block table is read only. Invalid columns and duplicate page
     IDs become masked slots instead of being compacted through the host.
     """
-    lengths = torch.as_tensor(
-        seq_lens, dtype=torch.int64, device=block_table.device
+    if isinstance(seq_lens, torch.Tensor) and seq_lens.device.type != "cpu":
+        raise ValueError(
+            "KVPP sequence lengths must remain on the host so the active-page "
+            "capacity bound never introduces a device-to-host synchronization."
+        )
+    host_lengths = torch.as_tensor(
+        seq_lens, dtype=torch.int64, device="cpu"
     ).flatten()
+    table_columns = block_table.shape[1]
+    pages_per_request_host = torch.div(
+        host_lengths + block_size - 1, block_size, rounding_mode="floor"
+    ).clamp_(min=0, max=table_columns)
+    count_upper_bound = min(
+        num_blocks, int(pages_per_request_host.sum().item())
+    )
+    lengths = host_lengths.to(device=block_table.device)
     table = block_table[: lengths.shape[0]].to(dtype=torch.int64)
     columns = torch.arange(
         table.shape[1], dtype=torch.int64, device=block_table.device
@@ -44,7 +57,11 @@ def _active_pages(
     if sorted_pages.numel() > 1:
         unique[1:] = sorted_pages[1:] != sorted_pages[:-1]
     valid_mask = unique & (sorted_pages < num_blocks)
-    return KVPPActivePages(sorted_pages, valid_mask)
+    return KVPPActivePages(
+        sorted_pages,
+        valid_mask,
+        count_upper_bound=count_upper_bound,
+    )
 
 
 @dataclass

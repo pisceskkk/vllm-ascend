@@ -295,13 +295,17 @@ class MemFabricMTEKVPPTransport:
                 f"cache buffer: page_bytes={metadata.staging_bytes_per_slot}, "
                 f"capacity={staging_bytes}."
             )
+        if pages.count_upper_bound > max_active_pages:
+            raise RuntimeError(
+                "KVPP MTE active-page upper bound exceeds staging capacity: "
+                f"upper_bound={pages.count_upper_bound}, "
+                f"capacity={max_active_pages}, "
+                f"staging_bytes={staging_bytes}. Increase "
+                "ASCEND_KVPP_MTE_STAGING_BYTES."
+            )
         active_ordinals = torch.cumsum(
             pages.valid_mask.to(dtype=torch.int64), dim=0
         ) - 1
-        torch._assert_async(
-            pages.valid_mask.sum() <= max_active_pages,
-            "KVPP MTE active pages exceed ASCEND_KVPP_MTE_STAGING_BYTES",
-        )
         per_buffer_capacity = metadata.block_bytes * max_active_pages
         buffer_offsets = torch.cumsum(per_buffer_capacity, dim=0)
         buffer_offsets = buffer_offsets - per_buffer_capacity
