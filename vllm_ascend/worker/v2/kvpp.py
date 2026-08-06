@@ -69,9 +69,10 @@ class KVPPContext:
     """Layer ownership and stream-ordered active-page transport.
 
     Owned layers use persistent KV caches. Non-owned layers are already bound
-    by vLLM's planner to one full-size shared scratch cache. Active pages are
-    pushed into the same physical block IDs, preserving the original block
-    table and slot mapping.
+    by vLLM's planner to one of two alternating full-size scratch caches.
+    Active pages are pushed into the same physical block IDs, preserving the
+    original block table and slot mapping. The dual buffers let layer N+1 be
+    filled while layer N attention still reads its own scratch cache.
     """
 
     group: GroupCoordinator
@@ -100,7 +101,7 @@ class KVPPContext:
     def __post_init__(self) -> None:
         if self.overlap_mode is None:
             self.overlap_mode = os.getenv(
-                "ASCEND_KVPP_OVERLAP_MODE", "baseline"
+                "ASCEND_KVPP_OVERLAP_MODE", "previous_layer"
             ).lower()
         valid_modes = {"baseline", "current_layer", "previous_layer"}
         if self.overlap_mode not in valid_modes:
@@ -192,7 +193,7 @@ class KVPPContext:
         return kv_cache
 
     def wait_for_current_layer(self, layer_name: str) -> None:
-        """Order current-token KV writes after all owner page pushes."""
+        """Order cache use, then prefetch the next layer before attention."""
         if self._current_layer != layer_name:
             raise RuntimeError(f"No pending KVPP transfer for layer {layer_name}.")
         if self.overlap_mode != "baseline":
@@ -210,6 +211,20 @@ class KVPPContext:
                 ):
                     self._transfer_future.result()
             self._transfer_waited = True
+            if self.overlap_mode == "previous_layer":
+                # The current transfer is remotely visible now. Its buffer is
+                # read by the attention about to be submitted, while the other
+                # scratch buffer can receive the next layer immediately. This
+                # overlaps the next transfer with current attention, o_proj,
+                # and MLP/MoE rather than only the post-attention tail.
+                self._pending_layer = None
+                self._transfer_future = None
+                layer_index = self._layer_indices[layer_name]
+                next_index = layer_index + 1
+                if next_index < len(self._ordered_layers):
+                    self._start_overlap_transfer(
+                        self._ordered_layers[next_index]
+                    )
             return
         if self._transfer_submitted:
             layer_index = self._layer_indices[layer_name]
@@ -236,12 +251,13 @@ class KVPPContext:
         self._current_layer = None
 
     def finish_layer_attention(self, layer_name: str) -> None:
-        """Release this layer's scratch and optionally prefetch the next one.
+        """Mark the current layer's attention submission complete.
 
         The call site is after all attention kernels that consume historical
         KV have been submitted, but before o_proj and the layer MLP/MoE. A
-        device event recorded here is therefore the earliest safe signal that
-        every peer may overwrite the shared scratch cache.
+        With dual scratch buffers the next transfer was already submitted just
+        before this attention. Compute-stream ordering protects reuse when the
+        buffer cycles back two layers later.
         """
         if self.overlap_mode == "baseline":
             return
@@ -252,16 +268,10 @@ class KVPPContext:
             )
 
         self._current_layer = None
-        self._pending_layer = None
-        self._transfer_future = None
         self._transfer_waited = False
-
-        if self.overlap_mode != "previous_layer":
-            return
-        layer_index = self._layer_indices[layer_name]
-        next_index = layer_index + 1
-        if next_index < len(self._ordered_layers):
-            self._start_overlap_transfer(self._ordered_layers[next_index])
+        if self.overlap_mode == "current_layer":
+            self._pending_layer = None
+            self._transfer_future = None
 
     def _start_overlap_transfer(self, layer_name: str) -> None:
         if self._pending_layer is not None:
@@ -275,11 +285,14 @@ class KVPPContext:
         if self._executor is None or self._comm_stream is None:
             raise RuntimeError("KVPP overlap worker was not initialized.")
 
-        # All ranks publish a local safe point. The owner does not write a
-        # peer's scratch until that peer reports this event complete.
+        # All ranks publish a local safe point. Alternating layers use distinct
+        # buffers. When a buffer cycles back after two layers, this event is
+        # ordered after all earlier attention work on the compute stream, so
+        # the owner cannot overwrite a buffer that is still being read.
         scratch_ready = torch.npu.Event()
         scratch_ready.record(torch.npu.current_stream())
         pages = self._selected_pages
+        assert pages is not None
         self._transfer_future = self._executor.submit(
             self._run_overlap_transfer, layer_name, pages, scratch_ready
         )

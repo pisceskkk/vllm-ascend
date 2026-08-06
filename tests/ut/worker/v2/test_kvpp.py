@@ -430,7 +430,7 @@ def test_owner_uses_persistent_cache():
     context.wait_for_current_layer("layer")
 
 
-def test_previous_layer_mode_prefetches_layers_in_forward_order():
+def test_previous_layer_mode_prefetches_before_current_attention():
     group = SimpleNamespace(rank_in_group=0, world_size=1)
     context = KVPPContext(
         group=group,
@@ -446,6 +446,7 @@ def test_previous_layer_mode_prefetches_layers_in_forward_order():
 
     context.begin_layer("layer.0", cache)
     context.wait_for_current_layer("layer.0")
+    assert context._pending_layer == "layer.1"
     context.finish_layer_attention("layer.0")
 
     assert context._pending_layer == "layer.1"
@@ -453,6 +454,19 @@ def test_previous_layer_mode_prefetches_layers_in_forward_order():
     context.wait_for_current_layer("layer.1")
     context.finish_layer_attention("layer.1")
     assert context._pending_layer is None
+
+
+def test_dual_buffer_overlap_is_the_default(monkeypatch):
+    monkeypatch.delenv("ASCEND_KVPP_OVERLAP_MODE", raising=False)
+    context = KVPPContext(
+        group=SimpleNamespace(rank_in_group=0, world_size=1),
+        layer_owners={"layer": 0},
+        num_blocks=10,
+        block_size=4,
+        transport=SimpleNamespace(),
+    )
+
+    assert context.overlap_mode == "previous_layer"
 
 
 def test_invalid_overlap_mode_is_rejected():
