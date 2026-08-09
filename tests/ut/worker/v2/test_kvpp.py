@@ -456,6 +456,66 @@ def test_previous_layer_mode_prefetches_before_current_attention():
     assert context._pending_layer is None
 
 
+def test_sfa_execution_layers_bundle_main_and_indexer_caches():
+    attn_layers = (
+        "model.layers.0.self_attn.attn",
+        "model.layers.1.self_attn.attn",
+    )
+    indexer_layers = (
+        "model.layers.0.self_attn.indexer.k_cache",
+        "model.layers.1.self_attn.indexer.k_cache",
+    )
+    owners = {
+        attn_layers[0]: 0,
+        indexer_layers[0]: 0,
+        attn_layers[1]: 1,
+        indexer_layers[1]: 1,
+    }
+    context = KVPPContext(
+        group=SimpleNamespace(rank_in_group=0, world_size=1),
+        layer_owners=owners,
+        num_blocks=10,
+        block_size=4,
+        execution_layers=attn_layers,
+        transport=SimpleNamespace(),
+        overlap_mode="previous_layer",
+    )
+
+    assert context._ordered_layers == attn_layers
+    assert context._layer_bundles == {
+        attn_layers[0]: (attn_layers[0], indexer_layers[0]),
+        attn_layers[1]: (attn_layers[1], indexer_layers[1]),
+    }
+    assert context._execution_owners == {
+        attn_layers[0]: 0,
+        attn_layers[1]: 1,
+    }
+
+    context.prepare_batch(
+        torch.tensor([[7, 2]], dtype=torch.int32), torch.tensor([5])
+    )
+    cache = (torch.zeros((10, 4, 1)),)
+    context.begin_layer(attn_layers[0], cache)
+    context.wait_for_current_layer(attn_layers[0])
+    assert context._pending_layer == attn_layers[1]
+    context.finish_layer_attention(attn_layers[0])
+
+
+def test_sfa_cache_bundle_rejects_mismatched_owners():
+    attn_layer = "model.layers.0.self_attn.attn"
+    indexer_layer = "model.layers.0.self_attn.indexer.k_cache"
+
+    with pytest.raises(ValueError, match="spans owners"):
+        KVPPContext(
+            group=SimpleNamespace(rank_in_group=0, world_size=1),
+            layer_owners={attn_layer: 0, indexer_layer: 1},
+            num_blocks=10,
+            block_size=4,
+            execution_layers=(attn_layer,),
+            transport=SimpleNamespace(),
+        )
+
+
 def test_dual_buffer_overlap_is_the_default(monkeypatch):
     monkeypatch.delenv("ASCEND_KVPP_OVERLAP_MODE", raising=False)
     context = KVPPContext(

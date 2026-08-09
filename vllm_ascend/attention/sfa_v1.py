@@ -540,6 +540,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.q_b_proj = kwargs["q_b_proj"]
         self.skip_topk = kwargs.get("skip_topk", False)
         self.topk_indices_buffer = kwargs.get("topk_indices_buffer")
+        # Injected by the v2 model runner when KV layer parallelism is active.
+        # The context bundles this main SFA cache with the same transformer
+        # layer's indexer K/scale cache, including the LI-C8 layout.
+        self.kvpp_context = None
 
         ascend_config = get_ascend_config()
         self.vllm_config = get_current_vllm_config()
@@ -1796,6 +1800,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             # Profiling run.
             return output.fill_(0)
 
+        if self.kvpp_context is not None:
+            kv_cache = self.kvpp_context.begin_layer(layer_name, kv_cache)
         composed_kv_cache = self._compose_sfa_kv_cache(kv_cache)
         assert composed_kv_cache is not None
         kv_cache = composed_kv_cache
@@ -1852,6 +1858,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             else:
                 k_li, k_li_scale = None, None
             wait_for_kv_layer_from_connector(layer_name)
+            if self.kvpp_context is not None:
+                # The fused preprocess is the first operation that may read or
+                # update the paged SFA and LI caches.
+                self.kvpp_context.wait_for_current_layer(layer_name)
 
             if fused_type == PreprocessType.PROLOG_V3:
                 hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_prolog_v3(
@@ -1895,6 +1905,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                 k_li, k_li_scale = None, None
 
             wait_for_kv_layer_from_connector(layer_name)
+            if self.kvpp_context is not None:
+                # Q/KV and lightning-indexer projections above overlap the
+                # active-page transfer. Wait only before the first cache write.
+                self.kvpp_context.wait_for_current_layer(layer_name)
 
             if self.enable_dsa_cp:
                 assert slot_mapping_cp is not None
@@ -2020,6 +2034,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_query,
             actual_seq_lengths_key,
         )
+        if self.kvpp_context is not None:
+            # The sparse attention kernel has consumed historical SFA and LI
+            # pages. The next transformer layer already uses the other scratch
+            # bundle and can continue transferring through v_up/o_proj/MoE.
+            self.kvpp_context.finish_layer_attention(layer_name)
 
         attn_output = self._v_up_proj(attn_output)
 

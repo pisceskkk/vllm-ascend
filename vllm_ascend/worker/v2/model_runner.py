@@ -177,23 +177,34 @@ class NPUModelRunner(GPUModelRunner):
         blocks_per_kv_block = self.block_tables.blocks_per_kv_block[0]
         num_kernel_blocks = self.kv_cache_config.num_blocks * blocks_per_kv_block
         block_size = self.block_tables.kernel_block_sizes[0]
+        kvpp_impls: dict[str, Any] = {}
+        for layer_name, module in self.compilation_config.static_forward_context.items():
+            if layer_name not in layer_owners:
+                continue
+            impl = getattr(module, "impl", None)
+            # Main MLA/SFA attention implementations expose this marker. SFA
+            # indexer cache layers have their own AttentionImpl, but execute as
+            # part of the main SFA forward and are bundled by transformer index.
+            if impl is not None and hasattr(impl, "kvpp_context"):
+                kvpp_impls[layer_name] = impl
+        if not kvpp_impls:
+            raise RuntimeError(
+                "KVPP did not find an MLA or SFA attention implementation to "
+                "drive layer transfers."
+            )
         kvpp_context = KVPPContext(
             kvpp_group,
             layer_owners,
             num_blocks=num_kernel_blocks,
             block_size=block_size,
+            execution_layers=tuple(kvpp_impls),
         )
         if self._kvpp_kv_caches is None:
             raise RuntimeError("KVPP cache tensors were not retained during allocation.")
         kvpp_context.initialize_transport(self._kvpp_kv_caches)
         self._kvpp_kv_caches = None
         self.kvpp_context = kvpp_context
-        for layer_name, module in self.compilation_config.static_forward_context.items():
-            if layer_name not in layer_owners:
-                continue
-            impl = getattr(module, "impl", None)
-            if impl is None:
-                raise RuntimeError(f"KVPP layer {layer_name} does not expose an attention impl.")
+        for impl in kvpp_impls.values():
             impl.kvpp_context = kvpp_context
 
     def prepare_attn(

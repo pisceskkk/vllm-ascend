@@ -6,6 +6,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from vllm.distributed.parallel_state import GroupCoordinator
+from vllm.v1.core.kv_cache_utils import extract_layer_index
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.kvpp_transport import (
     KVPPActivePages,
@@ -79,15 +80,18 @@ class KVPPContext:
     layer_owners: dict[str, int]
     num_blocks: int
     block_size: int
+    execution_layers: tuple[str, ...] | None = None
     transport: KVPPTransport | None = None
     overlap_mode: str | None = None
     _selected_pages: KVPPActivePages | None = None
     _comm_stream: Any | None = None
-    _transfer_completion: KVPPCompletion | None = None
+    _transfer_completions: list[KVPPCompletion] = field(default_factory=list)
     _transfer_submitted: bool = False
     _current_layer: str | None = None
     _ordered_layers: tuple[str, ...] = field(init=False)
     _layer_indices: dict[str, int] = field(init=False)
+    _layer_bundles: dict[str, tuple[str, ...]] = field(init=False)
+    _execution_owners: dict[str, int] = field(init=False)
     _executor: ThreadPoolExecutor | None = field(
         default=None, init=False, repr=False
     )
@@ -109,7 +113,57 @@ class KVPPContext:
                 "ASCEND_KVPP_OVERLAP_MODE must be one of "
                 f"{sorted(valid_modes)}, got {self.overlap_mode!r}."
             )
-        self._ordered_layers = tuple(self.layer_owners)
+        if self.execution_layers is None:
+            self._ordered_layers = tuple(self.layer_owners)
+            self._layer_bundles = {
+                layer_name: (layer_name,) for layer_name in self._ordered_layers
+            }
+        else:
+            self._ordered_layers = tuple(self.execution_layers)
+            if not self._ordered_layers:
+                raise ValueError("KVPP requires at least one executable attention layer.")
+            cache_layers_by_index: dict[int, list[str]] = {}
+            for cache_layer_name in self.layer_owners:
+                cache_layers_by_index.setdefault(
+                    extract_layer_index(cache_layer_name), []
+                ).append(cache_layer_name)
+            self._layer_bundles = {}
+            claimed_indices: set[int] = set()
+            for layer_name in self._ordered_layers:
+                if layer_name not in self.layer_owners:
+                    raise ValueError(
+                        f"KVPP execution layer {layer_name} has no KV cache owner."
+                    )
+                layer_index = extract_layer_index(layer_name)
+                if layer_index in claimed_indices:
+                    raise ValueError(
+                        "KVPP received multiple executable attention layers for "
+                        f"transformer layer {layer_index}."
+                    )
+                claimed_indices.add(layer_index)
+                self._layer_bundles[layer_name] = tuple(
+                    cache_layers_by_index[layer_index]
+                )
+            unclaimed = {
+                cache_layer_name
+                for layer_index, cache_layer_names in cache_layers_by_index.items()
+                if layer_index not in claimed_indices
+                for cache_layer_name in cache_layer_names
+            }
+            if unclaimed:
+                raise ValueError(
+                    "KVPP cache layers have no executable attention owner: "
+                    f"{sorted(unclaimed)}."
+                )
+
+        self._execution_owners = {}
+        for layer_name, cache_layer_names in self._layer_bundles.items():
+            owners = {self.layer_owners[name] for name in cache_layer_names}
+            if len(owners) != 1:
+                raise ValueError(
+                    f"KVPP cache bundle for {layer_name} spans owners {sorted(owners)}."
+                )
+            self._execution_owners[layer_name] = owners.pop()
         self._layer_indices = {
             layer_name: index
             for index, layer_name in enumerate(self._ordered_layers)
@@ -165,8 +219,8 @@ class KVPPContext:
             return kv_cache
 
         self._current_layer = layer_name
-        self._transfer_completion = None
-        owner_rank = self.layer_owners[layer_name]
+        self._transfer_completions.clear()
+        owner_rank = self._execution_owners[layer_name]
         self._transfer_submitted = self.group.world_size > 1
         if not self._transfer_submitted:
             return kv_cache
@@ -187,9 +241,14 @@ class KVPPContext:
             self._comm_stream = torch.npu.Stream()
         if owner_rank == self.group.rank_in_group:
             with torch.npu.stream(self._comm_stream):
-                self._transfer_completion = self.transport.push_active_pages(
-                    layer_name, self._selected_pages, self._comm_stream
-                )
+                self._transfer_completions = [
+                    self.transport.push_active_pages(
+                        cache_layer_name,
+                        self._selected_pages,
+                        self._comm_stream,
+                    )
+                    for cache_layer_name in self._layer_bundles[layer_name]
+                ]
         return kv_cache
 
     def wait_for_current_layer(self, layer_name: str) -> None:
@@ -231,31 +290,37 @@ class KVPPContext:
             with torch.profiler.record_function(
                 f"kvpp.baseline.transfer_wait.layer_{layer_index}"
             ):
-                if self._transfer_completion is not None:
+                for completion in self._transfer_completions:
                     # A local device dependency is insufficient before the CPU
                     # rendezvous: the backend must confirm remote visibility.
-                    self._transfer_completion.wait()
+                    completion.wait()
                 dist.barrier(group=self.group.cpu_group)
                 assert self._comm_stream is not None
                 assert self._selected_pages is not None
                 with torch.npu.stream(self._comm_stream):
-                    receive_completion = self.transport.receive_active_pages(
-                        layer_name, self._selected_pages, self._comm_stream
-                    )
+                    receive_completions = [
+                        self.transport.receive_active_pages(
+                            cache_layer_name,
+                            self._selected_pages,
+                            self._comm_stream,
+                        )
+                        for cache_layer_name in self._layer_bundles[layer_name]
+                    ]
                 # SDMA records an immediate event because its push targets the
                 # final scratch addresses. MTE waits here for receive-side
                 # staging unpack before this rank enters attention.
-                receive_completion.wait()
+                for completion in receive_completions:
+                    completion.wait()
         self._transfer_submitted = False
-        self._transfer_completion = None
+        self._transfer_completions.clear()
         self._current_layer = None
 
     def finish_layer_attention(self, layer_name: str) -> None:
         """Mark the current layer's attention submission complete.
 
         The call site is after all attention kernels that consume historical
-        KV have been submitted, but before o_proj and the layer MLP/MoE. A
-        With dual scratch buffers the next transfer was already submitted just
+        KV have been submitted, but before o_proj and the layer MLP/MoE. With
+        dual scratch buffers the next transfer was already submitted just
         before this attention. Compute-stream ordering protects reuse when the
         buffer cycles back two layers later.
         """
@@ -309,7 +374,7 @@ class KVPPContext:
         if self._device_id is not None:
             torch.npu.set_device(self._device_id)
 
-        owner_rank = self.layer_owners[layer_name]
+        owner_rank = self._execution_owners[layer_name]
         local_rank = self.group.rank_in_group
         owner_global_rank = self.group.ranks[owner_rank]
         layer_index = self._layer_indices[layer_name]
@@ -348,12 +413,14 @@ class KVPPContext:
                     f"kvpp.transport_receive.layer_{layer_index}"
                 ):
                     with torch.npu.stream(self._comm_stream):
-                        receive_completion = (
+                        receive_completions = [
                             self.transport.receive_active_pages(
-                                layer_name, pages, self._comm_stream
+                                cache_layer_name, pages, self._comm_stream
                             )
-                        )
-                    receive_completion.wait()
+                            for cache_layer_name in self._layer_bundles[layer_name]
+                        ]
+                    for completion in receive_completions:
+                        completion.wait()
                 return
 
             with torch.profiler.record_function(
@@ -373,13 +440,17 @@ class KVPPContext:
                 f"kvpp.transport_push.layer_{layer_index}"
             ):
                 with torch.npu.stream(self._comm_stream):
-                    completion = self.transport.push_active_pages(
-                        layer_name, pages, self._comm_stream
-                    )
+                    completions = [
+                        self.transport.push_active_pages(
+                            cache_layer_name, pages, self._comm_stream
+                        )
+                        for cache_layer_name in self._layer_bundles[layer_name]
+                    ]
                 # Only the communication worker waits on the host. The compute
                 # thread continues until this layer first writes/reads its
                 # paged KV cache.
-                completion.wait()
+                for completion in completions:
+                    completion.wait()
 
             with torch.profiler.record_function(
                 f"kvpp.done_send.layer_{layer_index}"
