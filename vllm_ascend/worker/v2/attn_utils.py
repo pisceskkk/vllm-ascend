@@ -28,6 +28,8 @@ from vllm.config import VllmConfig, get_current_vllm_config, get_layers_from_vll
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -43,9 +45,18 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.core.kv_cache_interface import (
+    AscendMLAAttentionSpec,
+    AscendSFAIndexerCacheSpec,
+)
 from vllm_ascend.quantization.utils import enable_fa_quant
-from vllm_ascend.utils import calc_split_factor
+from vllm_ascend.utils import (
+    AscendDeviceType,
+    calc_split_factor,
+    enable_sfa_dcp_replicated_indexer,
+    get_ascend_device_type,
+)
 
 _ATTENTION_MASK_BUILDER = None
 
@@ -80,6 +91,31 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 head_size=head_size,
                 dtype=dtype,
                 cache_dtype_str=cache_dtype_str,
+            )
+            continue
+        if isinstance(attn_module, DeepseekV32IndexerCache):
+            ascend_config = get_ascend_config()
+            cache_sparse_li_c8 = ascend_config.is_sparse_li_c8_layer(layer_name)
+            is_a5 = get_ascend_device_type() == AscendDeviceType.A5
+            if cache_sparse_li_c8:
+                cache_dtype = torch.float8_e4m3fn if is_a5 else torch.int8
+            else:
+                cache_dtype = vllm_config.model_config.dtype
+            replicated_size = (
+                vllm_config.parallel_config.decode_context_parallel_size
+                if enable_sfa_dcp_replicated_indexer(vllm_config)
+                else 1
+            )
+            kv_cache_spec[layer_name] = AscendSFAIndexerCacheSpec(
+                block_size=attn_module.cache_config.block_size,
+                num_kv_heads=1,
+                head_size=vllm_config.model_config.hf_text_config.index_head_dim,
+                dtype=cache_dtype,
+                cache_dtype_str=vllm_config.cache_config.cache_dtype,
+                scale_dim=1 if cache_sparse_li_c8 else 0,
+                scale_dtype=torch.float32 if is_a5 else torch.float16,
+                cache_sparse_li_c8=cache_sparse_li_c8,
+                sfa_dcp_replicated_indexer_size=replicated_size,
             )
 
     return kv_cache_spec
@@ -263,7 +299,7 @@ def _allocate_kv_cache(
     kv_cache_config: KVCacheConfig,
     shared_layers: dict[str, str],
     device: torch.device,
-) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+) -> dict[str, tuple[torch.Tensor, ...]]:
     """
     Initialize the KV cache buffer with the correct size. The buffer needs to be
     reshaped to the desired shape before being used by the models.
@@ -281,7 +317,7 @@ def _allocate_kv_cache(
     vllm_config = get_current_vllm_config()
 
     # init kv cache tensors
-    kv_cache_raw_tensors: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    kv_cache_raw_tensors: dict[str, tuple[torch.Tensor, ...]] = {}
     # prefill disaggregation need the addr of cache tensor be aligned with 2M
     alignment = 2 * 1024 * 1024
     layer_kv_cache_spec = _get_layer_kv_cache_specs(kv_cache_config)
@@ -298,6 +334,39 @@ def _allocate_kv_cache(
         example_layer_name = kv_cache_tensor.shared_by[0]
         example_kv_cache_spec = layer_kv_cache_spec[example_layer_name]
         assert isinstance(example_kv_cache_spec, AttentionSpec)
+
+        if isinstance(example_kv_cache_spec, AscendSFAIndexerCacheSpec):
+            num_blocks = kv_cache_tensor.size // example_kv_cache_spec.page_size_bytes
+            replicated_blocks = (
+                num_blocks
+                * example_kv_cache_spec.sfa_dcp_replicated_indexer_size
+            )
+            k_tensor_size = (
+                replicated_blocks
+                * example_kv_cache_spec.block_size
+                * example_kv_cache_spec.num_kv_heads
+                * example_kv_cache_spec.head_size
+                * get_dtype_size(example_kv_cache_spec.dtype)
+            )
+            raw_cache: tuple[torch.Tensor, ...]
+            k_tensor = torch.zeros(k_tensor_size, dtype=torch.int8, device=device)
+            if example_kv_cache_spec.scale_dim:
+                scale_tensor_size = (
+                    replicated_blocks
+                    * example_kv_cache_spec.block_size
+                    * example_kv_cache_spec.num_kv_heads
+                    * example_kv_cache_spec.scale_dim
+                    * get_dtype_size(example_kv_cache_spec.scale_dtype)
+                )
+                scale_tensor = torch.zeros(
+                    scale_tensor_size, dtype=torch.int8, device=device
+                )
+                raw_cache = (k_tensor, scale_tensor)
+            else:
+                raw_cache = (k_tensor,)
+            for layer_name in kv_cache_tensor.shared_by:
+                kv_cache_raw_tensors[layer_name] = raw_cache
+            continue
 
         k_dim, v_dim = _get_attention_kv_cache_dims(example_layer_name, example_kv_cache_spec)
         assert k_dim > 0 and v_dim > 0
@@ -435,7 +504,7 @@ def _reshape_kv_cache(
 
 def _reshape_kv_cache_v2(
     attn_groups: Sequence[AttentionGroup],
-    kv_cache_raw_tensors: dict[str, tuple[torch.Tensor, torch.Tensor]],
+    kv_cache_raw_tensors: dict[str, tuple[torch.Tensor, ...]],
     cache_dtype: str,
     kernel_block_sizes: list[int],
     shared_kv_cache_layers: dict[str, str],
@@ -463,7 +532,46 @@ def _reshape_kv_cache_v2(
 
             assert isinstance(kv_cache_spec, AttentionSpec)
 
-            raw_k_tensor, raw_v_tensor = kv_cache_raw_tensors[layer_name]
+            raw_cache = kv_cache_raw_tensors[layer_name]
+            if isinstance(kv_cache_spec, AscendSFAIndexerCacheSpec):
+                raw_k_tensor = raw_cache[0]
+                raw_scale_tensor = raw_cache[1] if len(raw_cache) == 2 else None
+                total_bytes = raw_k_tensor.numel() + (
+                    raw_scale_tensor.numel() if raw_scale_tensor is not None else 0
+                )
+                assert total_bytes % kv_cache_spec.page_size_bytes == 0
+                num_blocks = total_bytes // kv_cache_spec.page_size_bytes
+                replicated_blocks = (
+                    num_blocks * kv_cache_spec.sfa_dcp_replicated_indexer_size
+                )
+                indexer_k_shape = group.backend.get_kv_cache_shape(
+                    replicated_blocks,
+                    kv_cache_spec.block_size,
+                    kv_cache_spec.num_kv_heads,
+                    kv_cache_spec.head_size,
+                )
+                indexer_k_cache = raw_k_tensor.view(kv_cache_spec.dtype).view(
+                    indexer_k_shape
+                )
+                if raw_scale_tensor is None:
+                    kv_caches[layer_name] = (indexer_k_cache,)
+                else:
+                    indexer_scale_shape = group.backend.get_kv_cache_shape(
+                        replicated_blocks,
+                        kv_cache_spec.block_size,
+                        kv_cache_spec.num_kv_heads,
+                        kv_cache_spec.scale_dim,
+                    )
+                    indexer_scale_cache = raw_scale_tensor.view(
+                        kv_cache_spec.scale_dtype
+                    ).view(indexer_scale_shape)
+                    kv_caches[layer_name] = (
+                        indexer_k_cache,
+                        indexer_scale_cache,
+                    )
+                continue
+
+            raw_k_tensor, raw_v_tensor = raw_cache
             assert raw_k_tensor is not None
             assert raw_v_tensor is not None
             sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
