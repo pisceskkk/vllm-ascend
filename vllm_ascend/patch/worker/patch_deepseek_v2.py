@@ -23,6 +23,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.deepseek_v2 import (
     DeepSeekV2FusedQkvAProjLinear,
+    DeepseekV32IndexerCache,
     DeepseekV2MLAAttention,
     DeepseekV2Model,
     Indexer,
@@ -31,6 +32,16 @@ from vllm.model_executor.models.deepseek_v2 import (
 )
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.sequence import IntermediateTensors
+
+from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
+
+
+def _get_ascend_sfa_indexer_backend(self):
+    """Use the cache-only backend for the split SFA indexer cache."""
+    return AscendSFAIndexerBackend
+
+
+DeepseekV32IndexerCache.get_attn_backend = _get_ascend_sfa_indexer_backend
 
 
 def _should_skip_indexer_init(

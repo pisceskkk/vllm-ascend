@@ -2,6 +2,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+import vllm_ascend.patch.worker.patch_deepseek_v2  # noqa: F401
 from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
 from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
 from vllm_ascend.worker.v2.attn_utils import (
@@ -9,7 +10,6 @@ from vllm_ascend.worker.v2.attn_utils import (
     _reshape_kv_cache_v2,
     get_kv_cache_spec,
 )
-
 
 def _li_c8_spec() -> AscendSFAIndexerCacheSpec:
     return AscendSFAIndexerCacheSpec(
@@ -60,6 +60,7 @@ def test_get_kv_cache_spec_includes_glm_li_c8_indexer():
     assert spec.dtype == torch.int8
     assert spec.scale_dim == 1
     assert spec.scale_dtype == torch.float16
+    assert indexer.get_attn_backend() is AscendSFAIndexerBackend
 
 
 def test_li_c8_indexer_allocate_and_reshape_keeps_key_and_scale_handles():
