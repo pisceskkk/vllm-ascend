@@ -71,6 +71,11 @@ class AscendModelState(DefaultModelState):
             # extra attributes for ascend npus.
             seq_lens_np=input_batch.seq_lens_np,
             positions=input_batch.positions,
+            # SFA/DSA metadata builders use num_input_tokens to slice
+            # positions, slot_mapping, and rotary tensors. Keep this aligned
+            # with the token extent selected above (padded for FULL graphs,
+            # actual tokens for eager and piecewise execution).
+            num_input_tokens=num_tokens,
             attn_state=input_batch.attn_state,
             for_cudagraph_capture=for_capture,
         )
