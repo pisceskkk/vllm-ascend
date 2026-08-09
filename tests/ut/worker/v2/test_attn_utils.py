@@ -28,8 +28,9 @@ def _li_c8_spec() -> AscendSFAIndexerCacheSpec:
 def test_get_kv_cache_spec_includes_glm_li_c8_indexer():
     from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 
-    indexer = MagicMock(spec=DeepseekV32IndexerCache)
-    indexer.cache_config.block_size = 128
+    indexer = DeepseekV32IndexerCache.__new__(DeepseekV32IndexerCache)
+    torch.nn.Module.__init__(indexer)
+    indexer.cache_config = MagicMock(block_size=128)
     config = MagicMock()
     config.model_config.hf_text_config.index_head_dim = 128
     config.model_config.dtype = torch.bfloat16
