@@ -1394,9 +1394,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         k_li = self.k_norm(k_li).unsqueeze(1)
         k_li = k_li.view(-1, 1, self.head_dim)
 
+        cos, sin = self._indexer_rope_for_tokens(
+            cos,
+            sin,
+            k_li.shape[0],
+        )
+
         if HAS_TRITON:
-            cos = cos.view(-1, self.qk_rope_head_dim)
-            sin = sin.view(-1, self.qk_rope_head_dim)
             k_li = rope_forward_triton_siso(
                 k_li, cos, sin, rope_dim=self.qk_rope_head_dim, is_neox_style=self.is_rope_neox_style
             )
@@ -1423,6 +1427,33 @@ class AscendSFAImpl(MLAAttentionImpl):
             k_li_scale = None
 
         return k_li, k_li_scale
+
+    def _indexer_rope_for_tokens(
+        self,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        num_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Remove runner padding from LI rotary tensors.
+
+        v2 metadata may retain a padded ``num_input_tokens`` extent while the
+        lightning-indexer projection contains only the actual model tokens.
+        The padding is always at the tail, so preserve the original token
+        order and reject undersized or inconsistent rotary inputs.
+        """
+        cos = cos.reshape(-1, self.qk_rope_head_dim)
+        sin = sin.reshape(-1, self.qk_rope_head_dim)
+        if cos.shape != sin.shape:
+            raise RuntimeError(
+                "SFA indexer cos/sin shapes must match, "
+                f"got cos={tuple(cos.shape)} and sin={tuple(sin.shape)}."
+            )
+        if cos.shape[0] < num_tokens:
+            raise RuntimeError(
+                "SFA indexer rotary metadata has fewer tokens than the "
+                f"projection: rope_tokens={cos.shape[0]}, projection_tokens={num_tokens}."
+            )
+        return cos[:num_tokens], sin[:num_tokens]
 
     def indexer_select_post_process(
         self,
@@ -1472,6 +1503,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         else:
             q_li, _ = self.wq_b(q_c)
         q_li = q_li.view(-1, self.n_head, self.head_dim)
+        cos, sin = self._indexer_rope_for_tokens(
+            cos,
+            sin,
+            q_li.shape[0],
+        )
         if HAS_TRITON:
             q_li = rope_forward_triton_siso(
                 q_li, cos, sin, rope_dim=self.qk_rope_head_dim, is_neox_style=self.is_rope_neox_style
@@ -1481,6 +1517,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 q_li, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1
             )
 
+            cos = cos.view(-1, 1, 1, self.qk_rope_head_dim)
+            sin = sin.view(-1, 1, 1, self.qk_rope_head_dim)
             q_li_pe = q_li_pe.unsqueeze(2)
             q_li_pe = torch_npu.npu_rotary_mul(q_li_pe, cos, sin)
             q_li_pe = q_li_pe.squeeze(2)

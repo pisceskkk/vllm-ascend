@@ -33,6 +33,36 @@ from vllm_ascend.quantization.methods import (
 from vllm_ascend.utils import enable_dsa_cp
 
 
+class TestAscendSFAIndexerRope(TestBase):
+    def setUp(self):
+        self.impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        self.impl.qk_rope_head_dim = 4
+
+    def test_trims_tail_padding(self):
+        cos = torch.arange(24).view(6, 1, 1, 4)
+        sin = cos + 100
+
+        actual_cos, actual_sin = self.impl._indexer_rope_for_tokens(cos, sin, 4)
+
+        self.assertEqual(actual_cos.shape, (4, 4))
+        self.assertTrue(torch.equal(actual_cos, cos.view(6, 4)[:4]))
+        self.assertTrue(torch.equal(actual_sin, sin.view(6, 4)[:4]))
+
+    def test_rejects_undersized_metadata(self):
+        cos = torch.zeros(3, 4)
+        sin = torch.zeros(3, 4)
+
+        with self.assertRaisesRegex(RuntimeError, "fewer tokens"):
+            self.impl._indexer_rope_for_tokens(cos, sin, 4)
+
+    def test_rejects_mismatched_cos_sin(self):
+        cos = torch.zeros(4, 4)
+        sin = torch.zeros(3, 4)
+
+        with self.assertRaisesRegex(RuntimeError, "shapes must match"):
+            self.impl._indexer_rope_for_tokens(cos, sin, 4)
+
+
 class TestAscendSFABackend(TestBase):
     def setUp(self):
         self.mock_config = MagicMock()
