@@ -25,6 +25,28 @@ from vllm.distributed.parallel_state import GroupCoordinator
 from tests.ut.base import TestBase
 
 
+class TestBlockTableCommit(unittest.TestCase):
+    def test_commit_uses_independent_pinned_snapshot(self):
+        from vllm_ascend.worker.block_table import BlockTable
+
+        block_table = BlockTable.__new__(BlockTable)
+        cpu = MagicMock()
+        gpu = MagicMock()
+        cpu_view = cpu.__getitem__.return_value
+        cloned_view = cpu_view.clone.return_value
+        pinned_snapshot = cloned_view.pin_memory.return_value
+        gpu_view = gpu.__getitem__.return_value
+        block_table.block_table = MagicMock(cpu=cpu, gpu=gpu)
+
+        block_table.commit_block_table(3)
+
+        cpu.__getitem__.assert_called_once_with(slice(None, 3))
+        cpu_view.clone.assert_called_once_with()
+        cloned_view.pin_memory.assert_called_once_with()
+        gpu.__getitem__.assert_called_once_with(slice(None, 3))
+        gpu_view.copy_.assert_called_once_with(pinned_snapshot, non_blocking=True)
+
+
 class TestBlockTableComputeSlotMapping(TestBase):
     """Test suite for BlockTable.compute_slot_mapping() method
 
