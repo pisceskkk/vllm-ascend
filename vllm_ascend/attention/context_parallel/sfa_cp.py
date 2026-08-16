@@ -41,6 +41,8 @@ class DCPContext:
     slot_mapping: torch.Tensor
     block_table: torch.Tensor
     seq_lens: torch.Tensor
+    dcp_size: int = 1
+    blocks_per_phys_block: int = 1
     kv_gather_block_ids: torch.Tensor | None = None
     kv_gather_block_table: torch.Tensor | None = None
     gather_context: DCPGatherContext | None = None
@@ -334,6 +336,8 @@ class AscendSFADCPMetadataBuilder(
             slot_mapping=dcp_slot_mapping[:num_input_tokens],
             block_table=dcp_block_table,
             seq_lens=local_seq_lens,
+            dcp_size=self.dcp_size,
+            blocks_per_phys_block=self.blocks_per_phys_block,
             kv_gather_block_ids=kv_gather_block_ids,
             kv_gather_block_table=kv_gather_block_table,
         )

@@ -7,6 +7,7 @@ from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec, UniformTypeK
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.block_table import _compute_slot_mapping_kernel
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
 
 
@@ -276,6 +277,26 @@ class BlockTable:
             self.slot_mapping.cpu[: req_indices.shape[0]] = torch.where(mask, slot_mapping, -1)
 
     def commit_block_table(self, num_reqs: int) -> None:
+        if envs_ascend.VLLM_ASCEND_QLI_VALIDATE_BLOCK_TABLE:
+            # Keep an immutable view of the intended source before enqueueing
+            # the normal non-blocking copy. A mismatch identifies corruption at
+            # the mutable pinned-CPU -> NPU ownership boundary, before SFA-DCP
+            # derives its replicated view.
+            expected_cpu = self.block_table.cpu[:num_reqs].clone()
+            self.block_table.copy_to_gpu(num_reqs)
+            expected_gpu = expected_cpu.to(device=self.device)
+            mismatch = self.block_table.gpu[:num_reqs] != expected_gpu
+            mismatch_indices = torch.nonzero(mismatch, as_tuple=False)
+            if mismatch_indices.numel() != 0:
+                row = int(mismatch_indices[0, 0].item())
+                col = int(mismatch_indices[0, 1].item())
+                raise RuntimeError(
+                    "QLI block-table validation failed: "
+                    "source=cpu_to_npu_transfer_or_cpu_source_overwrite, "
+                    f"row={row}, col={col}, expected_id={int(expected_gpu[row, col].item())}, "
+                    f"actual_id={int(self.block_table.gpu[row, col].item())}"
+                )
+            return
         self.block_table.copy_to_gpu(num_reqs)
 
     def clear(self) -> None:

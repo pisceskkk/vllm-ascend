@@ -104,6 +104,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Validate the active LightningIndexer block-table window at each host-side
+    # ownership boundary. This intentionally synchronizes device work and is
+    # meant only for diagnosing block-table corruption or cache-binding issues.
+    "VLLM_ASCEND_QLI_VALIDATE_BLOCK_TABLE": lambda: bool(int(os.getenv("VLLM_ASCEND_QLI_VALIDATE_BLOCK_TABLE", "0"))),
 }
 
 # end-env-vars-definition

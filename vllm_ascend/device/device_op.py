@@ -23,6 +23,8 @@ import torch.nn.functional as F
 import torch_npu
 from vllm.triton_utils import HAS_TRITON
 
+import vllm_ascend.envs as envs_ascend
+from vllm_ascend.attention.qli_validation import validate_qli_block_table
 from vllm_ascend.device import utils as device_utils
 from vllm_ascend.device.mxfp_compat import (
     FLOAT8_E8M0FNU_DTYPE,
@@ -488,6 +490,21 @@ class BaseDeviceAdaptor:
         # TODO: torch.ops._C_ascend.npu_lightning_indexer needs to be removed.
         indexer_cache_idx = sfa_impl.kv_cache_indexer_k_idx
         indexer_scale_cache_idx = sfa_impl.kv_cache_indexer_scale_idx
+
+        if envs_ascend.VLLM_ASCEND_QLI_VALIDATE_BLOCK_TABLE:
+            dcp_context = getattr(attn_metadata, "dcp_context", None)
+            key_scale_cache = kv_cache[indexer_scale_cache_idx] if enable_sparse_li_c8 else None
+            validate_qli_block_table(
+                key_cache=kv_cache[indexer_cache_idx],
+                key_scale_cache=key_scale_cache,
+                block_table=attn_metadata.block_table,
+                actual_seq_lengths_key=actual_seq_lengths_key,
+                block_size=attn_metadata.block_size,
+                raw_block_table=getattr(dcp_context, "block_table", None),
+                dcp_size=getattr(dcp_context, "dcp_size", 1),
+                blocks_per_phys_block=getattr(dcp_context, "blocks_per_phys_block", 1),
+                context=f"layer={getattr(sfa_impl, 'layer_name', None)}",
+            )
 
         if enable_sparse_li_c8:
             assert len(kv_cache) == (3 if sfa_impl.enable_sparse_sfa_c8 else 4)
