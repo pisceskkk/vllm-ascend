@@ -11,6 +11,7 @@ from vllm.distributed import get_tp_group
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import (
     DCPImplMixin,
@@ -36,6 +37,33 @@ from vllm_ascend.utils import (
 )
 
 M = TypeVar("M", bound=AscendSFAMetadata)
+
+SFA_REMAP_BACKEND_ENV = "VLLM_ASCEND_SFA_REMAP_BACKEND"
+SFA_REMAP_BACKENDS = ("ascendc", "triton")
+
+
+def _resolve_sfa_remap_backend() -> str:
+    backend = ascend_envs.VLLM_ASCEND_SFA_REMAP_BACKEND.lower()
+    if backend not in SFA_REMAP_BACKENDS:
+        raise RuntimeError(f"Invalid {SFA_REMAP_BACKEND_ENV}={backend!r}; expected one of {SFA_REMAP_BACKENDS}.")
+    return backend
+
+
+def _remap_sparse_indices_ascendc(
+    indices: torch.Tensor,
+    output: torch.Tensor,
+    dcp_size: int,
+    dcp_rank: int,
+    interleave_size: int,
+) -> torch.Tensor:
+    torch.ops._C_ascend.sfa_remap_sparse_indices(
+        indices,
+        output,
+        dcp_size,
+        dcp_rank,
+        interleave_size,
+    )
+    return output
 
 
 @dataclass
@@ -815,11 +843,21 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
                 break
         if self._dcp_index_topk <= 0:
             raise RuntimeError("index_topk must be set in the model config for DCP SFA.")
-        if not enable_custom_op() or not hasattr(torch.ops._C_ascend, "sfa_remap_sparse_indices"):
-            raise RuntimeError(
-                "DCP SFA requires the _C_ascend.sfa_remap_sparse_indices custom operator. "
-                "Ensure vllm-ascend custom operators are installed and enabled."
+        self._sfa_remap_backend = _resolve_sfa_remap_backend()
+        if self._sfa_remap_backend == "ascendc":
+            if not enable_custom_op() or not hasattr(torch.ops._C_ascend, "sfa_remap_sparse_indices"):
+                raise RuntimeError(
+                    "The Ascend C SFA remap backend requires "
+                    "_C_ascend.sfa_remap_sparse_indices. Ensure vllm-ascend "
+                    "custom operators are installed and enabled."
+                )
+            self._sfa_remap_impl = _remap_sparse_indices_ascendc
+        else:
+            from vllm_ascend.ops.triton.sfa_remap_sparse_indices import (
+                remap_sparse_indices_triton,
             )
+
+            self._sfa_remap_impl = remap_sparse_indices_triton
 
     @staticmethod
     def _has_prefill(attn_metadata: M) -> bool:
@@ -917,14 +955,13 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
 
         contiguous_indices = topk_indices.contiguous()
         remapped_indices = torch.empty_like(contiguous_indices)
-        torch.ops._C_ascend.sfa_remap_sparse_indices(
+        return self._sfa_remap_impl(
             contiguous_indices,
             remapped_indices,
             self.dcp_size,
             self.dcp_rank,
             self._dcp_interleave_size,
         )
-        return remapped_indices
 
     def _all_to_all_dcp_tensor(
         self,

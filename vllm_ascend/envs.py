@@ -77,6 +77,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # it will consume more NPU memory. If reducing NPU memory usage is a higher priority
     # for your DeepSeek W8A8 scene, then disable it.
     "VLLM_ASCEND_ENABLE_MLAPO": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MLAPO", "1"))),
+    # Select the SFA DCP sparse-index remap implementation. The default keeps
+    # the production Ascend C custom operator; "triton" enables the staged
+    # Triton candidate for controlled A/B validation.
+    "VLLM_ASCEND_SFA_REMAP_BACKEND": lambda: os.getenv("VLLM_ASCEND_SFA_REMAP_BACKEND", "ascendc"),
     # Whether to enable weight cast format to FRACTAL_NZ.
     # 0: close nz;
     # 1: only quant case enable nz;
