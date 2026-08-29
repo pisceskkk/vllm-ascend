@@ -12,11 +12,8 @@ from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
 from vllm_ascend.ops.triton.compute_slot_mapping import (
-    _compute_slot_mapping_adaptive_kernel,
-    _compute_slot_mapping_fused_groups_kernel,
-    _compute_slot_mapping_kernel,
-    _compute_slot_mapping_parallel_kernel,
-    _next_power_of_2,
+    compute_slot_mapping,
+    compute_slot_mapping_fused_groups,
 )
 
 
@@ -157,71 +154,23 @@ class BlockTable:
             )
             self._compute_dcp_slot_mapping(req_indices, positions)
         else:
-            TILE_BLOCK_SIZE = 1024
-            if num_reqs > 1:
-                tokens_per_req = max(cdiv(num_tokens, num_reqs), 1)
-                TILE_BLOCK_SIZE = min(max(_next_power_of_2(tokens_per_req), 16), TILE_BLOCK_SIZE)
-            parallel_tiles = 4 if cdiv(num_tokens, TILE_BLOCK_SIZE) > 4 else cdiv(num_tokens, TILE_BLOCK_SIZE)
-            if num_reqs == 1:
-                parallel_tiles = parallel_tiles if num_tokens >= 2 * TILE_BLOCK_SIZE else 1
-            elif num_reqs == 2 and num_tokens >= 4 * TILE_BLOCK_SIZE:
-                parallel_tiles = 2
-            else:
-                parallel_tiles = 1
-            common_kernel_kwargs = {
-                "KV_CACHE_BLOCK_SIZE": self.physical_block_size,
-                "BLOCKS_PER_KV_BLOCK": self.blocks_per_phys_block,
-                "TOTAL_CP_WORLD_SIZE": total_cp_world_size,
-                "TOTAL_CP_RANK": total_cp_rank,
-                "CP_KV_CACHE_INTERLEAVE_SIZE": self.cp_kv_cache_interleave_size,
-                "PAD_ID": PAD_SLOT_ID,
-            }
-            kernel_kwargs = {
-                **common_kernel_kwargs,
-                "TILE_BLOCK_SIZE": TILE_BLOCK_SIZE,
-                "BLOCK_TABLE_WINDOW_SIZE": _next_power_of_2(cdiv(TILE_BLOCK_SIZE, self.block_size) + 1),
-            }
-
-            if num_reqs > 1 and TILE_BLOCK_SIZE < 1024:
-                _compute_slot_mapping_adaptive_kernel[(num_reqs + 1,)](
-                    num_tokens,
-                    self.max_num_batched_tokens,
-                    query_start_loc,
-                    positions,
-                    self.block_table.gpu,
-                    self.block_table.gpu.stride(0),
-                    self.block_size,
-                    self.slot_mapping.gpu,
-                    SMALL_TILE_BLOCK_SIZE=TILE_BLOCK_SIZE,
-                    SMALL_BLOCK_TABLE_WINDOW_SIZE=kernel_kwargs["BLOCK_TABLE_WINDOW_SIZE"],
-                    LARGE_BLOCK_TABLE_WINDOW_SIZE=_next_power_of_2(cdiv(1024, self.block_size) + 1),
-                    **common_kernel_kwargs,
-                )
-            elif parallel_tiles > 1:
-                _compute_slot_mapping_parallel_kernel[(num_reqs * parallel_tiles + 1,)](
-                    num_tokens,
-                    self.max_num_batched_tokens,
-                    query_start_loc,
-                    positions,
-                    self.block_table.gpu,
-                    self.block_table.gpu.stride(0),
-                    self.block_size,
-                    self.slot_mapping.gpu,
-                    PARALLEL_TILES=parallel_tiles,
-                    **kernel_kwargs,
-                )
-            else:
-                _compute_slot_mapping_kernel[(num_reqs + 1,)](
-                    num_tokens,
-                    self.max_num_batched_tokens,
-                    query_start_loc,
-                    positions,
-                    self.block_table.gpu,
-                    self.block_table.gpu.stride(0),
-                    self.block_size,
-                    self.slot_mapping.gpu,
-                    **kernel_kwargs,
-                )
+            compute_slot_mapping(
+                num_reqs,
+                num_tokens,
+                self.max_num_batched_tokens,
+                query_start_loc,
+                positions,
+                self.block_table.gpu,
+                self.block_table.gpu.stride(0),
+                self.block_size,
+                self.slot_mapping.gpu,
+                kv_cache_block_size=self.physical_block_size,
+                blocks_per_kv_block=self.blocks_per_phys_block,
+                total_cp_world_size=total_cp_world_size,
+                total_cp_rank=total_cp_rank,
+                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+                pad_id=PAD_SLOT_ID,
+            )
 
     def compute_slot_mapping_draft(
         self,
@@ -440,11 +389,15 @@ class MultiGroupBlockTable:
             ]
 
         active_block_tables = [block_table for block_table in self.block_tables if not block_table.is_mamba_group]
+        # Attention groups can share one launch only when their slot mapping
+        # uses the same positions. DCP needs rank-local remapping metadata that
+        # the fused kernel does not carry.
         self._can_fuse_slot_mapping = len(active_block_tables) > 1 and all(
             block_table.dcp_world_size == 1 for block_table in active_block_tables
         )
         if self._can_fuse_slot_mapping:
             self._fused_slot_mapping_group_count = len(active_block_tables)
+            self._fused_max_num_batched_tokens = active_block_tables[0].max_num_batched_tokens
             self._fused_block_table_addrs = torch.tensor(
                 [block_table.block_table.gpu.data_ptr() for block_table in active_block_tables],
                 dtype=torch.uint64,
@@ -496,27 +449,22 @@ class MultiGroupBlockTable:
         req_indices_compressed_list: list[np.ndarray] | None = None,
     ) -> None:
         num_tokens = positions.shape[0]
-        if (
-            self._can_fuse_slot_mapping
-            and num_reqs == 1
-            and num_tokens >= 2048
-            and not positions_compressed_list
-            and not req_indices_compressed_list
-        ):
-            tile_block_size = 1024
-            parallel_tiles = min(cdiv(num_tokens, tile_block_size), 4)
-            _compute_slot_mapping_fused_groups_kernel[(self._fused_slot_mapping_group_count * (parallel_tiles + 1),)](
+        # Speculative decoding supplies group-specific compressed positions,
+        # so those groups must keep their independent launches.
+        if self._can_fuse_slot_mapping and not positions_compressed_list and not req_indices_compressed_list:
+            compute_slot_mapping_fused_groups(
+                self._fused_slot_mapping_group_count,
+                num_reqs,
                 num_tokens,
-                self.block_tables[0].max_num_batched_tokens,
+                self._fused_max_num_batched_tokens,
+                query_start_loc,
                 positions,
                 self._fused_block_table_addrs,
                 self._fused_slot_mapping_addrs,
                 self._fused_block_table_strides,
                 self._fused_block_sizes,
-                PAD_ID=PAD_SLOT_ID,
-                TILE_BLOCK_SIZE=tile_block_size,
-                PARALLEL_TILES=parallel_tiles,
-                BLOCK_TABLE_WINDOW_SIZE=_next_power_of_2(cdiv(tile_block_size, self._fused_min_block_size) + 1),
+                self._fused_min_block_size,
+                pad_id=PAD_SLOT_ID,
             )
             return
 
