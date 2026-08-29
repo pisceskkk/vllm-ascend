@@ -15,6 +15,7 @@ import torch
 import torch_npu  # noqa: F401
 
 from vllm_ascend.ops.triton.compute_slot_mapping import (
+    _compute_slot_mapping_adaptive_kernel,
     _compute_slot_mapping_fused_groups_kernel,
     _compute_slot_mapping_kernel,
     _compute_slot_mapping_parallel_kernel,
@@ -49,6 +50,25 @@ CASES = {
         Case("profile-1r-4096-s65536", (4096,), 65536, 4096),
         Case("profile-1r-4096-s131072", (4096,), 131072, 4096),
         Case("profile-2r-4096-s8192", (2048, 2048), 8192, 4096),
+        Case("profile-2r-uneven-s8192", (0, 4096), 8192, 4096),
+        Case("profile-mr-4x1024-s8192", (1024,) * 4, 8192, 4096),
+        Case("profile-mr-8x512-s8192", (512,) * 8, 8192, 4096),
+        Case("profile-mr-16x256-s8192", (256,) * 16, 8192, 4096, max_num_reqs=16),
+        Case("profile-mr-32x128-s8192", (128,) * 32, 8192, 4096, max_num_reqs=32),
+        Case("profile-mr-64x64-s8192", (64,) * 64, 8192, 4096, max_num_reqs=64),
+        Case(
+            "profile-mr-8-uneven-s8192",
+            (2048, 1024, 512, 256, 128, 64, 32, 32),
+            8192,
+            4096,
+        ),
+        Case(
+            "profile-mr-32-uneven-s8192",
+            (4096,) + (0,) * 31,
+            8192,
+            4096,
+            max_num_reqs=32,
+        ),
         Case("decode-1r-1-max4096", (1,), 64, 4096),
         Case("decode-64r-64-max4096", (1,) * 64, 64, 4096, max_num_reqs=64),
         Case("tail-1r-1023", (1023,), 64, 4096),
@@ -92,6 +112,7 @@ PERFORMANCE_CASES = (
     "profile-1r-4096-s65536",
     "profile-1r-4096-s131072",
     "profile-2r-4096-s8192",
+    "profile-2r-uneven-s8192",
     "decode-1r-1-max4096",
     "decode-64r-64-max4096",
     "tail-1r-1023",
@@ -99,6 +120,20 @@ PERFORMANCE_CASES = (
     "prefill-8r-8192",
     "hybrid-1r-4096-p128-l32",
     "padding-1r-4-max8192",
+)
+
+MULTIREQUEST_PERFORMANCE_CASES = (
+    "profile-2r-4096-s8192",
+    "profile-2r-uneven-s8192",
+    "profile-mr-4x1024-s8192",
+    "profile-mr-8x512-s8192",
+    "profile-mr-16x256-s8192",
+    "profile-mr-32x128-s8192",
+    "profile-mr-64x64-s8192",
+    "profile-mr-8-uneven-s8192",
+    "profile-mr-32-uneven-s8192",
+    "prefill-8r-8192",
+    "decode-64r-64-max4096",
 )
 
 MULTIGROUP_CASES = {
@@ -190,19 +225,46 @@ def _make_inputs(case: Case):
 def _launch(case: Case, query_start_loc, positions, block_table, slot_mapping) -> None:
     num_reqs = len(case.lengths)
     num_tokens = positions.shape[0]
-    parallel_tiles = min(math.ceil(num_tokens / TILE_BLOCK_SIZE), 4)
-    parallel_tiles = parallel_tiles if num_reqs == 1 and num_tokens >= 2 * TILE_BLOCK_SIZE else 1
-    kernel_kwargs = {
+    tile_block_size = TILE_BLOCK_SIZE
+    if num_reqs > 1:
+        tokens_per_req = max(math.ceil(num_tokens / num_reqs), 1)
+        tile_block_size = min(max(_next_power_of_2(tokens_per_req), 16), tile_block_size)
+    parallel_tiles = min(math.ceil(num_tokens / tile_block_size), 4)
+    if num_reqs == 1:
+        parallel_tiles = parallel_tiles if num_tokens >= 2 * tile_block_size else 1
+    elif num_reqs == 2 and num_tokens >= 4 * tile_block_size:
+        parallel_tiles = 2
+    else:
+        parallel_tiles = 1
+    common_kernel_kwargs = {
         "KV_CACHE_BLOCK_SIZE": case.kv_cache_block_size,
         "BLOCKS_PER_KV_BLOCK": case.kv_cache_block_size // case.block_size,
         "TOTAL_CP_WORLD_SIZE": case.cp_world_size,
         "TOTAL_CP_RANK": case.cp_rank,
         "CP_KV_CACHE_INTERLEAVE_SIZE": case.cp_interleave,
         "PAD_ID": PAD_ID,
-        "TILE_BLOCK_SIZE": TILE_BLOCK_SIZE,
-        "BLOCK_TABLE_WINDOW_SIZE": _next_power_of_2(math.ceil(TILE_BLOCK_SIZE / case.block_size) + 1),
     }
-    if parallel_tiles > 1:
+    kernel_kwargs = {
+        **common_kernel_kwargs,
+        "TILE_BLOCK_SIZE": tile_block_size,
+        "BLOCK_TABLE_WINDOW_SIZE": _next_power_of_2(math.ceil(tile_block_size / case.block_size) + 1),
+    }
+    if num_reqs > 1 and tile_block_size < TILE_BLOCK_SIZE:
+        _compute_slot_mapping_adaptive_kernel[(num_reqs + 1,)](
+            num_tokens,
+            case.max_num_tokens,
+            query_start_loc,
+            positions,
+            block_table,
+            block_table.stride(0),
+            case.block_size,
+            slot_mapping,
+            SMALL_TILE_BLOCK_SIZE=tile_block_size,
+            SMALL_BLOCK_TABLE_WINDOW_SIZE=kernel_kwargs["BLOCK_TABLE_WINDOW_SIZE"],
+            LARGE_BLOCK_TABLE_WINDOW_SIZE=_next_power_of_2(math.ceil(TILE_BLOCK_SIZE / case.block_size) + 1),
+            **common_kernel_kwargs,
+        )
+    elif parallel_tiles > 1:
         _compute_slot_mapping_parallel_kernel[(num_reqs * parallel_tiles + 1,)](
             num_tokens,
             case.max_num_tokens,
@@ -227,6 +289,29 @@ def _launch(case: Case, query_start_loc, positions, block_table, slot_mapping) -
             slot_mapping,
             **kernel_kwargs,
         )
+
+
+def _launch_original(case: Case, query_start_loc, positions, block_table, slot_mapping) -> None:
+    num_reqs = len(case.lengths)
+    num_tokens = positions.shape[0]
+    _compute_slot_mapping_kernel[(num_reqs + 1,)](
+        num_tokens,
+        case.max_num_tokens,
+        query_start_loc,
+        positions,
+        block_table,
+        block_table.stride(0),
+        case.block_size,
+        slot_mapping,
+        KV_CACHE_BLOCK_SIZE=case.kv_cache_block_size,
+        BLOCKS_PER_KV_BLOCK=case.kv_cache_block_size // case.block_size,
+        TOTAL_CP_WORLD_SIZE=case.cp_world_size,
+        TOTAL_CP_RANK=case.cp_rank,
+        CP_KV_CACHE_INTERLEAVE_SIZE=case.cp_interleave,
+        PAD_ID=PAD_ID,
+        TILE_BLOCK_SIZE=TILE_BLOCK_SIZE,
+        BLOCK_TABLE_WINDOW_SIZE=_next_power_of_2(math.ceil(TILE_BLOCK_SIZE / case.block_size) + 1),
+    )
 
 
 def make_multigroup_inputs(cases: tuple[Case, ...]):
@@ -342,7 +427,7 @@ def validate_multigroup(case_id: str, cases: tuple[Case, ...], *, graph_capture:
     return result
 
 
-def validate(case: Case) -> dict:
+def validate(case: Case, *, graph_capture: bool = False) -> dict:
     (
         positions_list,
         block_table_list,
@@ -351,7 +436,15 @@ def validate(case: Case) -> dict:
         block_table,
         slot_mapping,
     ) = _make_inputs(case)
-    _launch(case, query_start_loc, positions, block_table, slot_mapping)
+    if graph_capture:
+        _launch(case, query_start_loc, positions, block_table, slot_mapping)
+        torch.npu.synchronize()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            _launch(case, query_start_loc, positions, block_table, slot_mapping)
+        graph.replay()
+    else:
+        _launch(case, query_start_loc, positions, block_table, slot_mapping)
     torch.npu.synchronize()
     expected = torch.tensor(_reference(case, positions_list, block_table_list), dtype=torch.int32)
     actual = slot_mapping.cpu()
@@ -424,6 +517,59 @@ def benchmark(case: Case, *, warmup: int, samples: int, inner_loops: int) -> dic
     }
 
 
+def benchmark_compare(case: Case, *, warmup: int, samples: int, inner_loops: int) -> dict:
+    _, _, query_start_loc, positions, block_table, slot_mapping = _make_inputs(case)
+    launchers = {"original": _launch_original, "current": _launch}
+    for launcher in launchers.values():
+        for _ in range(warmup):
+            launcher(case, query_start_loc, positions, block_table, slot_mapping)
+    torch.npu.synchronize()
+
+    device_us: dict[str, list[float]] = {name: [] for name in launchers}
+    wrapper_us: dict[str, list[float]] = {name: [] for name in launchers}
+    for sample_idx in range(samples):
+        order = ("original", "current") if sample_idx % 2 == 0 else ("current", "original")
+        for name in order:
+            start_event = torch.npu.Event(enable_timing=True)
+            end_event = torch.npu.Event(enable_timing=True)
+            torch.npu.synchronize()
+            host_start = time.perf_counter_ns()
+            start_event.record()
+            for _ in range(inner_loops):
+                launchers[name](case, query_start_loc, positions, block_table, slot_mapping)
+            end_event.record()
+            torch.npu.synchronize()
+            host_end = time.perf_counter_ns()
+            device_us[name].append(start_event.elapsed_time(end_event) * 1000.0 / inner_loops)
+            wrapper_us[name].append((host_end - host_start) / 1000.0 / inner_loops)
+
+    measurements = {}
+    for name in launchers:
+        values = device_us[name]
+        measurements[name] = {
+            "device_us": values,
+            "wrapper_us": wrapper_us[name],
+            "median_us": statistics.median(values),
+            "mean_us": statistics.mean(values),
+            "min_us": min(values),
+            "max_us": max(values),
+            "cv": statistics.pstdev(values) / statistics.mean(values),
+            "wrapper_median_us": statistics.median(wrapper_us[name]),
+        }
+    original_median = measurements["original"]["median_us"]
+    current_median = measurements["current"]["median_us"]
+    return {
+        "schema_version": 1,
+        "case_id": case.id,
+        "case": asdict(case),
+        "warmup": warmup,
+        "samples": samples,
+        "inner_loops": inner_loops,
+        "measurements": measurements,
+        "relative_improvement": (original_median - current_median) / original_median,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -435,6 +581,9 @@ def main() -> int:
             "validate-multigroup-graph",
             "benchmark",
             "benchmark-all",
+            "benchmark-compare-multirequest",
+            "validate-multirequest",
+            "validate-multirequest-graph",
         ),
         required=True,
     )
@@ -457,7 +606,13 @@ def main() -> int:
         args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         print(json.dumps({"status": "completed", "action": args.action, "output": str(args.output)}))
         return 0
-    if args.action.endswith("-all"):
+    if args.action in {
+        "benchmark-compare-multirequest",
+        "validate-multirequest",
+        "validate-multirequest-graph",
+    }:
+        case_ids = MULTIREQUEST_PERFORMANCE_CASES
+    elif args.action.endswith("-all"):
         case_ids = sorted(CASES) if args.action == "validate-all" else PERFORMANCE_CASES
     else:
         if args.case is None:
@@ -468,7 +623,17 @@ def main() -> int:
     for case_id in case_ids:
         case = CASES[case_id]
         if args.action.startswith("validate"):
-            results[case_id] = validate(case)
+            results[case_id] = validate(
+                case,
+                graph_capture=args.action == "validate-multirequest-graph",
+            )
+        elif args.action == "benchmark-compare-multirequest":
+            results[case_id] = benchmark_compare(
+                case,
+                warmup=args.warmup,
+                samples=args.samples,
+                inner_loops=args.inner_loops,
+            )
         else:
             results[case_id] = benchmark(
                 case,

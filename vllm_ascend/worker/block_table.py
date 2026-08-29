@@ -12,6 +12,7 @@ from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
 from vllm_ascend.ops.triton.compute_slot_mapping import (
+    _compute_slot_mapping_adaptive_kernel,
     _compute_slot_mapping_fused_groups_kernel,
     _compute_slot_mapping_kernel,
     _compute_slot_mapping_parallel_kernel,
@@ -157,20 +158,46 @@ class BlockTable:
             self._compute_dcp_slot_mapping(req_indices, positions)
         else:
             TILE_BLOCK_SIZE = 1024
+            if num_reqs > 1:
+                tokens_per_req = max(cdiv(num_tokens, num_reqs), 1)
+                TILE_BLOCK_SIZE = min(max(_next_power_of_2(tokens_per_req), 16), TILE_BLOCK_SIZE)
             parallel_tiles = 4 if cdiv(num_tokens, TILE_BLOCK_SIZE) > 4 else cdiv(num_tokens, TILE_BLOCK_SIZE)
-            parallel_tiles = parallel_tiles if num_reqs == 1 and num_tokens >= 2 * TILE_BLOCK_SIZE else 1
-            kernel_kwargs = {
+            if num_reqs == 1:
+                parallel_tiles = parallel_tiles if num_tokens >= 2 * TILE_BLOCK_SIZE else 1
+            elif num_reqs == 2 and num_tokens >= 4 * TILE_BLOCK_SIZE:
+                parallel_tiles = 2
+            else:
+                parallel_tiles = 1
+            common_kernel_kwargs = {
                 "KV_CACHE_BLOCK_SIZE": self.physical_block_size,
                 "BLOCKS_PER_KV_BLOCK": self.blocks_per_phys_block,
                 "TOTAL_CP_WORLD_SIZE": total_cp_world_size,
                 "TOTAL_CP_RANK": total_cp_rank,
                 "CP_KV_CACHE_INTERLEAVE_SIZE": self.cp_kv_cache_interleave_size,
                 "PAD_ID": PAD_SLOT_ID,
+            }
+            kernel_kwargs = {
+                **common_kernel_kwargs,
                 "TILE_BLOCK_SIZE": TILE_BLOCK_SIZE,
                 "BLOCK_TABLE_WINDOW_SIZE": _next_power_of_2(cdiv(TILE_BLOCK_SIZE, self.block_size) + 1),
             }
 
-            if parallel_tiles > 1:
+            if num_reqs > 1 and TILE_BLOCK_SIZE < 1024:
+                _compute_slot_mapping_adaptive_kernel[(num_reqs + 1,)](
+                    num_tokens,
+                    self.max_num_batched_tokens,
+                    query_start_loc,
+                    positions,
+                    self.block_table.gpu,
+                    self.block_table.gpu.stride(0),
+                    self.block_size,
+                    self.slot_mapping.gpu,
+                    SMALL_TILE_BLOCK_SIZE=TILE_BLOCK_SIZE,
+                    SMALL_BLOCK_TABLE_WINDOW_SIZE=kernel_kwargs["BLOCK_TABLE_WINDOW_SIZE"],
+                    LARGE_BLOCK_TABLE_WINDOW_SIZE=_next_power_of_2(cdiv(1024, self.block_size) + 1),
+                    **common_kernel_kwargs,
+                )
+            elif parallel_tiles > 1:
                 _compute_slot_mapping_parallel_kernel[(num_reqs * parallel_tiles + 1,)](
                     num_tokens,
                     self.max_num_batched_tokens,
