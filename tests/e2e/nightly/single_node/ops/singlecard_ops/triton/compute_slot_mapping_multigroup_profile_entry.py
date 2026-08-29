@@ -5,7 +5,7 @@ import os
 
 import torch
 import torch_npu  # noqa: F401
-from compute_slot_mapping_opt_runner import (
+from compute_slot_mapping_opt_runner import (  # type: ignore[import-not-found]
     MULTIGROUP_CASES,
     launch_multigroup,
     make_multigroup_inputs,

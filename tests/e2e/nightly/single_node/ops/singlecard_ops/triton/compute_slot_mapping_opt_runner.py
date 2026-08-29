@@ -8,8 +8,10 @@ import json
 import math
 import statistics
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import cast
 
 import torch
 import torch_npu  # noqa: F401
@@ -556,8 +558,8 @@ def benchmark_compare(case: Case, *, warmup: int, samples: int, inner_loops: int
             "cv": statistics.pstdev(values) / statistics.mean(values),
             "wrapper_median_us": statistics.median(wrapper_us[name]),
         }
-    original_median = measurements["original"]["median_us"]
-    current_median = measurements["current"]["median_us"]
+    original_median = cast(float, measurements["original"]["median_us"])
+    current_median = cast(float, measurements["current"]["median_us"])
     return {
         "schema_version": 1,
         "case_id": case.id,
@@ -606,6 +608,7 @@ def main() -> int:
         args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         print(json.dumps({"status": "completed", "action": args.action, "output": str(args.output)}))
         return 0
+    case_ids: Sequence[str]
     if args.action in {
         "benchmark-compare-multirequest",
         "validate-multirequest",
