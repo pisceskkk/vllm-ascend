@@ -240,6 +240,27 @@ class AscendKimiMoE(nn.Module):
         return final_hidden_states.view(num_tokens, hidden_size)
 
 
+class AscendKimiDenseMLP(KimiMLP):
+    """Preserve token identity for dense TP weights in an SP decoder."""
+
+    def __init__(self, *, use_sequence_parallel: bool = False, **kwargs):
+        super().__init__(**kwargs)
+        # Fine-grained MLP custom ops already gather/scatter their token rows.
+        self.explicit_sequence_parallel = (
+            use_sequence_parallel
+            and getattr(self.gate_up_proj, "custom_op", None) is None
+            and getattr(self.down_proj, "custom_op", None) is None
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.explicit_sequence_parallel:
+            hidden_states = sp_all_gather(hidden_states)
+        hidden_states = super().forward(hidden_states)
+        if self.explicit_sequence_parallel:
+            hidden_states = sp_shard(hidden_states)
+        return hidden_states
+
+
 class AscendKimiMLAAttention(UpstreamKimiMLAAttention):
     """Extend vLLM's generic Kimi MLA only for DSpark RoPE metadata."""
 
@@ -416,7 +437,8 @@ class AscendKimiDecoderLayer(UpstreamKimiDecoderLayer):
             )
             self.mlp = self.block_sparse_moe
         else:
-            self.mlp = KimiMLP(
+            self.mlp = AscendKimiDenseMLP(
+                use_sequence_parallel=use_sequence_parallel,
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
