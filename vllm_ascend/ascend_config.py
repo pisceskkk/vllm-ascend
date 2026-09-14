@@ -448,6 +448,7 @@ class AscendConfig:
     enable_cpu_binding: bool = True
     multistream_dsv4_dsa_overlap: bool = True
     enable_prefill_mc2: bool = False
+    enable_kimi_o_proj_mm_reduce_scatter: bool = False
     multistream_overlap_shared_expert: bool = False
     enable_kv_nz: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
@@ -585,7 +586,7 @@ class AscendConfig:
             )
 
         # enable_shared_expert_dp = val and ep and tp>1
-        from vllm_ascend.utils import enable_sp
+        from vllm_ascend.utils import AscendDeviceType, enable_sp, get_ascend_device_type
 
         self.enable_shared_expert_dp = (
             self.enable_shared_expert_dp
@@ -692,7 +693,14 @@ class AscendConfig:
                 "enable_fused_mc2 and multistream_overlap_shared_expert "
                 "cannot be enabled at the same time. Setting multistream_overlap_shared_expert to False."
             )
-        if self.enable_fused_mc2 == 1 and _MEGA_MOE_SUPPORTED and not self._is_megamoe_supported_by_config(vc):
+        # A5 is validated from instantiated layer capabilities, including MXFP.
+        # The legacy checkpoint-metadata filter below is only for A2/A3.
+        if (
+            self.enable_fused_mc2 == 1
+            and _MEGA_MOE_SUPPORTED
+            and get_ascend_device_type() != AscendDeviceType.A5
+            and not self._is_megamoe_supported_by_config(vc)
+        ):
             self.enable_fused_mc2 = 0
             logger.warning_once(
                 "MegaMoe is not supported for this model config; additional_config.enable_fused_mc2 will be set to 0."
