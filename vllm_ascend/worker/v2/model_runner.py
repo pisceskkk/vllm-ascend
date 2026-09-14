@@ -438,9 +438,6 @@ class NPUModelRunner(GPUModelRunner):
         )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
 
-        # Pad for full CUDA graph mode.
-        self.input_buffers.seq_lens_np[num_reqs_padded:] = 0
-
         dcp_local_seq_lens = None
         if self.use_dcp:
             prepare_dcp_local_seq_lens(
@@ -721,6 +718,9 @@ class NPUModelRunner(GPUModelRunner):
             req_index = self.req_states.req_id_to_index[req_id]
             num_computed_tokens = self.req_states.num_computed_tokens_cpu[req_index]
             self.input_buffers.seq_lens_cpu[i] = num_computed_tokens + num_scheduled_tokens[req_id]
+        # Graph padding has no KV, including rows left over from a larger
+        # previous batch. DCP derives per-rank lengths from this CPU mirror.
+        self.input_buffers.seq_lens_cpu[len(req_ids) :].zero_()
 
     def _pad_query_start_loc_for_fia(
         self,
