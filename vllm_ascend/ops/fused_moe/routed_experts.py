@@ -57,8 +57,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
     def __init__(self, moe: FusedMoEConfig = None, tid2eid=None):
         super().__init__(moe=moe)
-        vllm_config = get_current_vllm_config()
-        self.dynamic_eplb = False if vllm_config.use_v2_model_runner else get_ascend_config().eplb_config.dynamic_eplb
+        self.dynamic_eplb = get_ascend_config().eplb_config.dynamic_eplb
         self.tid2eid = tid2eid
         self.lora_context = None
         self._lora_routing = None
@@ -375,7 +374,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         self.global_redundant_expert_num: int = 0
         self.ascend_pertoken_scale: torch.Tensor | None = None
         self.ascend_mc2_mask: torch.Tensor | None = None
-        if not self._use_v2_model_runner:
+        if not self._use_v2_model_runner or ascend_config.eplb_config.dynamic_eplb:
             self.init_eplb(n_shared_experts)
         self.return_with_event = False
 
@@ -521,7 +520,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
     @property
     def ascend_expert_map(self) -> torch.Tensor | None:
         """Return the global-to-local map used by Ascend MoE execution."""
-        if getattr(self, "_use_v2_model_runner", False):
+        if getattr(self, "_use_v2_model_runner", False) and not getattr(self, "dynamic_eplb", False):
             return self.expert_map
         return getattr(self, "_ascend_expert_map", None)
 
@@ -670,7 +669,8 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             self.ascend_pertoken_scale = None
             self.ascend_mc2_mask = None
 
-        if self.dynamic_eplb and _EXTRA_CTX.eplb_heat_collection_status:
+        load_enabled = getattr(self, "eplb_load_enabled", None)
+        if self.dynamic_eplb and (load_enabled is not None or _EXTRA_CTX.eplb_heat_collection_status):
             expert_tokens = fused_experts_results.expert_tokens
             group_list_type = fused_experts_results.group_list_type
             assert expert_tokens is not None and group_list_type is not None, (
@@ -681,6 +681,8 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
                 if group_list_type == 1
                 else torch.cat([expert_tokens[:1], expert_tokens[1:] - expert_tokens[:-1]])
             )
+            if load_enabled is not None:
+                local_load = local_load * load_enabled
             assert self.moe_load is not None
             if self.multi_stage:
                 assert self.load_counter is not None and self.num_iter is not None
@@ -688,7 +690,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
                 self.moe_load.index_add_(
                     dim=0, index=cur_iter, source=local_load.to(torch.int32, non_blocking=True).view(1, -1)
                 )
-                self.load_counter.add_(1)
+                self.load_counter.add_(self.eplb_counter_enabled if load_enabled is not None else 1)
             else:
                 self.moe_load.add_(local_load)
 

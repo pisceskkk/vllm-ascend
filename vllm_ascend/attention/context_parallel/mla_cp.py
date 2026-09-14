@@ -9,6 +9,7 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.utils.math_utils import cdiv
 
+from vllm_ascend import envs
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 
@@ -27,6 +28,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.context_parallel.common_cp import (
     DCPImplMixin,
     DCPMetadataBuilderMixin,
+    _dcp_mtp_comm_stream,
     get_dcp_local_seq_lens,
 )
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
@@ -51,16 +53,6 @@ class MLASplitAttentionGraphParams(NamedTuple):
     attention_params: tuple
     attention_kind: MLASplitAttentionKind
     layer_name: str
-
-
-_DCP_MTP_COMM_STREAM: torch.npu.Stream | None = None
-
-
-def _dcp_mtp_comm_stream() -> torch.npu.Stream:
-    global _DCP_MTP_COMM_STREAM
-    if _DCP_MTP_COMM_STREAM is None:
-        _DCP_MTP_COMM_STREAM = torch_npu.npu.Stream()
-    return _DCP_MTP_COMM_STREAM
 
 
 @dataclass
@@ -214,6 +206,18 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
     understand this class
     """
 
+    can_return_lse_for_decode: bool = True
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # AscendMLAImpl bypasses the upstream MLA initializer. Both FIA and
+        # Flash MLA return LSE for the internal DCP merge.
+        self.need_to_return_lse_for_decode = self.dcp_size > 1
+        if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+            # Flash MLA merges DCP-local history with causal current tokens;
+            # the history lengths account for the configured KV interleave.
+            self.supports_mtp_with_cp_non_trivial_interleave_size = True
+
     @staticmethod
     def update_graph_params(
         update_stream,
@@ -223,6 +227,9 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
         speculative_config=None,
         draft_attn_metadatas=None,
     ):
+        if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+            # The executor refreshes Flash schedules outside the captured graph.
+            return
         if _EXTRA_CTX.is_draft_model:
             if _EXTRA_CTX.is_draft_model_prefill:
                 graph_params = get_draft_graph_prefill_params()
