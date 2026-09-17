@@ -137,7 +137,6 @@ def _fused_sfa_dcp_lse_combine_kernel(
     SCATTER_TOKENS: tl.constexpr,
     LSE_PACK_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    RETURN_LSE: tl.constexpr = False,
     HAS_LOCAL: tl.constexpr = False,
 ):
     program_idx = tl.program_id(0)
@@ -239,10 +238,6 @@ def _fused_sfa_dcp_lse_combine_kernel(
         merged /= denominator
         output_offsets = token_idx * output_stride_t + head_idx * output_stride_h + d_offsets * output_stride_d
         tl.store(output_ptr + output_offsets, merged, mask=d_mask)
-        if RETURN_LSE:
-            merged_lse = tl.where(any_valid_lse, safe_lse_max + tl.log(denominator), -float("inf"))
-            lse_offset = token_idx * output_stride_t + head_idx * output_stride_h + head_dim * output_stride_d
-            tl.store(output_ptr + lse_offset, merged_lse)
 
 
 def _lse_pack_dim(output_dtype: torch.dtype) -> int:
@@ -367,7 +362,6 @@ def fused_sfa_dcp_lse_combine(
     recv: torch.Tensor,
     head_dim: int,
     scatter_dim: int,
-    return_lse: bool = False,
     local_output: torch.Tensor | None = None,
     local_lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -377,12 +371,7 @@ def fused_sfa_dcp_lse_combine(
     contribution is counted once, with FP32 weights shared by all ranks.
     """
     if recv.dtype == torch.int32:
-        if return_lse:
-            raise TypeError("Returning merged LSE requires an FP32 receive buffer.")
         return merge_raw_dcp_output_lse(recv, head_dim, scatter_dim, local_output, local_lse)
-    # Appended LSE must retain FP32 precision.
-    if return_lse and recv.dtype != torch.float32:
-        raise TypeError("Returning merged LSE requires an FP32 receive buffer.")
     if recv.ndim != 4:
         raise RuntimeError(f"SFA DCP fused combine expects a 4D receive buffer, got {tuple(recv.shape)}.")
     if not recv.is_contiguous():
@@ -414,7 +403,7 @@ def fused_sfa_dcp_lse_combine(
             raise RuntimeError("Local contribution and receive buffer must be on the same device.")
         _lse_pack_dim(local_output.dtype)
     output = torch.empty(
-        (num_tokens, num_heads, head_dim + int(return_lse)),
+        (num_tokens, num_heads, head_dim),
         dtype=recv.dtype,
         device=recv.device,
     )
@@ -430,7 +419,6 @@ def fused_sfa_dcp_lse_combine(
         and head_dim <= 512
         and 32 <= num_tokens <= 256
         and local_output is not None
-        and not return_lse
     )
     if batched:
         _fused_sfa_dcp_lse_combine_batched_kernel[(grid_size,)](
@@ -449,7 +437,6 @@ def fused_sfa_dcp_lse_combine(
             SCATTER_TOKENS=scatter_dim == 0,
             LSE_PACK_DIM=lse_pack_dim,
             BLOCK_D=triton.next_power_of_2(head_dim),
-            RETURN_LSE=return_lse,
             HAS_LOCAL=local_output is not None,
             BLOCK_ROWS=8,
         )
@@ -470,7 +457,6 @@ def fused_sfa_dcp_lse_combine(
         SCATTER_TOKENS=scatter_dim == 0,
         LSE_PACK_DIM=lse_pack_dim,
         BLOCK_D=triton.next_power_of_2(head_dim),
-        RETURN_LSE=return_lse,
         HAS_LOCAL=local_output is not None,
     )
     return output
@@ -483,7 +469,6 @@ def sfa_dcp_a2a_fused_combine(
     scatter_dim: int,
     scatter_group: dist.ProcessGroup | None,
     pcp_group: GroupCoordinator | None = None,
-    return_lse: bool = False,
     defer_combine: bool = False,
 ) -> torch.Tensor:
     """Pack, scatter over DCP or TP, optionally gather over PCP, then merge.
@@ -497,7 +482,6 @@ def sfa_dcp_a2a_fused_combine(
         scatter_size,
         scatter_dim,
         has_pcp=pcp_group is not None,
-        return_lse=return_lse,
     ):
         if scatter_group is None:
             raise ValueError("SFA output scatter requires an explicit All2All group.")
@@ -530,7 +514,7 @@ def sfa_dcp_a2a_fused_combine(
         recv = pcp_group.all_gather(recv, dim=0)
     if defer_combine:
         return recv
-    return fused_sfa_dcp_lse_combine(recv, sfa_output.shape[-1], scatter_dim=scatter_dim, return_lse=return_lse)
+    return fused_sfa_dcp_lse_combine(recv, sfa_output.shape[-1], scatter_dim=scatter_dim)
 
 
 def sfa_dcp_a2a_fused(
@@ -540,7 +524,6 @@ def sfa_dcp_a2a_fused(
     scatter_dim: int,
     group_name: str,
     pcp_group_name: str | None = None,
-    return_lse: bool = False,
     defer_combine: bool = False,
 ) -> torch.Tensor:
     """Fused SFA output merge, optionally gathering contributions across PCP.
@@ -549,14 +532,7 @@ def sfa_dcp_a2a_fused(
     dcp_size/group_name describe the TP scatter group, not the unified DCP
     group. A size of 1 skips scatter-group lookup and All2All.
     With defer_combine=True, return the packed rank contributions after communication.
-    With return_lse=True, require FP32 input and return [..., head_dim + 1],
-    with the merged LSE in the last element for a subsequent local merge.
     """
-    if defer_combine and return_lse:
-        raise ValueError("defer_combine and return_lse are mutually exclusive.")
-    # In return_lse mode the last output element stores the merged FP32 LSE.
-    if return_lse and sfa_output.dtype != torch.float32:
-        raise TypeError("Returning merged LSE requires FP32 attention output.")
     scatter_group = None
     if dcp_size > 1:
         group_ref = _groups.get(group_name)
@@ -584,7 +560,6 @@ def sfa_dcp_a2a_fused(
         scatter_dim,
         scatter_group=scatter_group,
         pcp_group=pcp_group,
-        return_lse=return_lse,
         defer_combine=defer_combine,
     )
 
@@ -596,7 +571,6 @@ def sfa_dcp_a2a_fused_fake(
     scatter_dim: int,
     group_name: str,
     pcp_group_name: str | None = None,
-    return_lse: bool = False,
     defer_combine: bool = False,
 ) -> torch.Tensor:
     """Propagate output metadata for torch.compile without running HCCL.
@@ -606,8 +580,6 @@ def sfa_dcp_a2a_fused_fake(
     the real implementation performs the collective at execution time.
     """
     del group_name
-    if defer_combine and return_lse:
-        raise ValueError("defer_combine and return_lse are mutually exclusive.")
     if defer_combine:
         if can_use_raw_dcp_exchange(
             sfa_output,
@@ -615,7 +587,6 @@ def sfa_dcp_a2a_fused_fake(
             dcp_size,
             scatter_dim,
             has_pcp=pcp_group_name is not None,
-            return_lse=return_lse,
         ):
             return torch.empty((8, 12, sfa_output.shape[0], 257), dtype=torch.int32, device=sfa_output.device)
         rank_count = dcp_size
@@ -635,11 +606,8 @@ def sfa_dcp_a2a_fused_fake(
             dtype=sfa_output.dtype,
             device=sfa_output.device,
         )
-    if return_lse and sfa_output.dtype != torch.float32:
-        raise TypeError("Returning merged LSE requires FP32 attention output.")
     output_shape = list(sfa_output.shape)
     output_shape[scatter_dim] //= dcp_size
-    output_shape[-1] += int(return_lse)
     return torch.empty(output_shape, dtype=sfa_output.dtype, device=sfa_output.device)
 
 

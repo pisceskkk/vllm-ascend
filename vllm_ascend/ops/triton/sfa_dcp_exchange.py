@@ -43,12 +43,10 @@ def can_use_raw_dcp_exchange(
     scatter_dim: int,
     *,
     has_pcp: bool = False,
-    return_lse: bool = False,
 ) -> bool:
     """Shape/dtype-only dispatch: ranks must select the same wire protocol."""
     return (
         not has_pcp
-        and not return_lse
         and scatter_size == 8
         and scatter_dim == 1
         and output.device.type == "npu"

@@ -134,7 +134,6 @@ def _fused_sfa_dcp_lse_combine_batched_kernel(
     LSE_PACK_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
-    RETURN_LSE: tl.constexpr = False,
     HAS_LOCAL: tl.constexpr = False,
 ):
     program_idx = tl.program_id(0)
@@ -253,7 +252,3 @@ def _fused_sfa_dcp_lse_combine_batched_kernel(
         merged /= denominator
         output_offsets = token_idx * output_stride_t + head_idx * output_stride_h + d_offsets * output_stride_d
         tl.store(output_ptr + output_offsets, merged, mask=d_mask)
-        if RETURN_LSE:
-            merged_lse = tl.where(any_valid_lse, safe_lse_max + tl.log(denominator), -float("inf"))
-            lse_offset = token_idx * output_stride_t + head_idx * output_stride_h + head_dim * output_stride_d
-            tl.store(output_ptr + lse_offset, merged_lse, mask=row_mask)

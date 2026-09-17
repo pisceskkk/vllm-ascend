@@ -315,7 +315,10 @@ def test_mla_dcp_uses_native_global_query_heads_for_fia(mock_fia) -> None:
         (2, 1, (64, 128), 256),
     ],
 )
-def test_split_decode_packs_on_main_overlapping_current_attention(dcp_size, dcp_rank, workspace_sizes, cached_size):
+@pytest.mark.parametrize("history_dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_split_decode_packs_on_main_overlapping_current_attention(
+    dcp_size, dcp_rank, workspace_sizes, cached_size, history_dtype
+):
     import vllm_ascend.attention.context_parallel.mla_cp as mla_cp
 
     impl = AscendMlaDCPImpl.__new__(AscendMlaDCPImpl)
@@ -342,7 +345,7 @@ def test_split_decode_packs_on_main_overlapping_current_attention(dcp_size, dcp_
         cp_history_seq_len=[2],
     )
     decode.attn_mask = torch.zeros(2, 2, dtype=torch.bool)
-    history_output = torch.ones(2, 2 * dcp_size, 4)
+    history_output = torch.ones(2, 2 * dcp_size, 4, dtype=history_dtype)
     history_lse = torch.zeros(2, 2 * dcp_size, 1)
     current_output = torch.full((2, 2, 4), 3.0)
     current_lse = torch.zeros(2, 2, 1)

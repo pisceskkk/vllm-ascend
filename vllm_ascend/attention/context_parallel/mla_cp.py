@@ -648,7 +648,7 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
         current_lse.record_stream(main_stream)
 
         history_recv = torch.ops.vllm.sfa_dcp_a2a_fused(
-            history_output.float(),
+            history_output,
             history_lse.float(),
             self.dcp_size,
             1,
