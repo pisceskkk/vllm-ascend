@@ -726,13 +726,19 @@ class RecomputeScheduler(Scheduler):
                         (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
                         and self.num_sampled_tokens_per_step > 0
                         and num_new_tokens == 1
-                        and (scheduled_running_reqs and not prefill_scheduled)
+                        and not prefill_scheduled
+                        and (scheduled_running_reqs or num_computed_tokens > 0)
                     ):
-                        num_new_tokens = 1 + self.num_spec_tokens
-                        if num_new_tokens > token_budget or num_computed_tokens + num_new_tokens > self.max_model_len:
-                            # Prefer to not schedule than schedule un-padded here.
-                            break
-                        pad_spec_decode = True
+                        padded_num_tokens = 1 + self.num_spec_tokens
+                        if (
+                            num_computed_tokens + padded_num_tokens + self.num_sampled_tokens_per_step
+                            <= self.max_model_len
+                        ):
+                            if padded_num_tokens > token_budget:
+                                # Prefer to not schedule than schedule un-padded here.
+                                break
+                            num_new_tokens = padded_num_tokens
+                            pad_spec_decode = True
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
@@ -775,6 +781,12 @@ class RecomputeScheduler(Scheduler):
                     )
                     if num_new_tokens == 0:
                         break
+
+                if pad_spec_decode and num_new_tokens != 1 + self.num_spec_tokens:
+                    # A clipped verifier window must not advertise more draft
+                    # logits than its query rows. Keep the real prompt tail.
+                    num_new_tokens = 1
+                    pad_spec_decode = False
 
                 # During async KV load, no forward pass is run yet. Allocate
                 # speculative lookahead slots later to avoid mismatching local

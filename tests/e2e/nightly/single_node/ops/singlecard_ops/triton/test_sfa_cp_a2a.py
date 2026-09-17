@@ -311,3 +311,37 @@ def test_combine_with_raw_local_fia(scatter_dim, dcp_size, head_dim, local_dtype
     expected_lse = torch.logsumexp(lses.masked_fill(~torch.isfinite(lses), -torch.inf), dim=0)
     torch.testing.assert_close(actual[..., :head_dim], expected, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(actual[..., head_dim], expected_lse, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("num_tokens", [8, 16, 31, 32, 63, 64, 65, 128, 256])
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize(
+    "dcp_size,num_heads,head_dim",
+    [(2, 6, 64), (4, 28, 128), (8, 96, 512), (16, 80, 384), (4, 36, 129), (2, 2, 1), (4, 20, 511), (4, 20, 513)],
+)
+@torch.inference_mode()
+def test_sfa_batched_local_combine(
+    num_tokens: int, strided: bool, dcp_size: int, num_heads: int, head_dim: int
+) -> None:
+    """Cover row-batching boundaries, rank counts, head counts and column tails."""
+    torch.manual_seed(20260917)
+    destination_rank = dcp_size - 1
+    local_heads = num_heads // dcp_size
+    stride = 2 if strided else 1
+    values = torch.randn(dcp_size, num_tokens, num_heads, head_dim * stride, device="npu", dtype=torch.bfloat16)[
+        ..., ::stride
+    ]
+    lses = (torch.randn(dcp_size, num_tokens, num_heads, stride, device="npu") * 3)[..., :1]
+    local = torch.randn(num_tokens, local_heads, head_dim * stride, device="npu", dtype=torch.bfloat16)[..., ::stride]
+    local_lse = (torch.randn(num_tokens, local_heads, stride, device="npu") * 3)[..., :1]
+    values[:, 0] = torch.nan
+    lses[:, 0] = -torch.inf
+    local[0] = torch.nan
+    local_lse[0] = -torch.inf
+    recv = _simulate_receive(values, lses, destination_rank, scatter_dim=1)
+    actual = fused_sfa_dcp_lse_combine(recv, head_dim, scatter_dim=1, local_output=local, local_lse=local_lse)
+    head_slice = slice(destination_rank * local_heads, (destination_rank + 1) * local_heads)
+    reference_values = torch.cat((values[:, :, head_slice], local.unsqueeze(0)))
+    reference_lses = torch.cat((lses[:, :, head_slice], local_lse.unsqueeze(0)))[..., 0]
+    expected = _reference_merge(reference_values, reference_lses)
+    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)

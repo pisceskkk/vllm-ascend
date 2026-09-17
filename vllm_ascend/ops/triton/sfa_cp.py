@@ -8,6 +8,13 @@ from vllm.distributed.parallel_state import GroupCoordinator, _groups
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from vllm_ascend.device.device_config import is_950
+from vllm_ascend.ops.triton.sfa_cp_batched import (
+    _fused_sfa_dcp_lse_combine_batched_kernel,
+    _pack_sfa_dcp_output_lse_batched_kernel,
+)
+from vllm_ascend.ops.triton.sfa_dcp_exchange import can_use_raw_dcp_exchange, pack_raw_dcp_output_lse
+from vllm_ascend.ops.triton.sfa_dcp_merge import merge_raw_dcp_output_lse
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num, init_device_properties_triton
 
 
@@ -308,7 +315,35 @@ def pack_sfa_dcp_output_lse(
     )
     total_rows = num_tokens * num_heads
     init_device_properties_triton()
-    grid_size = min(total_rows, get_vectorcore_num())
+    vector_cores = get_vectorcore_num()
+    grid_size = total_rows if total_rows < vector_cores else vector_cores
+    # Bound the eight-row tile to at most 512 padded columns.
+    batched = (
+        is_950()
+        and sfa_output.dtype == torch.bfloat16
+        and scatter_dim == 1
+        and head_dim <= 512
+        and 8 <= num_tokens <= 256
+    )
+    if batched:
+        _pack_sfa_dcp_output_lse_batched_kernel[(grid_size,)](
+            sfa_output,
+            softmax_lse,
+            send,
+            *sfa_output.stride(),
+            softmax_lse.stride(0),
+            softmax_lse.stride(1),
+            *send.stride(),
+            local_scatter_size,
+            head_dim,
+            num_heads,
+            total_rows,
+            SCATTER_TOKENS=scatter_dim == 0,
+            LSE_PACK_DIM=lse_pack_dim,
+            BLOCK_D=triton.next_power_of_2(head_dim),
+            BLOCK_ROWS=8,
+        )
+        return send
     _pack_sfa_dcp_output_lse_kernel[(grid_size,)](
         sfa_output,
         softmax_lse,
@@ -341,6 +376,10 @@ def fused_sfa_dcp_lse_combine(
     Local tensors use [tokens, heads, D/1] layout and may be strided. The local
     contribution is counted once, with FP32 weights shared by all ranks.
     """
+    if recv.dtype == torch.int32:
+        if return_lse:
+            raise TypeError("Returning merged LSE requires an FP32 receive buffer.")
+        return merge_raw_dcp_output_lse(recv, head_dim, scatter_dim, local_output, local_lse)
     # Appended LSE must retain FP32 precision.
     if return_lse and recv.dtype != torch.float32:
         raise TypeError("Returning merged LSE requires an FP32 receive buffer.")
@@ -383,6 +422,38 @@ def fused_sfa_dcp_lse_combine(
     init_device_properties_triton()
     vector_cores = get_vectorcore_num()
     grid_size = total_rows if total_rows < vector_cores else vector_cores
+    # Small combine shapes need more independent programs than batching allows.
+    batched = (
+        is_950()
+        and recv.dtype == torch.bfloat16
+        and scatter_dim == 1
+        and head_dim <= 512
+        and 32 <= num_tokens <= 256
+        and local_output is not None
+        and not return_lse
+    )
+    if batched:
+        _fused_sfa_dcp_lse_combine_batched_kernel[(grid_size,)](
+            recv,
+            output,
+            local_output if local_output is not None else recv,
+            local_lse if local_lse is not None else recv,
+            *(local_output.stride() if local_output is not None else (0, 0, 0)),
+            *(local_lse.stride()[:2] if local_lse is not None else (0, 0)),
+            *recv.stride(),
+            *output.stride(),
+            head_dim,
+            num_heads,
+            total_rows,
+            DCP_SIZE=dcp_size,
+            SCATTER_TOKENS=scatter_dim == 0,
+            LSE_PACK_DIM=lse_pack_dim,
+            BLOCK_D=triton.next_power_of_2(head_dim),
+            RETURN_LSE=return_lse,
+            HAS_LOCAL=local_output is not None,
+            BLOCK_ROWS=8,
+        )
+        return output
     _fused_sfa_dcp_lse_combine_kernel[(grid_size,)](
         recv,
         output,
@@ -420,6 +491,22 @@ def sfa_dcp_a2a_fused_combine(
     scatter_size is the All2All group size, not the unified DCP size when
     stacking PCP and DCP. Use 1 when Q heads were not gathered over TP.
     """
+    if can_use_raw_dcp_exchange(
+        sfa_output,
+        softmax_lse,
+        scatter_size,
+        scatter_dim,
+        has_pcp=pcp_group is not None,
+        return_lse=return_lse,
+    ):
+        if scatter_group is None:
+            raise ValueError("SFA output scatter requires an explicit All2All group.")
+        send = pack_raw_dcp_output_lse(sfa_output, softmax_lse)
+        recv = torch.empty_like(send)
+        dist.all_to_all_single(recv, send, group=scatter_group)
+        if defer_combine:
+            return recv
+        return fused_sfa_dcp_lse_combine(recv, sfa_output.shape[-1], scatter_dim)
     send = pack_sfa_dcp_output_lse(
         sfa_output,
         softmax_lse,
@@ -518,10 +605,19 @@ def sfa_dcp_a2a_fused_fake(
     operator. It must only describe the local output shape, dtype, and device;
     the real implementation performs the collective at execution time.
     """
-    del softmax_lse, group_name
+    del group_name
     if defer_combine and return_lse:
         raise ValueError("defer_combine and return_lse are mutually exclusive.")
     if defer_combine:
+        if can_use_raw_dcp_exchange(
+            sfa_output,
+            softmax_lse,
+            dcp_size,
+            scatter_dim,
+            has_pcp=pcp_group_name is not None,
+            return_lse=return_lse,
+        ):
+            return torch.empty((8, 12, sfa_output.shape[0], 257), dtype=torch.int32, device=sfa_output.device)
         rank_count = dcp_size
         if pcp_group_name is not None:
             group_ref = _groups.get(pcp_group_name)
