@@ -8,7 +8,7 @@ from vllm.distributed.parallel_state import GroupCoordinator, _groups
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from vllm_ascend.device.device_config import get_device_config
+from vllm_ascend.device.device_config import is_950
 from vllm_ascend.ops.triton.sfa_cp_batched import (
     _fused_sfa_dcp_lse_combine_batched_kernel,
     _pack_sfa_dcp_output_lse_batched_kernel,
@@ -317,14 +317,12 @@ def pack_sfa_dcp_output_lse(
     init_device_properties_triton()
     vector_cores = get_vectorcore_num()
     grid_size = total_rows if total_rows < vector_cores else vector_cores
-    # Batch the measured A5 DCP8 region; retain the scalar path elsewhere.
+    # Bound the eight-row tile to at most 512 padded columns.
     batched = (
-        get_device_config().sfa_dcp_row_batch_size == 8
+        is_950()
         and sfa_output.dtype == torch.bfloat16
-        and dcp_size == 8
         and scatter_dim == 1
-        and num_heads == 96
-        and head_dim == 512
+        and head_dim <= 512
         and 8 <= num_tokens <= 256
     )
     if batched:
@@ -426,12 +424,10 @@ def fused_sfa_dcp_lse_combine(
     grid_size = total_rows if total_rows < vector_cores else vector_cores
     # Small combine shapes need more independent programs than batching allows.
     batched = (
-        get_device_config().sfa_dcp_row_batch_size == 8
+        is_950()
         and recv.dtype == torch.bfloat16
-        and dcp_size == 8
         and scatter_dim == 1
-        and num_heads == 12
-        and head_dim == 512
+        and head_dim <= 512
         and 32 <= num_tokens <= 256
         and local_output is not None
         and not return_lse
