@@ -8,8 +8,7 @@ import torch
 from vllm.distributed import get_tp_group
 from vllm.forward_context import get_forward_context
 
-from vllm_ascend.attention.context_parallel.dsa_common import restore_tp_heads
-from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
+from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder, restore_tp_heads
 from vllm_ascend.attention.dsa_v1 import dsv4_dsa_overlap_stream
 from vllm_ascend.attention.dsa_v41 import (
     AscendDSAV41Impl,
@@ -208,18 +207,13 @@ class AscendDSAV41CPImpl(AscendDSAV41Impl):
         return self._get_layer_metadata(global_by_prefix)
 
     def _prepare_inputs_and_caches(self, attn, hidden_states, metadata, metadata_by_prefix):
-        if not attn.dsa_attn.dsa_attn.impl.multistream_dsv4_dsa_overlap or metadata.swa.num_actual_tokens == 0:
+        if metadata.swa.num_actual_tokens == 0:
             # Empty query ranks still update replicated caches before exchange.
             global_metadata = self._global_layer_metadata(metadata_by_prefix)
             self._update_caches(attn, hidden_states[: global_metadata.swa.num_actual_tokens], global_metadata)
 
     def _prepare_queries(self, attn, hidden_states, positions, cos, sin, metadata):
-        if attn.dsa_attn.dsa_attn.impl.multistream_dsv4_dsa_overlap:
-            return self.multistream_preprocess(attn, hidden_states, cos, sin, metadata.swa)
-        # Replicated caches were updated before the TP token slice.
-        start, _, _, _ = metadata.swa.cp_token_range
-        hidden_states = hidden_states[start : start + metadata.swa.num_actual_tokens]
-        return self._project_q(attn, hidden_states, cos, sin)
+        return self.multistream_preprocess(attn, hidden_states, cos, sin, metadata.swa)
 
     def _select_sparse_indices(self, attn, hidden_states, qr, positions, cos, sin, metadata):
         if not self.role.has_long_context:
@@ -242,6 +236,5 @@ class AscendDSAV41CPImpl(AscendDSAV41Impl):
             padded[: output.shape[0]] = output
         exchanged = restore_tp_heads(padded, get_tp_group())
         # The inherited V4 module owns quantized weights and TP projection logic.
-        local_output = attn.dsa_attn.dsa_attn.impl._forward_o_proj(exchanged)
-        projected.copy_(local_output[: hidden_states.shape[0]])
+        attn.dsa_attn.dsa_attn.impl._forward_o_proj(exchanged[: hidden_states.shape[0]], projected)
         return projected

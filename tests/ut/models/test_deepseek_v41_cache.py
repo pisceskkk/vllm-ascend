@@ -1277,7 +1277,8 @@ def test_v41_cp_builds_device_controls_only_on_consuming_side(runtime, monkeypat
 
 
 @pytest.mark.parametrize("local_tokens", [0, 1, 2])
-def test_v41_cp_output_exchange_only_pads_partial_ranks(monkeypatch, local_tokens):
+@pytest.mark.parametrize("num_tokens", [3, 4])
+def test_v41_cp_output_exchange_only_pads_partial_ranks(monkeypatch, local_tokens, num_tokens):
     from vllm_ascend.attention.context_parallel.dsa_v41_cp import AscendDSAV41CPImpl
 
     impl = AscendDSAV41CPImpl("layer", SimpleNamespace(is_kv_source=False), None, None, None)
@@ -1289,14 +1290,20 @@ def test_v41_cp_output_exchange_only_pads_partial_ranks(monkeypatch, local_token
         return torch.ones((4, 2, 3))
 
     monkeypatch.setattr("vllm_ascend.attention.context_parallel.dsa_v41_cp.restore_tp_heads", exchange)
-    projection = SimpleNamespace(_forward_o_proj=lambda tensor: tensor.flatten(1))
+
+    def project(tensor, output):
+        assert output is destination
+        assert tensor.shape == (num_tokens, 2, 3)
+        output.copy_(tensor.flatten(1))
+
+    projection = SimpleNamespace(_forward_o_proj=project)
     attn = SimpleNamespace(dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(impl=projection)))
-    destination = torch.empty((3, 6))
+    destination = torch.empty((num_tokens, 6))
     local_output = torch.ones((local_tokens, 4, 3))
     output = impl._project_output(
         attn,
         local_output,
-        torch.empty((3, 6)),
+        torch.empty((num_tokens, 6)),
         SimpleNamespace(swa=SimpleNamespace(cp_token_range=(0, 2, 2, 4))),
         projected=destination,
     )
@@ -1306,7 +1313,8 @@ def test_v41_cp_output_exchange_only_pads_partial_ranks(monkeypatch, local_token
     assert (calls[0] is local_output) == (local_tokens == 2)
     torch.testing.assert_close(calls[0][:local_tokens], local_output)
     assert torch.count_nonzero(calls[0][local_tokens:]) == 0
-    assert output.shape == (3, 6)
+    assert output.shape == (num_tokens, 6)
+    torch.testing.assert_close(output, torch.ones_like(destination))
 
 
 def test_v41_cp_consumers_reuse_local_topk_and_candidates():
@@ -1380,14 +1388,13 @@ def test_v41_cp_resolves_own_planes_with_native_draft_metadata_present():
 
 
 @pytest.mark.parametrize("overlap", [False, True])
-def test_v41_query_preparation_keeps_mainline_preprocess(overlap):
+def test_v41_query_preparation_uses_multistream(overlap):
     from unittest.mock import Mock
 
     from vllm_ascend.attention.dsa_v41 import AscendDSAV41Impl
 
     impl = AscendDSAV41Impl.__new__(AscendDSAV41Impl)
     impl.role = SimpleNamespace(is_kv_source=True)
-    impl.preprocess = Mock(return_value=("q", "qr"))
     impl.multistream_preprocess = Mock(return_value=("q", "qr"))
     impl._write_compressed_source = Mock()
     attn = SimpleNamespace(
@@ -1395,21 +1402,17 @@ def test_v41_query_preparation_keeps_mainline_preprocess(overlap):
     )
     metadata = SimpleNamespace(swa=SimpleNamespace(num_actual_tokens=6))
     assert impl._prepare_queries(attn, "hidden", "positions", "cos", "sin", metadata) == ("q", "qr")
-    selected = impl.multistream_preprocess if overlap else impl.preprocess
-    other = impl.preprocess if overlap else impl.multistream_preprocess
-    selected.assert_called_once_with(attn, "hidden", "cos", "sin", metadata.swa)
-    other.assert_not_called()
+    impl.multistream_preprocess.assert_called_once_with(attn, "hidden", "cos", "sin", metadata.swa)
     impl._write_compressed_source.assert_called_once_with(attn, "hidden", "positions", "cos", "sin", metadata)
 
 
 @pytest.mark.parametrize("overlap", [False, True])
-def test_v41_cp_query_preparation_uses_full_inputs_only_for_overlap(overlap):
+def test_v41_cp_query_preparation_uses_full_inputs(overlap):
     from unittest.mock import Mock
 
     from vllm_ascend.attention.context_parallel.dsa_v41_cp import AscendDSAV41CPImpl
 
     impl = AscendDSAV41CPImpl.__new__(AscendDSAV41CPImpl)
-    impl._project_q = Mock(return_value=("q", "qr"))
     impl.multistream_preprocess = Mock(return_value=("q", "qr"))
     impl._write_compressed_source = Mock()
     attn = SimpleNamespace(
@@ -1417,12 +1420,7 @@ def test_v41_cp_query_preparation_uses_full_inputs_only_for_overlap(overlap):
     )
     metadata = SimpleNamespace(swa=SimpleNamespace(num_actual_tokens=2, cp_token_range=(2, 4, 2, 6)))
     assert impl._prepare_queries(attn, "abcdef", "positions", "cos", "sin", metadata) == ("q", "qr")
-    if overlap:
-        impl.multistream_preprocess.assert_called_once_with(attn, "abcdef", "cos", "sin", metadata.swa)
-        impl._project_q.assert_not_called()
-    else:
-        impl._project_q.assert_called_once_with(attn, "cd", "cos", "sin")
-        impl.multistream_preprocess.assert_not_called()
+    impl.multistream_preprocess.assert_called_once_with(attn, "abcdef", "cos", "sin", metadata.swa)
     impl._write_compressed_source.assert_not_called()
 
 
@@ -1443,7 +1441,7 @@ def test_v41_cp_input_preparation_updates_empty_rank_cache(overlap, local_tokens
     )
     metadata = SimpleNamespace(swa=SimpleNamespace(cp_token_range=(3, 6, 3, 6), num_actual_tokens=local_tokens))
     assert impl._prepare_inputs_and_caches(attn, full, metadata, {}) is None
-    if not overlap or local_tokens == 0:
+    if local_tokens == 0:
         impl._update_caches.assert_called_once()
         assert torch.equal(impl._update_caches.call_args.args[1], full[:5])
         assert impl._update_caches.call_args.args[2] is global_metadata
