@@ -161,6 +161,7 @@ def test_runner_engram_history_selects_swa_group_and_full_requests(monkeypatch, 
             block_table=[None, SimpleNamespace(get_cpu_tensor=lambda: pages)],
         ),
     )
+    monkeypatch.setattr(runner_module, "get_forward_context", lambda: SimpleNamespace(attn_metadata={}))
     actual_boundaries, actual_pages, block_size = runner_module.NPUModelRunner._get_engram_history_inputs(runner)
     torch.testing.assert_close(actual_boundaries, boundaries[: num_reqs + 1])
     torch.testing.assert_close(actual_pages, pages[:num_reqs])
@@ -177,21 +178,23 @@ def test_runner_disabled_engram_does_not_read_batch():
     assert runner_module.NPUModelRunner._get_engram_history_inputs(runner) is None
 
 
-def test_runner_dummy_engram_does_not_read_live_batch(monkeypatch):
+def test_runner_engram_without_attention_metadata_skips_history(monkeypatch):
     from unittest.mock import Mock
 
     from vllm_ascend.worker import model_runner_v1 as runner_module
 
     model = Mock(return_value=42)
     model.prepare_engram_inputs.return_value = {}
+    model.engram_cache_layer_name = "swa"
     runner = SimpleNamespace(model=model, enable_enpu=False, _update_full_graph_params_if_needed=lambda *args: None)
+    runner._get_engram_history_inputs = runner_module.NPUModelRunner._get_engram_history_inputs.__get__(runner)
     monkeypatch.setattr(
         runner_module,
         "get_forward_context",
-        lambda: SimpleNamespace(cudagraph_runtime_mode=runner_module.CUDAGraphMode.NONE),
+        lambda: SimpleNamespace(cudagraph_runtime_mode=runner_module.CUDAGraphMode.NONE, attn_metadata=None),
     )
     monkeypatch.setattr(torch.npu, "is_current_stream_capturing", lambda: False)
-    assert runner_module.NPUModelRunner._model_forward(runner, 4, is_dummy_run=True) == 42
+    assert runner_module.NPUModelRunner._model_forward(runner, 4) == 42
     model.prepare_engram_inputs.assert_called_once_with(None, None, 4, None)
 
 
@@ -214,7 +217,7 @@ def test_engram_history_consumes_explicit_full_request_inputs(model):
     assert args[3] is pages and args[4] == 4
 
 
-def test_engram_dummy_routes_empty_hashes(model):
+def test_engram_without_history_inputs_routes_empty_hashes(model):
     from unittest.mock import Mock
 
     model.engram_history = SimpleNamespace(update=Mock())
