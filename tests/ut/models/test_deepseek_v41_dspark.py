@@ -126,7 +126,6 @@ def test_v41_draft_routes_to_v41(cp):
     with (
         patch.object(DeepseekV41SWAAttention, "__init__", initialize_base),
         patch("vllm_ascend.attention.context_parallel.dsa_v41_cp.enable_dsa_cp", return_value=cp),
-        patch("vllm_ascend.attention.context_parallel.dsa_v41_cp.enable_pcp", return_value=False),
     ):
         draft = DeepseekV41DSparkAttention(vllm_config=config, prefix="mtp.0.self_attn")
     assert type(draft.v41_impl) is (AscendDSAV41CPImpl if cp else AscendDSAV41Impl)
@@ -163,7 +162,7 @@ def test_v41_draft_sequence_parallel_shards_inputs_and_restores_output(monkeypat
     model = SimpleNamespace(
         embed_tokens=MagicMock(return_value=hidden),
         hc_mult=4,
-        use_sequence_parallel=True,
+        use_sequence_parallel_moe=True,
         needs_moe_input_ids=False,
         layers={"40": Layer()},
     )

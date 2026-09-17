@@ -2526,7 +2526,7 @@ class NPUModelRunner(GPUModelRunner):
             # Verify every scheduled layer executed its deferred copy.
             if self.cache_config.mamba_cache_mode == "align" and mamba_copy_connector is not None:
                 mamba_copy_connector.finish_mamba_state_copy()
-        if active_device_metadata_executor is not None:
+        if active_device_metadata_executor is not None and active_device_metadata_executor.submission_in_flight:
             active_device_metadata_executor.release()
         self.kvpp.complete_forward()
 
@@ -3105,13 +3105,21 @@ class NPUModelRunner(GPUModelRunner):
                 model_inputs.update(prepare_engram(input_ids, positions, num_tokens_padded, history_inputs))
         run_model = partial(self.model, **model_inputs)
 
-        if self.enable_enpu:
-            # The soft segmentation scenario requires event.record first, then event.wait
-            self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
-            hidden_states = run_model()
-        else:
-            hidden_states = run_model()
-            self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
+        try:
+            if self.enable_enpu:
+                # The soft segmentation scenario requires event.record first, then event.wait
+                self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
+                hidden_states = run_model()
+            else:
+                hidden_states = run_model()
+                self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
+        finally:
+            # A forward that raises must still retire the device-metadata
+            # submission: otherwise the next submit() refuses to start and a
+            # single request error wedges every DP rank of the instance.
+            executor = getattr(forward_context, "device_metadata_executor", None)
+            if executor is not None and executor.submission_in_flight:
+                executor.release()
 
         return hidden_states
 
@@ -4068,7 +4076,7 @@ class NPUModelRunner(GPUModelRunner):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
                 )
-            if active_device_metadata_executor is not None:
+            if active_device_metadata_executor is not None and active_device_metadata_executor.submission_in_flight:
                 active_device_metadata_executor.release()
             self.kvpp.complete_forward()
             if self.use_aux_hidden_state_outputs:
@@ -5961,6 +5969,19 @@ class NPUModelRunner(GPUModelRunner):
             self.kv_cache_spec = kv_cache_spec # reserve for Sparse KV offload usage
         return kv_cache_spec
 
+    def _should_align_cudagraph_capture_sizes(self) -> bool:
+        """Align FULL decode keys to LCM(TP, query_len) for stable CP/SP dispatch.
+
+        Upstream SP sizing uses max(TP, query_len) and does not account for CP.
+        Pre-alignment can shrink sizes or fail before a backend-driven downgrade.
+        TODO: Resolve mode first, then apply joint alignment upstream and remove
+        this workaround, including the resolver-only TP override.
+        """
+        return (
+            self.compilation_config.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+            and (enable_dsa_cp() or enable_sp(self.vllm_config) or self.compilation_config.pass_config.enable_sp)
+        )
+
     def _check_and_update_cudagraph_mode(
         self,
         attention_backends: list[set[type[AttentionBackend]]],
@@ -5984,13 +6005,7 @@ class NPUModelRunner(GPUModelRunner):
         with update_pass_config(self):
             tensor_parallel_size = self.parallel_config.tensor_parallel_size
             resolver_tensor_parallel_size = tensor_parallel_size
-            if (
-                self.compilation_config.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
-                and (enable_dsa_cp() or enable_sp(self.vllm_config) or self.compilation_config.pass_config.enable_sp)
-            ):
-                # CP and SP pad tokens to TP. Align capture keys to both TP
-                # and the speculative query length before the v0.27 resolver,
-                # whose max(query_len, TP) rejects non-divisible pairs (6, 8).
+            if self._should_align_cudagraph_capture_sizes():
                 graph_alignment = math.lcm(self.uniform_decode_query_len, tensor_parallel_size)
                 self.compilation_config.adjust_cudagraph_sizes_for_spec_decode(graph_alignment, 1)
                 resolver_tensor_parallel_size = 1

@@ -68,12 +68,21 @@ from vllm_ascend.models.common.ops.sequence_parallel import (
 from vllm_ascend.ops.dsa import AscendDeepseekSparseAttention, DSAModules
 from vllm_ascend.ops.rope_dsv4 import ComplexExpRotaryEmbedding
 from vllm_ascend.ops.triton.mul_add import muls_add_triton
-from vllm_ascend.utils import enable_custom_op, enable_dsa_cp, normalize_deepseek_v41_config
+from vllm_ascend.utils import (
+    enable_custom_op,
+    enable_dsa_cp,
+    normalize_deepseek_v41_config,
+)
 
-from .compressor import DeepseekV41Compressor, _read, text_config_of
-from .engram_gate import engram_gate
-from .engram_hash import PagedNgramHistory
-from .engram_hbm import EngramQueryGroup, NodeShardedEngram
+from .compressor import DeepseekV41Compressor
+from .engram import (
+    EngramQueryGroup,
+    NodeShardedEngram,
+    PagedNgramHistory,
+    engram_cpu_offload,
+    engram_enabled,
+    engram_gate,
+)
 from .indexer import DeepseekV41Indexer
 
 
@@ -477,11 +486,6 @@ class DeepseekV41SharedAttentionState:
         return None
 
 
-def _as_int_tuple(config: Any, name: str) -> tuple[int, ...]:
-    value = _read(config, name)
-    return tuple(value)
-
-
 def _latest_source(layer_idx: int, sources: tuple[int, ...]) -> int | None:
     return next((source for source in reversed(sources) if source <= layer_idx), None)
 
@@ -489,21 +493,20 @@ def _latest_source(layer_idx: int, sources: tuple[int, ...]) -> int | None:
 def build_layer_plan(config: Any) -> DeepseekV41Topology:
     """Build and validate the V4.1 layer-sharing graph from a text config.
 
-    ``config`` may be a Transformers config object or the raw ``text_config``
-    dictionary.  Extra compression ratios for speculative layers are allowed,
+    ``config`` is the parsed text-model config. Extra compression ratios for
+    speculative layers are allowed,
     but only the first ``num_hidden_layers`` entries describe the backbone.
     """
 
-    config = text_config_of(config)
-    num_layers = int(_read(config, "num_hidden_layers"))
-    ratios = _as_int_tuple(config, "compress_ratios")
-    kv_sources = _as_int_tuple(config, "kv_source_layer_ids")
-    index_sources = _as_int_tuple(config, "index_source_layer_ids")
-    engram_layers = _as_int_tuple(config, "engram_layer_ids")
-    candidate_source = int(_read(config, "candidate_source_layer_id"))
-    candidate_topk_blocks = int(_read(config, "candidate_topk_blocks"))
-    candidate_block_size = int(_read(config, "candidate_block_size"))
-    index_topk = int(_read(config, "index_topk"))
+    num_layers = int(config.num_hidden_layers)
+    ratios = tuple(config.compress_ratios)
+    kv_sources = tuple(config.kv_source_layer_ids)
+    index_sources = tuple(config.index_source_layer_ids)
+    engram_layers = tuple(config.engram_layer_ids)
+    candidate_source = int(config.candidate_source_layer_id)
+    candidate_topk_blocks = int(config.candidate_topk_blocks)
+    candidate_block_size = int(config.candidate_block_size)
+    index_topk = int(config.index_topk)
 
     ratios = ratios[:num_layers]
 
@@ -671,7 +674,6 @@ class DeepseekV41Attention(DeepseekV41SWAAttention):
         reduce_results=True,
         need_gather_q_kv=False,
     ):
-        config = text_config_of(config)
         validate_cache_runtime(vllm_config)
         layer_idx = int(prefix.split(".")[-2])
         topology = build_layer_plan(config)
@@ -693,7 +695,7 @@ class DeepseekV41Attention(DeepseekV41SWAAttention):
         self.topology = topology
         self.shared_state = None
         self.prefix = prefix
-        width = _read(config, "head_dim")
+        width = config.head_dim
         self.softmax_scale = width**-0.5
         if role.is_kv_source:
             self.long_kv_cache = DeepseekV41CacheLayer(
@@ -820,8 +822,8 @@ class DeepseekV41DecoderLayer(nn.Module):
         # and MoE paths then stay sharded between attention calls.
         if self.use_sequence_parallel:
             self.self_attn.wo_b.reduce_results = False
-        engram_enabled = get_ascend_config().enable_engram
-        if engram_enabled and not is_draft_layer and self.layer_idx in config.engram_layer_ids:
+        has_engram = engram_enabled(config)
+        if has_engram and not is_draft_layer and self.layer_idx in config.engram_layer_ids:
             self.engram = torch.nn.Module()
             self.engram.wkv = torch.nn.Linear(
                 (config.engram_max_ngram_size - 1) * config.engram_n_heads * config.engram_head_dim,
@@ -994,21 +996,18 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                 layer.self_attn.shared_state = self.shared_attention_state
         self.engram_root = vllm_config.model_config.model
         config = self.config
-        # Target storage is a loader/runtime choice.  Checkpoint metadata is
-        # used only by load_checkpoint to validate the source representation.
-        # Read the storage choice after AscendConfig validation.
-        ascend_config = get_ascend_config()
         self.engram_weight_root = self.engram_root
-        storage_format = ascend_config.engram_storage
-        if ascend_config.enable_engram:
+        # The table is INT8 with group-32 scales; whether it lives in host
+        # memory is vLLM's EngramConfig choice.
+        cpu_offload = engram_cpu_offload(vllm_config)
+        if engram_enabled(config):
             query_group = EngramQueryGroup.from_vllm(vllm_config.parallel_config)
             for layer_id, rows in zip(config.engram_layer_ids, config.engram_num_embeddings):
                 self.layers[layer_id].engram.embed = NodeShardedEngram(
                     rows,
                     config.engram_head_dim,
                     query_group,
-                    storage_format=storage_format,
-                    cpu_offload=ascend_config.enable_engram_ple_offload,
+                    cpu_offload=cpu_offload,
                 )
         self.engram_history = None
         self._engram_input_buffers = None
@@ -1017,7 +1016,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             vllm_config.compilation_config.max_cudagraph_capture_size or 0,
         )
         self.register_buffer("engram_rotation", torch.eye(32), persistent=False)
-        if ascend_config.enable_engram and vllm_config.load_config.load_format != "dummy":
+        if engram_enabled(config) and vllm_config.load_config.load_format != "dummy":
             with torch.device("cpu"):
                 tokenizer = AutoTokenizer.from_pretrained(self.engram_root)
                 self.engram_history = PagedNgramHistory(config, tokenizer)
@@ -1044,7 +1043,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         Calls without attention metadata pass None and participate with empty hashes.
         """
         config = self.config
-        if not get_ascend_config().enable_engram:
+        if not engram_enabled(config):
             return {}, torch.empty(0, dtype=torch.bool, device=positions.device)
         columns = (config.engram_max_ngram_size - 1) * config.engram_n_heads
         hashes = torch.empty((0, len(config.engram_layer_ids), columns), dtype=torch.int64, device="cpu")
@@ -1080,7 +1079,8 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         num_tokens = positions.shape[0]
         output_tokens = num_tokens if padded_tokens is None else padded_tokens
         lookups, mask = self.prepare_engram(input_ids, positions, history_inputs)
-        buffers, mask_buffer = self._engram_input_buffers
+        buffers = graph_inputs["engram_lookups"]
+        mask_buffer = graph_inputs["engram_mask"]
         mask_buffer[: mask.numel()].copy_(mask)
         mask_buffer[mask.numel() : output_tokens].zero_()
         for layer, values in lookups.items():
@@ -1090,7 +1090,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
 
     def prepare_engram_graph_inputs(self, padded_tokens=None):
         """Capture fixed-address buffers without CPU history or routing work."""
-        if not get_ascend_config().enable_engram:
+        if not engram_enabled(self.config):
             return {"engram_lookups": {}, "engram_mask": self.engram_rotation.new_empty(0, dtype=torch.bool)}
         if self._engram_input_buffers is None:
             capacity = self._engram_max_tokens
@@ -1174,6 +1174,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                     self.config.rms_norm_eps,
                 )
             hidden_states, pre_mix = layer(positions, hidden_states, pre_mix, None, input_ids=moe_input_ids)
+        assert last_layer is not None, "Hyper-connection collapse requires at least one decoder layer"
         hidden_states = last_layer.hc_collapse(hidden_states, pre_mix)
         if use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
@@ -1249,7 +1250,7 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        if not get_ascend_config().enable_engram:
+        if not engram_enabled(self.model.config):
             return self._load_model_weights((name, tensor) for name, tensor in weights if ".engram." not in name)
         engram_loaded: set[str] = set()
 
@@ -1562,6 +1563,6 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
 
     @property
     def engram_cache_layer_name(self) -> str | None:
-        if not get_ascend_config().enable_engram:
+        if not engram_enabled(self.model.config):
             return None
         return self.model.layers[0].self_attn.dsa_attn.swa_cache_layer.prefix
