@@ -93,6 +93,11 @@ from .engram.parallel import gather_engram_hashes, get_engram_dp_size
 from .indexer import DeepseekV41Indexer
 
 
+def _engram_enabled_for_runtime(config, vllm_config) -> bool:
+    """Use the current vLLM Engram opt-in for both runtime paths."""
+    return engram_enabled(config, vllm_config)
+
+
 class DeepseekV41MLP(nn.Module):
     def __init__(
         self,
@@ -826,7 +831,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         # and MoE paths then stay sharded between attention calls.
         if self.use_sequence_parallel:
             self.self_attn.wo_b.reduce_results = False
-        has_engram = engram_enabled(config, vllm_config)
+        has_engram = _engram_enabled_for_runtime(config, vllm_config)
         self.engram: AscendEngram | None
         if has_engram and not is_draft_layer and self.layer_idx in config.engram_layer_ids:
             self.engram = AscendEngram(config)
@@ -938,7 +943,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         config = normalize_deepseek_v41_config(vllm_config.model_config.hf_config)
         quant_config = vllm_config.quant_config
         self.config = config
-        self.has_engram = engram_enabled(config, vllm_config)
+        self.has_engram = _engram_enabled_for_runtime(config, vllm_config)
         self.device = current_platform.device_type
         self.use_sequence_parallel_moe = vllm_config.parallel_config.use_sequence_parallel_moe
 
@@ -1019,7 +1024,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         # memory is vLLM's EngramConfig choice.
         cpu_offload = engram_cpu_offload(vllm_config)
         self.engram_dp_shared_memory = bool(vllm_config.engram_config and vllm_config.engram_config.dp_shared_memory)
-        self.engram_layout = EngramLayout.from_config(config) if engram_enabled(config) else None
+        self.engram_layout = EngramLayout.from_config(config) if self.has_engram else None
         if self.engram_layout is not None:
             # Complete head buckets per rank, laid out over TP and the
             # node-local EDP group (upstream's, not one built from EP hosts).
@@ -1299,9 +1304,7 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
         # A5's packaged cache operators are qualified for eager prefill and
         # full-graph decode. Runtime NONE must bypass the compiled model rather
         # than entering a piecewise torch.compile path.
-        self.requires_uncompiled_fallback = (
-            DeviceOperator.get_deepseek_v41_backend() is not None
-        )
+        self.requires_uncompiled_fallback = DeviceOperator.get_deepseek_v41_backend() is not None
 
         self.model = self.model_cls(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
         if get_pp_group().is_last_rank:
