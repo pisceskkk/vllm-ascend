@@ -57,6 +57,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheLayer,
 )
+from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -64,8 +65,6 @@ from vllm_ascend.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 from vllm_ascend.ops.dsa import AscendDeepseekSparseAttention, DSAModules
-from vllm_ascend.ops.dsv41_a5 import hc_post as a5_hc_post
-from vllm_ascend.ops.dsv41_a5 import hc_pre as a5_hc_pre
 from vllm_ascend.ops.rope_dsv4 import ComplexExpRotaryEmbedding
 from vllm_ascend.ops.triton.mul_add import muls_add_triton
 from vllm_ascend.utils import (
@@ -77,7 +76,6 @@ from vllm_ascend.utils import (
 from .cache_config import (
     make_long_cache_spec,
     make_swa_cache_spec,
-    uses_a5_packed_cache,
 )
 from .compressor import DeepseekV41Compressor
 from .engram import (
@@ -702,7 +700,7 @@ class DeepseekV41Attention(DeepseekV41SWAAttention):
         self.topology = topology
         self.shared_state = None
         self.prefix = prefix
-        self.uses_a5_packed_cache = uses_a5_packed_cache()
+        self.dsv41_backend = DeviceOperator.get_deepseek_v41_backend()
         width = config.head_dim
         self.softmax_scale = width**-0.5
         if role.is_kv_source:
@@ -823,12 +821,12 @@ class DeepseekV41DecoderLayer(nn.Module):
         self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
         self.use_sequence_parallel = vllm_config.parallel_config.use_sequence_parallel_moe
-        self.uses_a5_packed_cache = uses_a5_packed_cache()
+        self.dsv41_backend = DeviceOperator.get_deepseek_v41_backend()
         # Leave the TP partial sums for the reduce-scatter below. The mHC
         # and MoE paths then stay sharded between attention calls.
         if self.use_sequence_parallel:
             self.self_attn.wo_b.reduce_results = False
-        has_engram = engram_enabled(config)
+        has_engram = engram_enabled(config, vllm_config)
         self.engram: AscendEngram | None
         if has_engram and not is_draft_layer and self.layer_idx in config.engram_layer_ids:
             self.engram = AscendEngram(config)
@@ -851,8 +849,8 @@ class DeepseekV41DecoderLayer(nn.Module):
         return (pre_mix.unsqueeze(-1) * x.float()).sum(-2).to(x.dtype)
 
     def hc_pre(self, x, hc_fn, hc_scale, hc_base, pre_mix=None):
-        if self.uses_a5_packed_cache:
-            return a5_hc_pre(
+        if self.dsv41_backend is not None:
+            return self.dsv41_backend.hc_pre(
                 x,
                 hc_fn,
                 hc_scale,
@@ -876,8 +874,8 @@ class DeepseekV41DecoderLayer(nn.Module):
         )
 
     def hc_post(self, x, residual, post, comb):
-        if self.uses_a5_packed_cache:
-            return a5_hc_post(x, residual, post, comb)
+        if self.dsv41_backend is not None:
+            return self.dsv41_backend.hc_post(x, residual, post, comb)
         return torch.ops._C_ascend.npu_hc_post(
             x.unsqueeze(0),
             residual.unsqueeze(0),
@@ -940,6 +938,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         config = normalize_deepseek_v41_config(vllm_config.model_config.hf_config)
         quant_config = vllm_config.quant_config
         self.config = config
+        self.has_engram = engram_enabled(config, vllm_config)
         self.device = current_platform.device_type
         self.use_sequence_parallel_moe = vllm_config.parallel_config.use_sequence_parallel_moe
 
@@ -1051,7 +1050,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             vllm_config.compilation_config.max_cudagraph_capture_size or 0,
         )
         self.register_buffer("engram_rotation", torch.eye(32), persistent=False)
-        if engram_enabled(config):
+        if self.has_engram:
             if vllm_config.load_config.load_format != "dummy":
                 with torch.device("cpu"):
                     with safe_open(Path(self.engram_root) / "optional/quarot.safetensors", framework="pt") as file:
@@ -1091,7 +1090,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         lookback window, then the slot cache the hash state fills itself.
         """
         config = self.config
-        if not engram_enabled(config):
+        if not self.has_engram:
             return {}, torch.empty(0, dtype=torch.bool, device=positions.device)
         device = positions.device
         hash_state = self.engram_hash
@@ -1195,7 +1194,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
 
     def prepare_engram_graph_inputs(self, padded_tokens=None):
         """Capture fixed-address buffers without CPU history or routing work."""
-        if not engram_enabled(self.config):
+        if not self.has_engram:
             return {"engram_lookups": {}, "engram_mask": self.engram_rotation.new_empty(0, dtype=torch.bool)}
         if self._engram_input_buffers is None:
             capacity = self._engram_max_tokens
@@ -1297,6 +1296,12 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
+        # A5's packaged cache operators are qualified for eager prefill and
+        # full-graph decode. Runtime NONE must bypass the compiled model rather
+        # than entering a piecewise torch.compile path.
+        self.requires_uncompiled_fallback = (
+            DeviceOperator.get_deepseek_v41_backend() is not None
+        )
 
         self.model = self.model_cls(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
         if get_pp_group().is_last_rank:
@@ -1379,7 +1384,7 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        if not engram_enabled(self.model.config):
+        if not self.model.has_engram:
             return self._load_model_weights((name, tensor) for name, tensor in weights if ".engram." not in name)
         loaded = self._load_model_weights((name, tensor) for name, tensor in weights if self._is_milestone_weight(name))
         return loaded
@@ -1671,6 +1676,6 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
 
     @property
     def engram_cache_layer_name(self) -> str | None:
-        if not engram_enabled(self.model.config):
+        if not self.model.has_engram:
             return None
         return self.model.layers[0].self_attn.dsa_attn.swa_cache_layer.prefix
