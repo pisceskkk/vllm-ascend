@@ -36,6 +36,8 @@ A5_INDEX_LOGICAL_DIM = 128
 A5_INDEX_GROUP_SIZE = 32
 A5_INDEX_DATA_BYTES = A5_INDEX_LOGICAL_DIM // 2
 A5_INDEX_SCALE_COUNT = A5_INDEX_LOGICAL_DIM // A5_INDEX_GROUP_SIZE
+A5_INDEX_FOLDED_GROUP_ROWS = 8
+A5_INDEX_FOLDED_ROW_BYTES = A5_INDEX_FOLDED_GROUP_ROWS * (A5_INDEX_DATA_BYTES + A5_INDEX_SCALE_COUNT)
 
 
 def uses_a5_packed_cache() -> bool:
@@ -103,6 +105,21 @@ def make_index_cache_spec(*, block_size, head_size, compress_ratio):
     )
 
 
+def make_folded_index_cache_spec(*, block_size):
+    """0923 QSLI candidate-source view: 8 K/scale rows per 544-byte row."""
+    if block_size % A5_INDEX_FOLDED_GROUP_ROWS:
+        raise ValueError("A5 folded index page must contain full 8-token groups")
+    return AscendMLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=A5_INDEX_FOLDED_ROW_BYTES,
+        dtype=torch.uint8,
+        tokens_per_state=A5_INDEX_FOLDED_GROUP_ROWS,
+        model_version="deepseek_v41",
+        storage_block_size=block_size // A5_INDEX_FOLDED_GROUP_ROWS,
+    )
+
+
 def is_deepseek_v41_cache(specs_or_groups):
     if isinstance(specs_or_groups, dict):
         specs = list(specs_or_groups.values())
@@ -131,7 +148,7 @@ def get_layer_tuples(specs):
     state = sorted((name for name, spec in specs.items() if isinstance(spec, CircularBufferSpec)), key=_layer_number)
     swa = {name for name, spec in specs.items() if isinstance(spec, AscendSlidingWindowMLASpec)}
 
-    full = sorted((name for name in mla if not specs[name].scale_dim), key=_layer_number)
+    full = sorted((name for name in mla if name.endswith(".long_kv_cache")), key=_layer_number)
     target_swa = sorted((name for name in swa if ".mtp." not in f".{name}"), key=_layer_number)
     draft_swa = sorted((name for name in swa if ".mtp." in f".{name}"), key=_draft_layer_number)
 
@@ -140,18 +157,21 @@ def get_layer_tuples(specs):
     for slot_idx, kv_name in enumerate(full):
         prefix = kv_name.rsplit(".", 1)[0]
         index_name = prefix + ".indexer.k_cache"
+        folded_name = index_name + "_folded"
+        folded_spec = specs.get(folded_name)
         index_spec = specs[index_name]
         kv_spec = specs[kv_name]
         aliases = ([state[slot_idx]] if slot_idx < len(state) else []) + target_swa[slot_idx :: len(full)]
         kv_bytes = kv_spec.unpadded_page_size_bytes
         index_bytes = index_spec.unpadded_page_size_bytes
+        folded_bytes = folded_spec.unpadded_page_size_bytes if folded_spec is not None else 0
         if slot_idx < len(draft_swa):
             aliases.append(draft_swa[slot_idx])
         capacity = max(
-            kv_bytes + index_bytes,
+            kv_bytes + index_bytes + folded_bytes,
             *(specs[name].unpadded_page_size_bytes for name in aliases),
         )
-        layer_tuples.append((kv_name, index_name, *aliases))
+        layer_tuples.append((kv_name, index_name, *((folded_name,) if folded_spec is not None else ()), *aliases))
         page_sizes.append(capacity)
     return page_sizes, layer_tuples
 
@@ -161,10 +181,18 @@ def group_cache_specs(specs):
     page_sizes, layer_tuples = get_layer_tuples(specs)
     padded = {}
     for page_size, layer_tuple in zip(page_sizes, layer_tuples):
-        kv_name, index_name, *aliases = layer_tuple
+        kv_name, index_name, *rest = layer_tuple
+        folded_name = index_name + "_folded"
+        has_folded = folded_name in rest
+        aliases = rest[1:] if has_folded else rest
         kv_bytes = specs[kv_name].unpadded_page_size_bytes
+        index_bytes = specs[index_name].unpadded_page_size_bytes
         padded[kv_name] = replace(specs[kv_name], page_size_padded=kv_bytes)
-        padded[index_name] = replace(specs[index_name], page_size_padded=page_size - kv_bytes)
+        padded[index_name] = replace(
+            specs[index_name], page_size_padded=index_bytes if has_folded else page_size - kv_bytes
+        )
+        if has_folded:
+            padded[folded_name] = replace(specs[folded_name], page_size_padded=page_size - kv_bytes - index_bytes)
         padded.update((name, replace(specs[name], page_size_padded=page_size)) for name in aliases)
 
     mla_names = [name for name, spec in padded.items() if isinstance(spec, AscendMLAAttentionSpec)]

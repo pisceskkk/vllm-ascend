@@ -35,6 +35,7 @@ from vllm_ascend.core.kv_cache_interface import (
     get_storage_block_size,
 )
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.ops.dsv41_a5.package_loader import import_packaged_a5_module
 from vllm_ascend.ops.rope_dsv4 import (
     get_cos_and_sin_dsa,
     get_full_cos_and_sin_dsa_for_layer,
@@ -489,13 +490,18 @@ class AscendDSAV41Impl:
 
         context = get_forward_context().no_compile_layers
         source_layer = context[self.index_k_source_prefix]
+        source_cache = source_layer.kv_cache[0]
+        if self.role.uses_candidate_filter and getattr(attn.indexer, "dsv41_backend", None) is not None:
+            folded_name = self.index_k_source_prefix + "_folded"
+            folded_cache = context[folded_name].kv_cache[0]
+            source_cache = (*source_cache, folded_cache)
         selected, candidates = attn.indexer.select(
             hidden_states,
             qr,
             positions,
             cos,
             sin,
-            source_layer.kv_cache[0],
+            source_cache,
             metadata.indexer.cache,
             is_candidate_source=self.role.is_candidate_source,
             uses_candidate_filter=self.role.uses_candidate_filter,
@@ -645,7 +651,10 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
         elif isinstance(kv_cache_spec, AscendSlidingWindowMLASpec):
             self._cache_kind = "swa"
         elif isinstance(kv_cache_spec, AscendMLAAttentionSpec):
-            self._cache_kind = "index_k" if kv_cache_spec.scale_dim else "long_kv"
+            if kv_cache_spec.tokens_per_state == 8 and kv_cache_spec.head_size == 544:
+                self._cache_kind = "index_k_folded"
+            else:
+                self._cache_kind = "index_k" if kv_cache_spec.scale_dim else "long_kv"
         else:
             raise TypeError(f"Unsupported V4.1 cache spec: {type(kv_cache_spec).__name__}")
         self._device_backend = DeviceOperator.get_deepseek_v41_backend()
@@ -666,8 +675,7 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
         if self._supports_device_ops and self._uses_a5_packed_cache and self._cache_kind == "swa":
             self._a5_causal_swa_indices = torch.empty((max_tokens, 1, window_size), dtype=torch.int32, device=device)
             self._a5_causal_swa_lengths = torch.empty((max_tokens, 1), dtype=torch.int32, device=device)
-            blocks = int(torch.npu.get_device_properties(device).cube_core_num)
-            self._a5_smla_metadata = torch.empty(2 * blocks, dtype=torch.int32, device=device)
+            self._a5_smla_metadata = torch.empty(V41_METADATA_BUFFER_SIZE, dtype=torch.int32, device=device)
             self._a5_smla_length_rows = torch.empty((max_tokens, 1), dtype=torch.int32, device=device)
         else:
             self._a5_causal_swa_indices = None
@@ -965,7 +973,20 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                     self._a5_smla_metadata.zero_()
                     return
                 length_rows = self._a5_smla_length_rows[:num_actual_tokens]
-                value = self._device_backend.build_smla_metadata(length_rows)
+                import_packaged_a5_module("cann_ops_transformer.ops.attention.mixed_quant_sparse_flash_mla_dsl")
+                value = torch.ops.cann_ops_transformer.ds41.mixed_quant_sparse_flash_mla_metadata(
+                    length_rows,
+                    length_rows,
+                    cu_seqlens_q=common.query_start_loc[: num_reqs + 1].int().contiguous(),
+                    num_heads_q=64,
+                    num_heads_kv=1,
+                    head_dim=512,
+                    quant_mode=1,
+                    layout_q="TND",
+                    layout_kv="PA_BBND",
+                    has_ori_kv=True,
+                    has_cmp_kv=True,
+                )
                 self._a5_smla_metadata.copy_(value)
 
             smla_metadata = self._publish_task(
@@ -1029,30 +1050,68 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
         if (
             self._build_query_metadata
             and self._supports_device_ops
-            and not self._uses_a5_packed_cache
             and cache_kind == "index_k"
         ):
             residual = cmp_residual_buffer
 
-            def build_qli_metadata() -> None:
-                value = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
-                    int(_config_value(text_config, "index_n_heads")),
-                    1,
-                    int(_config_value(text_config, "index_head_dim")),
-                    index_topk,
-                    2,
-                    cu_seqlens_q=common.query_start_loc[: num_reqs + 1].int(),
-                    seqused_k=coordinates["cache_seq_lens"],
-                    cmp_residual_k=residual,
-                    batch_size=num_reqs,
-                    max_seqlen_q=int(getattr(common, "max_query_len", 0)),
-                    max_seqlen_k=coordinates["max_cache_seq_len"],
-                    layout_q="TND",
-                    layout_k="PA_BBND",
-                    mask_mode=3,
-                    cmp_ratio=ratio,
+            if self._uses_a5_packed_cache:
+                candidate_source = int(_config_value(text_config, "candidate_source_layer_id", -1))
+                ratios = _config_value(text_config, "compress_ratios")
+                emits_candidates = (
+                    ratios is not None
+                    and 0 <= candidate_source < len(ratios)
+                    and int(ratios[candidate_source]) == ratio
                 )
-                self._qli_metadata.copy_(value)
+                candidate_blocks = int(_config_value(text_config, "candidate_topk_blocks")) if emits_candidates else -1
+                candidate_block_size = (
+                    int(_config_value(text_config, "candidate_block_size")) if emits_candidates else -1
+                )
+
+                def build_qli_metadata() -> None:
+                    if num_actual_tokens == 0:
+                        self._qli_metadata.zero_()
+                        return
+                    import_packaged_a5_module("cann_ops_transformer.ops.attention.quant_lightning_indexer_dsl")
+                    value = torch.ops.cann_ops_transformer.ds41.quant_lightning_indexer_metadata(
+                        cu_seqlens_q=common.query_start_loc[: num_reqs + 1].int(),
+                        seqused_k=coordinates["cache_seq_lens"],
+                        cmp_residual_k=residual,
+                        batch_size=num_reqs,
+                        max_seqlen_q=-1,
+                        max_seqlen_k=-1,
+                        num_heads_q=int(_config_value(text_config, "index_n_heads")),
+                        num_heads_k=1,
+                        head_dim=int(_config_value(text_config, "index_head_dim")),
+                        topk=index_topk,
+                        mask_mode=3,
+                        cmp_ratio=ratio,
+                        layout_q="TND",
+                        layout_k="PA_BBND",
+                        candidate_topk_blocks=candidate_blocks,
+                        candidate_block_size=candidate_block_size,
+                    )
+                    self._qli_metadata.copy_(value)
+            else:
+
+                def build_qli_metadata() -> None:
+                    value = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
+                        int(_config_value(text_config, "index_n_heads")),
+                        1,
+                        int(_config_value(text_config, "index_head_dim")),
+                        index_topk,
+                        2,
+                        cu_seqlens_q=common.query_start_loc[: num_reqs + 1].int(),
+                        seqused_k=coordinates["cache_seq_lens"],
+                        cmp_residual_k=residual,
+                        batch_size=num_reqs,
+                        max_seqlen_q=int(getattr(common, "max_query_len", 0)),
+                        max_seqlen_k=coordinates["max_cache_seq_len"],
+                        layout_q="TND",
+                        layout_k="PA_BBND",
+                        mask_mode=3,
+                        cmp_ratio=ratio,
+                    )
+                    self._qli_metadata.copy_(value)
 
             qli_metadata = self._publish_task(
                 batch_shared,

@@ -51,6 +51,7 @@ from vllm_ascend.models.deepseek_v41.cache_config import (
     group_cache_specs,
     is_deepseek_v41_cache,
     make_cache_groups,
+    make_folded_index_cache_spec,
 )
 from vllm_ascend.models.deepseek_v41.compressor import DeepseekV41Compressor
 from vllm_ascend.models.deepseek_v41.model import build_layer_plan
@@ -210,6 +211,24 @@ def test_twelve_groups_share_four_layer_slots(config, runtime):
                 assert key.dtype == torch.int8 and scale.dtype == torch.float16
                 assert scale.data_ptr() - key.data_ptr() == storage_block_size * spec.head_size
                 assert scale.shape == (blocks, storage_block_size, 1, 1)
+
+
+def test_candidate_source_folded_index_cache_is_in_same_physical_slot(runtime):
+    specs = collect_specs(runtime)
+    name = "model.layers.20.self_attn.indexer.k_cache_folded"
+    specs[name] = make_folded_index_cache_spec(block_size=runtime.cache_config.block_size)
+    index_name = name.removesuffix("_folded")
+    long_name = name.removesuffix(".indexer.k_cache_folded") + ".long_kv_cache"
+    page_sizes, tuples = get_layer_tuples(specs)
+    source_slot = next(i for i, slot in enumerate(tuples) if long_name in slot)
+    assert tuples[source_slot][:3] == (long_name, index_name, name)
+    assert page_sizes[source_slot] >= sum(specs[layer].unpadded_page_size_bytes for layer in tuples[source_slot][:3])
+    groups = make_cache_groups(group_cache_specs(specs))
+    planned = get_deepseek_v41_kv_cache_config(
+        runtime, groups, get_deepseek_v41_pool_bytes_per_block(groups) * 2
+    )
+    assert planned.kv_cache_tensors[source_slot].layers[:3] == [long_name, index_name, name]
+    assert planned.kv_cache_tensors[source_slot].block_stride == page_sizes[source_slot]
 
 
 def test_production_layout_matches_design(config, runtime):

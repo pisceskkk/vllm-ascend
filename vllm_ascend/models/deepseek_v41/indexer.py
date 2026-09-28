@@ -13,7 +13,12 @@ from vllm_ascend.attention.dsa_v41 import (
     scatter_cache_sk,
 )
 from vllm_ascend.device.device_op import DeviceOperator
-from vllm_ascend.models.deepseek_v41.cache_config import make_index_cache_spec
+from vllm_ascend.models.deepseek_v41.cache_config import (
+    make_folded_index_cache_spec,
+    make_index_cache_spec,
+    uses_a5_packed_cache,
+)
+from vllm_ascend.ops.triton.fold_indexer_cache import fold_indexer_cache_rows
 from vllm_ascend.ops.triton.prepare_indexer_indices import prepare_indexer_indices
 from vllm_ascend.ops.triton.quantize_indexer_query import quantize_indexer_query
 from vllm_ascend.worker.device_metadata import (
@@ -37,6 +42,7 @@ class DeepseekV41Indexer(nn.Module):
         prefix,
         compress_ratio,
         quant_config=None,
+        is_candidate_source=False,
     ):
         super().__init__()
         self.owns_k = owns_k
@@ -81,6 +87,15 @@ class DeepseekV41Indexer(nn.Module):
                     compress_ratio=compress_ratio,
                 ),
             )
+            self.k_cache_folded = (
+                DeepseekV41CacheLayer(
+                    vllm_config,
+                    f"{prefix}.k_cache_folded",
+                    make_folded_index_cache_spec(block_size=vllm_config.cache_config.block_size),
+                )
+                if is_candidate_source and uses_a5_packed_cache()
+                else None
+            )
 
     @staticmethod
     def _output(linear, value):
@@ -112,6 +127,8 @@ class DeepseekV41Indexer(nn.Module):
         k_cache, scale_cache = self.k_cache.kv_cache[0]
         if self.dsv41_backend is not None:
             self.dsv41_backend.write_index_cache((k_cache, scale_cache), slots, key)
+            if self.k_cache_folded is not None:
+                fold_indexer_cache_rows((k_cache, scale_cache), self.k_cache_folded.kv_cache[0], slots)
             return
         quantized, scale = torch_npu.npu_dynamic_quant(key, dst_type=torch.int8)
         scatter_cache_sk(k_cache, slots, quantized)
