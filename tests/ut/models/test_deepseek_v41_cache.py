@@ -1073,8 +1073,10 @@ def test_ring_source_reuses_prepared_store_coordinates(monkeypatch, num_tokens, 
         compressor=SimpleNamespace(cache=cache, state=state),
         indexer=SimpleNamespace(cache=cache),
     )
+    impl = object.__new__(AscendDSAV41Impl)
+    impl.role = SimpleNamespace(compress_ratio=2)
     AscendDSAV41Impl._write_compressed_source(
-        SimpleNamespace(role=SimpleNamespace(compress_ratio=2)),
+        impl,
         attn,
         hidden_states,
         positions,
