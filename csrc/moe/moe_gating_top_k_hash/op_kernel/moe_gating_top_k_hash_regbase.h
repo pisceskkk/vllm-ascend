@@ -569,6 +569,8 @@ namespace MoeGatingTopKHashRegbaseNS
         visionRow_ = false;
         if (hasBiasVl_) {
             int64_t tokenId = static_cast<int64_t>(inputIdsGm_.GetValue(row));
+            // Match token zero before classifying draft/padding IDs as vision.
+            tokenId = tokenId == -1 ? 0 : tokenId;
             visionRow_ = tokenId >= tilingData_->imageSentinelLo &&
                          tokenId - tilingData_->imageSentinelLo < tilingData_->imageSentinelCount;
         }
@@ -799,6 +801,7 @@ namespace MoeGatingTopKHashRegbaseNS
         LocalTensor<int32_t> hashExpertIdInt32 = hashExpertId.template ReinterpretCast<int32_t>();
 
         U1 key = inputIdsGm_.GetValue(row);
+        key = key == static_cast<U1>(-1) ? static_cast<U1>(0) : key;
         SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
         DataCopyExtParams dataCopyParams{1, static_cast<uint32_t>(k_ * sizeof(U2)), 0, 0, 0};
         DataCopyPadExtParams dataCopyPadParams{false, 0, 0, static_cast<U2>(0)};

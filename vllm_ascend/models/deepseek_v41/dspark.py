@@ -220,10 +220,6 @@ class DeepseekV41DSparkModel(torch.nn.Module):
         last_layer.norm = self.norm
         last_layer.markov_head = self.markov_head
 
-        self.needs_moe_input_ids = any(
-            layer.mlp.gate.tid2eid is not None or layer.mlp.gate.bias_vl is not None for layer in self.layers.values()
-        )
-
     def _store_standard_swa_kv(self, shared_kv, slot_mapping, attn=None):
         if slot_mapping is None or slot_mapping.numel() == 0:
             return
@@ -264,9 +260,6 @@ class DeepseekV41DSparkModel(torch.nn.Module):
         pre_mix = hidden_states.new_zeros(hidden_states.shape[0], self.hc_mult, dtype=torch.float32)
         pre_mix[:, 0] = 1.0
         last_layer = None
-        moe_input_ids = input_ids
-        if self.needs_moe_input_ids:
-            moe_input_ids = torch.where(input_ids == -1, 0, input_ids)
         for layer in self.layers.values():
             last_layer = layer
             hidden_states, pre_mix = layer(
@@ -274,7 +267,7 @@ class DeepseekV41DSparkModel(torch.nn.Module):
                 hidden_states,
                 pre_mix,
                 llama_4_scaling=None,
-                input_ids=moe_input_ids,
+                input_ids=input_ids,
             )
         assert last_layer is not None, "Hyper-connection collapse requires at least one decoder layer"
         hidden_states = last_layer.hc_collapse(hidden_states, pre_mix)

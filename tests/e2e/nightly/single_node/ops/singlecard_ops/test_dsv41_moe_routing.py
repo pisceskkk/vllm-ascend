@@ -28,17 +28,17 @@ def _load_ops():
     load_custom_op_library()
 
 
-def _inputs(dtype, route):
+def _inputs(dtype, route, image_start=IMAGE_START):
     torch.manual_seed(849)
     logits = (torch.randn(8, EXPERTS) * 2).to(dtype)
     # Exercise stable softplus, including very negative and positive logits.
     logits[0, :4] = torch.tensor([-80, -40, 40, 80], dtype=dtype)
     bias = (torch.randn(EXPERTS) * 3).to(dtype)
     bias_vl = torch.flip(bias, dims=[0]) if route == "vision" else None
-    ids = torch.tensor([0, 11, 22, 33, 44, 55, 7, 19], dtype=torch.int64)
+    ids = torch.tensor([-1, 0, 22, 33, 44, 55, 7, 19], dtype=torch.int64)
     if route == "vision":
         # Both sentinel boundaries, plus text immediately outside the range.
-        ids = torch.tensor([IMAGE_START - 1, IMAGE_START, IMAGE_START + 4, IMAGE_START + 5, 11, 22, 33, 44])
+        ids = torch.tensor([-1, 0, image_start, image_start + 4, image_start + 5, 11, 22, 33])
     table = None
     if route != "dynamic":
         table = torch.arange((IMAGE_START + 6) * TOP_K, dtype=torch.int32)
@@ -47,6 +47,9 @@ def _inputs(dtype, route):
 
 
 def _reference(logits, bias, bias_vl, ids, table, image_start=IMAGE_START, image_count=5):
+    # Preserve the model's pre-fusion contract: a draft/padding -1 routes as 0.
+    ids = ids.clone()
+    ids[ids == -1] = 0
     # FP64 logaddexp remains stable at the large-magnitude inputs above.
     scores = torch.logaddexp(logits.double(), torch.zeros_like(logits, dtype=torch.float64)).sqrt()
     correction = torch.zeros_like(scores) if bias is None else bias.double().expand_as(scores)
@@ -111,20 +114,24 @@ def test_dsv41_text_routing_custom_op(dtype, route, execution):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("with_hash", [False, True])
-def test_dsv41_vision_routing_replay_changes_row_kind(dtype, id_dtype, with_hash):
+@pytest.mark.parametrize("image_start", [211, 0, -2])
+def test_dsv41_vision_routing_replay_changes_row_kind(dtype, id_dtype, with_hash, image_start):
     torch.manual_seed(850)
     # More rows than vector cores exercises each core's pipelined row loop.
-    rows, image_start, image_count = 149, 211, 3
+    rows, image_count = 149, 3
     # Unique BF16-representable logits avoid ambiguous unbiased TopK ties.
     logits = (torch.stack([torch.randperm(EXPERTS) for _ in range(rows)]).float() - EXPERTS // 2) / 32
     logits = logits.to(dtype)
     bias_vl = (torch.randn(EXPERTS) * 3).to(dtype)
     # No text bias also covers the distinct unbiased text path.
-    ids = torch.tensor([7, image_start - 1, image_start, image_start + 2, image_start + 3, 11], dtype=id_dtype)
+    # Include -1 before and after zero-valued/signed custom sentinel boundaries.
+    ids = torch.tensor(
+        [-1, 0, 7, max(0, image_start - 1), image_start, image_start + 2, image_start + 3, 11], dtype=id_dtype
+    )
     ids = ids.repeat((rows + ids.numel() - 1) // ids.numel())[:rows]
     table = None
     if with_hash:
-        table = ((torch.arange((image_start + 4) * TOP_K).reshape(-1, TOP_K) * 13 + 7) % EXPERTS).int()
+        table = ((torch.arange(max(16, image_start + 4) * TOP_K).reshape(-1, TOP_K) * 13 + 7) % EXPERTS).int()
     device_logits, device_ids, device_bias_vl = logits.npu(), ids.npu(), bias_vl.npu()
     device_table = table.npu() if table is not None else None
 
@@ -167,11 +174,14 @@ def test_dsv41_vision_routing_replay_changes_row_kind(dtype, id_dtype, with_hash
         torch.testing.assert_close(actual_weights.cpu().float(), expected_weights, rtol=tolerance, atol=tolerance)
 
 
-@pytest.mark.parametrize("route", ["dynamic", "hash", "vision"])
-def test_dsv41_router_and_weighted_experts(route):
+@pytest.mark.parametrize(
+    "route,image_start",
+    [("dynamic", IMAGE_START), ("hash", IMAGE_START), ("vision", IMAGE_START), ("vision", 0), ("vision", -2)],
+)
+def test_dsv41_router_and_weighted_experts(route, image_start):
     """Run the real router and single-rank ID preparation before expert aggregation."""
-    logits, bias, bias_vl, ids, table = _inputs(torch.float32, route)
-    expected_weights, expected_ids = _reference(logits, bias, bias_vl, ids, table)
+    logits, bias, bias_vl, ids, table = _inputs(torch.float32, route, image_start)
+    expected_weights, expected_ids = _reference(logits, bias, bias_vl, ids, table, image_start)
     router = AscendFusedTopKRouter(
         top_k=TOP_K,
         global_num_experts=EXPERTS,
@@ -180,6 +190,7 @@ def test_dsv41_router_and_weighted_experts(route):
         e_score_correction_bias=bias.npu(),
         tid2eid=table.npu() if table is not None else None,
         bias_vl=bias_vl.npu() if bias_vl is not None else None,
+        image_sentinel_lo=image_start,
     )
     hidden = torch.randn(8, 32)
     experts = torch.randn(EXPERTS, 32, 16) / 32**0.5

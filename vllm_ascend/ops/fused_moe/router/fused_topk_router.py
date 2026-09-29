@@ -48,6 +48,8 @@ def select_deepseek_v4_vision_experts(
     ``tid2eid`` lookup used by the text-only model, while image rows use the
     checkpoint's ``bias_vl`` with the sqrt-softplus router scores.
     """
+    # Native routing performs this normalization inside the operator.
+    input_ids = torch.where(input_ids == -1, 0, input_ids)
     scores = torch.nn.functional.softplus(router_logits).sqrt()
     image_hi = image_sentinel_lo + DEEPSEEK_V4_IMAGE_SENTINEL_COUNT
     image_mask = (input_ids >= image_sentinel_lo) & (input_ids < image_hi)
@@ -183,7 +185,6 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                     # ids. Apply the identical TP chunk only when communication
                     # has not already aligned ids with local router rows.
                     input_ids = sequence_parallel_chunk(input_ids.reshape(-1, 1)).reshape(-1)
-                input_ids = torch.where(input_ids == -1, 0, input_ids)
             else:
                 input_ids = None
                 tid2eid_ones = None
