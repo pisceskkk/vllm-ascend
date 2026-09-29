@@ -1,20 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Packaged A5 CompressorV2 adapter."""
+"""A5 CompressorV2 adapter."""
 
 from __future__ import annotations
 
 import torch
 
-from .package_loader import import_packaged_a5_module
-
 
 def compressor_v2(x, wkv, wgate, state_cache, metadata, out):
     """Run CompressorV2 and restore its packed rows to token alignment."""
-    import_packaged_a5_module("cann_ops_transformer.ops.attention.compressor_v2.compressor")
     controls = metadata.c2_ring_metadata
     complete = metadata.c2_complete_mask[: x.shape[0]]
-    packed = torch.ops.cann_ops_transformer.ds41.compressor(
+    packed = torch.ops._C_ascend.compressor_v2(
         x.contiguous(),
         wkv.detach().contiguous(),
         wgate.detach().contiguous(),

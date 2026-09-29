@@ -858,10 +858,12 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
 
     @staticmethod
     def get_deepseek_v41_backend() -> Any:
-        # Import lazily so non-A5 processes never load the packaged A5 operator
+        # Import lazily so non-A5 processes never load the in-tree A5 operator
         # adapters or their runtime dependencies.
         from vllm_ascend.ops import dsv41_a5
+        from vllm_ascend.utils import load_custom_op_library
 
+        load_custom_op_library()
         return dsv41_a5
 
     @classmethod

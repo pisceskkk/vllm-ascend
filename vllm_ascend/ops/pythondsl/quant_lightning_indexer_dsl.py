@@ -13,46 +13,43 @@ weighted reduction and uint16 streaming TopK, with optional candidate TopK.
 
 from __future__ import annotations
 
-import os
 import threading
 from math import gcd
-from cannbotdsl.ops.sync import global_sync_all, vec_sync_all
-from cannbotdsl import channel_rewind
-from typing import Optional
 
 import cannbotdsl
 import torch
-
-from cannbotdsl import ChannelKind, MemLoc, Tensor, dtypes, select as dyn_select
+from cannbotdsl import MemLoc, Tensor, channel_rewind, dtypes
+from cannbotdsl import select as dyn_select
 from cannbotdsl.buffer import Buffer
 from cannbotdsl.channel import Channel
+from cannbotdsl.lang.constexpr import range_constexpr
+from cannbotdsl.lang.control_flow import range as dsl_range
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.lang.spec import TensorSpec
 from cannbotdsl.lang.vf import vf
-from cannbotdsl.lang.control_flow import range as dsl_range
-from cannbotdsl.lang.constexpr import range_constexpr
+from cannbotdsl.ops import reg as rr
 from cannbotdsl.ops.arch import get_block_idx, get_subblock_id
 from cannbotdsl.ops.matmul import matmul as dsl_matmul
 from cannbotdsl.ops.memcpy import make_copy_engine, mem_copy
 from cannbotdsl.ops.sync import (
     PIPE,
-    cube_sync_intra_wait, cube_sync_intra_arrive,
-    vec_sync_intra_wait, vec_sync_intra_arrive,
-    cube_sync_notify,
-    cube_sync_wait,
+    cube_sync_intra_arrive,
+    cube_sync_intra_wait,
+    global_sync_all,
+    vec_sync_all,
+    vec_sync_intra_arrive,
+    vec_sync_intra_wait,
     vec_sync_notify,
     vec_sync_wait,
 )
 from cannbotdsl.tensor import (
     local_slice,
+    make_layout,
     make_pointer,
     make_tensor,
-    make_layout,
     tile_view,
 )
-from cannbotdsl.ops import reg as rr
-
 
 # Group six N1=32 query rows into an M192 tile; N1=64 uses four rows.
 QUERY_TILE_ROWS = 6
@@ -97,24 +94,16 @@ def _pa_axis0_storage_rows(
     """
     strides = tuple(int(step) for step in tensor.stride())
     if strides[1:] != expected_inner_strides:
-        raise ValueError(
-            f"{name} only supports non-contiguous storage on axis 0 in "
-            "PA_BBND layout"
-        )
+        raise ValueError(f"{name} only supports non-contiguous storage on axis 0 in PA_BBND layout")
     stride0 = strides[0]
     if stride0 < 0:
         raise ValueError(f"{name} axis-0 stride must be non-negative")
     if stride0 % storage_row_elements != 0:
-        raise ValueError(
-            f"{name} axis-0 stride must preserve complete PA storage rows"
-        )
+        raise ValueError(f"{name} axis-0 stride must preserve complete PA storage rows")
     blocks = int(tensor.shape[0])
     if blocks <= 0:
         raise ValueError(f"{name} must contain at least one physical PA block")
-    storage_rows = (
-        (blocks - 1) * (stride0 // storage_row_elements)
-        + int(tensor.shape[1])
-    )
+    storage_rows = (blocks - 1) * (stride0 // storage_row_elements) + int(tensor.shape[1])
     return stride0, storage_rows
 
 
@@ -126,9 +115,7 @@ class QliRawTopKWorkspace:
         self.max_topk = int(max_topk)
         self.pipelined = bool(pipelined)
         self.topk_pad = ceil_div(self.max_topk, 256) * 256
-        self.merge_len_pad = ceil_div(
-            self.topk_pad + self.max_trunk_len, 128
-        ) * 128
+        self.merge_len_pad = ceil_div(self.topk_pad + self.max_trunk_len, 128) * 128
         self.current_trunk = Channel(
             MemLoc.UB,
             (1, self.max_trunk_len),
@@ -137,35 +124,21 @@ class QliRawTopKWorkspace:
             addr=4 * self.merge_len_pad,
         )
         if self.pipelined:
-            self.merge_key = Channel(
-                MemLoc.UB, (1, self.merge_len_pad), dtypes.uint16, depth=2, addr=0
-            )
+            self.merge_key = Channel(MemLoc.UB, (1, self.merge_len_pad), dtypes.uint16, depth=2, addr=0)
         else:
-            self.merge_key = Buffer(
-                MemLoc.UB, (1, self.merge_len_pad), dtypes.uint16, addr=0
-            )
-        self.tmp_idx = Buffer(
-            MemLoc.UB, (self.merge_len_pad,), dtypes.uint16
-        )
+            self.merge_key = Buffer(MemLoc.UB, (1, self.merge_len_pad), dtypes.uint16, addr=0)
+        self.tmp_idx = Buffer(MemLoc.UB, (self.merge_len_pad,), dtypes.uint16)
         self.histogram = Buffer(MemLoc.UB, (256,), dtypes.uint16)
-        self.high_target_carrier = Buffer(
-            MemLoc.UB, (64,), dtypes.int32
-        )
-        self.history_key = Buffer(
-            MemLoc.UB, (2, self.topk_pad), dtypes.uint16
-        )
+        self.high_target_carrier = Buffer(MemLoc.UB, (64,), dtypes.int32)
+        self.history_key = Buffer(MemLoc.UB, (2, self.topk_pad), dtypes.uint16)
         self.next_history_key = Channel(
             MemLoc.UB,
             (1, self.topk_pad),
             dtypes.uint16,
             depth=1,
         )
-        self.history_idx = Buffer(
-            MemLoc.UB, (2, self.topk_pad), dtypes.int32
-        )
-        self.next_idx = Buffer(
-            MemLoc.UB, (self.topk_pad,), dtypes.int32
-        )
+        self.history_idx = Buffer(MemLoc.UB, (2, self.topk_pad), dtypes.int32)
+        self.next_idx = Buffer(MemLoc.UB, (self.topk_pad,), dtypes.int32)
 
 
 class QliRawTopKSelector:
@@ -191,9 +164,7 @@ class QliRawTopKSelector:
         self.trunk_len = workspace.max_trunk_len
         # ASC reserves history in 256-element units before the next trunk.
         self.topk_pad = ceil_div(self.topk, 256) * 256
-        self.merge_len_pad = ceil_div(
-            self.topk_pad + self.trunk_len, 128
-        ) * 128
+        self.merge_len_pad = ceil_div(self.topk_pad + self.trunk_len, 128) * 128
         self.workspace = workspace
         self.pipelined = bool(getattr(workspace, "pipelined", False))
         if (
@@ -204,12 +175,8 @@ class QliRawTopKSelector:
             raise ValueError("TopK selector exceeds the shared UB workspace")
         # Final V->MTE3 stages are selector-owned so Sparse and Candidate can
         # share computational scratch without racing each other's GM writes.
-        self.output_idx_stage = Channel(
-            MemLoc.UB, (1, self.topk), dtypes.int32, depth=1
-        )
-        self.output_value_bits_stage = Channel(
-            MemLoc.UB, (1, self.topk), dtypes.uint16, depth=1
-        )
+        self.output_idx_stage = Channel(MemLoc.UB, (1, self.topk), dtypes.int32, depth=1)
+        self.output_value_bits_stage = Channel(MemLoc.UB, (1, self.topk), dtypes.uint16, depth=1)
         self.hist_slot0 = workspace.histogram
         self.hist_slot1 = workspace.histogram
 
@@ -242,12 +209,9 @@ class QliRawTopKSelector:
                 source_offset = chunk * 128
                 count = current_len - source_offset
                 current_mask = rr.update_mask(count, elem_bits=16)[0]
-                selected = rr.vselect(rr.vload(current_trunk, source_offset),
-                                      zero, cond_mask=current_mask)
-                rr.vstore(merge_key, history_prefix + source_offset,
-                          selected, mask16)
-            for chunk in dsl_range(current_chunk_count,
-                                   (current_len_pad + 127) // 128, unroll=1):
+                selected = rr.vselect(rr.vload(current_trunk, source_offset), zero, cond_mask=current_mask)
+                rr.vstore(merge_key, history_prefix + source_offset, selected, mask16)
+            for chunk in dsl_range(current_chunk_count, (current_len_pad + 127) // 128, unroll=1):
                 rr.vstore(merge_key, history_prefix + chunk * 128, zero, mask16)
             rr.vmem_bar("vst_vld")
 
@@ -257,8 +221,10 @@ class QliRawTopKSelector:
         if not self.pipelined:
             vec_sync_notify(PIPE.V, PIPE.MTE2, 3)
             vec_sync_wait(PIPE.V, PIPE.MTE2, 3)
-            mem_copy(local_slice(_offset_view(merge, (0, history_prefix)), (1, copied)),
-                     gm_keys[0:1, source_offset:source_offset + copied])
+            mem_copy(
+                local_slice(_offset_view(merge, (0, history_prefix)), (1, copied)),
+                gm_keys[0:1, source_offset : source_offset + copied],
+            )
             vec_sync_notify(PIPE.MTE2, PIPE.V, 3)
             vec_sync_wait(PIPE.MTE2, PIPE.V, 3)
             with vf(mode="raw"):
@@ -269,13 +235,13 @@ class QliRawTopKSelector:
         elif history_prefix == 0:
             # Common case: no retained history -> load the trunk straight into
             # the double-buffered merge Channel (async, no extra V copy).
-            mem_copy(local_slice(merge, (1, copied)),
-                     gm_keys[0:1, source_offset:source_offset + copied])
+            mem_copy(local_slice(merge, (1, copied)), gm_keys[0:1, source_offset : source_offset + copied])
         else:
-            mem_copy(local_slice(self.workspace.current_trunk, (1, copied)),
-                     gm_keys[0:1, source_offset:source_offset + copied])
-            self._build_merge(self.workspace.current_trunk, history, merge,
-                              length, copied, history_prefix)
+            mem_copy(
+                local_slice(self.workspace.current_trunk, (1, copied)),
+                gm_keys[0:1, source_offset : source_offset + copied],
+            )
+            self._build_merge(self.workspace.current_trunk, history, merge, length, copied, history_prefix)
 
     @jit
     def _find_indices(self, sort_key, valid_len, tmp_idx, histogram, high_target_carrier):
@@ -315,7 +281,6 @@ class QliRawTopKSelector:
             h1 = rr.vadd(h1, h1c2, mask=full16)
             h1 = rr.vadd(h1, h1c3, mask=full16)
 
-
             full16 = rr.update_mask(128, elem_bits=16)[0]
             lane0 = rr.update_mask(1, elem_bits=16)[0]
             bottom_k = valid_len - self.topk + 1
@@ -334,14 +299,15 @@ class QliRawTopKSelector:
             )
             high_target = rr.vreduce_min(rr.vmin(candidate0, candidate1, mask=full16), mask=full16)
 
-
             full16 = rr.update_mask(128, elem_bits=16)[0]
             lane0 = rr.update_mask(1, elem_bits=16)[0]
             zero16 = rr.vdups(0, dtypes.uint16, mask=full16)
             one16 = rr.vdups(1, dtypes.uint16, mask=full16)
             bottom_k = valid_len - self.topk + 1
             high_target = rr.vdup(high_target, mask=full16)
-            high_target8 = rr.vreinterpret_lanes(rr.vbitwise_or(high_target, rr.vshl(high_target, 8, mask=full16), mask=full16), dtypes.uint8)
+            high_target8 = rr.vreinterpret_lanes(
+                rr.vbitwise_or(high_target, rr.vshl(high_target, 8, mask=full16), mask=full16), dtypes.uint8
+            )
             prev = rr.vsub(high_target, one16, mask=full16)
             is_zero = rr.veqs(high_target, 0, mask=full16)
             prev = rr.vselect(zero16, prev, cond_mask=is_zero)
@@ -396,9 +362,8 @@ class QliRawTopKSelector:
             l1 = rr.vadd(l1, l1c2, mask=full16)
             l1 = rr.vadd(l1, l1c3, mask=full16)
 
-
             full16 = rr.update_mask(128, elem_bits=16)[0]
-            lane0 = rr.update_mask(1, elem_bits=16)[0]
+            lane0 = rr.update_mask(1, elem_bits=16)[0]  # noqa: F841
             next_k = next_k_register
             all_ones = rr.vdups(0xFFFF, dtypes.uint16, mask=full16)
             hist0 = l0
@@ -415,7 +380,6 @@ class QliRawTopKSelector:
             )
             low_target = rr.vreduce_min(rr.vmin(candidate0, candidate1, mask=full16), mask=full16)
 
-
             full16 = rr.update_mask(128, elem_bits=16)[0]
             low_target = rr.vdup(low_target, mask=full16)
             kth = rr.vbitwise_or(
@@ -430,18 +394,14 @@ class QliRawTopKSelector:
                 mask16 = rr.update_mask(valid_count, elem_bits=16)[0]
                 keys = rr.vload(sort_key, chunk * 128)
                 idx = rr.varange(chunk * 128, dtypes.uint16)
-                sq = rr.vsqueeze_and_storeunalign_init(
-                    idx, mask=rr.vgt(keys, kth, mask=mask16)
-                )
+                sq = rr.vsqueeze_and_storeunalign_init(idx, mask=rr.vgt(keys, kth, mask=mask16))
                 rr.vsqueeze_and_storeunalign(tmp_idx, 0, sq, ureg)
             for chunk in dsl_range(valid_chunk_count, unroll=1):
                 valid_count = valid_len - chunk * 128
                 mask16 = rr.update_mask(valid_count, elem_bits=16)[0]
                 keys = rr.vload(sort_key, chunk * 128)
                 idx = rr.varange(chunk * 128, dtypes.uint16)
-                sq = rr.vsqueeze_and_storeunalign_init(
-                    idx, mask=rr.veq(keys, kth, mask=mask16)
-                )
+                sq = rr.vsqueeze_and_storeunalign_init(idx, mask=rr.veq(keys, kth, mask=mask16))
                 rr.vsqueeze_and_storeunalign(tmp_idx, 0, sq, ureg)
             rr.vstore_unalign_post(tmp_idx, 0, ureg)
             rr.vmem_bar("vst_vld")
@@ -471,14 +431,15 @@ class QliRawTopKSelector:
             )
             high_target = rr.vreduce_min(rr.vmin(candidate0, candidate1, mask=full16), mask=full16)
 
-
             full16 = rr.update_mask(128, elem_bits=16)[0]
             lane0 = rr.update_mask(1, elem_bits=16)[0]
             zero16 = rr.vdups(0, dtypes.uint16, mask=full16)
             one16 = rr.vdups(1, dtypes.uint16, mask=full16)
             bottom_k = valid_len - self.topk + 1
             high_target = rr.vdup(high_target, mask=full16)
-            high_target8 = rr.vreinterpret_lanes(rr.vbitwise_or(high_target, rr.vshl(high_target, 8, mask=full16), mask=full16), dtypes.uint8)
+            high_target8 = rr.vreinterpret_lanes(
+                rr.vbitwise_or(high_target, rr.vshl(high_target, 8, mask=full16), mask=full16), dtypes.uint8
+            )
             prev = rr.vsub(high_target, one16, mask=full16)
             is_zero = rr.veqs(high_target, 0, mask=full16)
             prev = rr.vselect(zero16, prev, cond_mask=is_zero)
@@ -533,9 +494,8 @@ class QliRawTopKSelector:
             l1 = rr.vadd(l1, l1c2, mask=full16)
             l1 = rr.vadd(l1, l1c3, mask=full16)
 
-
             full16 = rr.update_mask(128, elem_bits=16)[0]
-            lane0 = rr.update_mask(1, elem_bits=16)[0]
+            lane0 = rr.update_mask(1, elem_bits=16)[0]  # noqa: F841
             next_k = next_k_register
             all_ones = rr.vdups(0xFFFF, dtypes.uint16, mask=full16)
             hist0 = l0
@@ -552,7 +512,6 @@ class QliRawTopKSelector:
             )
             low_target = rr.vreduce_min(rr.vmin(candidate0, candidate1, mask=full16), mask=full16)
 
-
             full16 = rr.update_mask(128, elem_bits=16)[0]
             low_target = rr.vdup(low_target, mask=full16)
             kth = rr.vbitwise_or(
@@ -567,32 +526,35 @@ class QliRawTopKSelector:
                 mask16 = rr.update_mask(valid_count, elem_bits=16)[0]
                 keys = rr.vload(sort_key, chunk * 128)
                 idx = rr.varange(chunk * 128, dtypes.uint16)
-                sq = rr.vsqueeze_and_storeunalign_init(
-                    idx, mask=rr.vgt(keys, kth, mask=mask16)
-                )
+                sq = rr.vsqueeze_and_storeunalign_init(idx, mask=rr.vgt(keys, kth, mask=mask16))
                 rr.vsqueeze_and_storeunalign(tmp_idx, 0, sq, ureg)
             for chunk in dsl_range(valid_chunk_count, unroll=1):
                 valid_count = valid_len - chunk * 128
                 mask16 = rr.update_mask(valid_count, elem_bits=16)[0]
                 keys = rr.vload(sort_key, chunk * 128)
                 idx = rr.varange(chunk * 128, dtypes.uint16)
-                sq = rr.vsqueeze_and_storeunalign_init(
-                    idx, mask=rr.veq(keys, kth, mask=mask16)
-                )
+                sq = rr.vsqueeze_and_storeunalign_init(idx, mask=rr.veq(keys, kth, mask=mask16))
                 rr.vsqueeze_and_storeunalign(tmp_idx, 0, sq, ureg)
             rr.vstore_unalign_post(tmp_idx, 0, ureg)
             rr.vmem_bar("vst_vld")
 
-
     @jit
-    def _find_indices_dispatch(self, sort_key, valid_len, tmp_idx, histogram, high_target_carrier, cached_hist, hist_row):
+    def _find_indices_dispatch(
+        self, sort_key, valid_len, tmp_idx, histogram, high_target_carrier, cached_hist, hist_row
+    ):
         with vf(mode="raw"):
             full16 = rr.update_mask(128, elem_bits=16)[0]
             h0 = rr.vdups(0, dtypes.uint16, mask=full16)
             h1 = rr.vdups(0, dtypes.uint16, mask=full16)
             if cached_hist:
-                h0 = rr.vadd(rr.vload(self.hist_slot0, hist_row * 512), rr.vload(self.hist_slot1, hist_row * 512), mask=full16)
-                h1 = rr.vadd(rr.vload(self.hist_slot0, hist_row * 512 + 256), rr.vload(self.hist_slot1, hist_row * 512 + 256), mask=full16)
+                h0 = rr.vadd(
+                    rr.vload(self.hist_slot0, hist_row * 512), rr.vload(self.hist_slot1, hist_row * 512), mask=full16
+                )
+                h1 = rr.vadd(
+                    rr.vload(self.hist_slot0, hist_row * 512 + 256),
+                    rr.vload(self.hist_slot1, hist_row * 512 + 256),
+                    mask=full16,
+                )
             else:
                 h0c0 = rr.vdups(0, dtypes.uint16, mask=full16)
                 h1c0 = rr.vdups(0, dtypes.uint16, mask=full16)
@@ -628,7 +590,6 @@ class QliRawTopKSelector:
                 h1 = rr.vadd(h1, h1c2, mask=full16)
                 h1 = rr.vadd(h1, h1c3, mask=full16)
 
-
             full16 = rr.update_mask(128, elem_bits=16)[0]
             lane0 = rr.update_mask(1, elem_bits=16)[0]
             bottom_k = valid_len - self.topk + 1
@@ -647,14 +608,15 @@ class QliRawTopKSelector:
             )
             high_target = rr.vreduce_min(rr.vmin(candidate0, candidate1, mask=full16), mask=full16)
 
-
             full16 = rr.update_mask(128, elem_bits=16)[0]
             lane0 = rr.update_mask(1, elem_bits=16)[0]
             zero16 = rr.vdups(0, dtypes.uint16, mask=full16)
             one16 = rr.vdups(1, dtypes.uint16, mask=full16)
             bottom_k = valid_len - self.topk + 1
             high_target = rr.vdup(high_target, mask=full16)
-            high_target8 = rr.vreinterpret_lanes(rr.vbitwise_or(high_target, rr.vshl(high_target, 8, mask=full16), mask=full16), dtypes.uint8)
+            high_target8 = rr.vreinterpret_lanes(
+                rr.vbitwise_or(high_target, rr.vshl(high_target, 8, mask=full16), mask=full16), dtypes.uint8
+            )
             prev = rr.vsub(high_target, one16, mask=full16)
             is_zero = rr.veqs(high_target, 0, mask=full16)
             prev = rr.vselect(zero16, prev, cond_mask=is_zero)
@@ -709,9 +671,8 @@ class QliRawTopKSelector:
             l1 = rr.vadd(l1, l1c2, mask=full16)
             l1 = rr.vadd(l1, l1c3, mask=full16)
 
-
             full16 = rr.update_mask(128, elem_bits=16)[0]
-            lane0 = rr.update_mask(1, elem_bits=16)[0]
+            lane0 = rr.update_mask(1, elem_bits=16)[0]  # noqa: F841
             next_k = next_k_register
             all_ones = rr.vdups(0xFFFF, dtypes.uint16, mask=full16)
             hist0 = l0
@@ -728,7 +689,6 @@ class QliRawTopKSelector:
             )
             low_target = rr.vreduce_min(rr.vmin(candidate0, candidate1, mask=full16), mask=full16)
 
-
             full16 = rr.update_mask(128, elem_bits=16)[0]
             low_target = rr.vdup(low_target, mask=full16)
             kth = rr.vbitwise_or(
@@ -743,25 +703,17 @@ class QliRawTopKSelector:
                 mask16 = rr.update_mask(valid_count, elem_bits=16)[0]
                 keys = rr.vload(sort_key, chunk * 128)
                 idx = rr.varange(chunk * 128, dtypes.uint16)
-                sq = rr.vsqueeze_and_storeunalign_init(
-                    idx, mask=rr.vgt(keys, kth, mask=mask16)
-                )
+                sq = rr.vsqueeze_and_storeunalign_init(idx, mask=rr.vgt(keys, kth, mask=mask16))
                 rr.vsqueeze_and_storeunalign(tmp_idx, 0, sq, ureg)
             for chunk in dsl_range(valid_chunk_count, unroll=1):
                 valid_count = valid_len - chunk * 128
                 mask16 = rr.update_mask(valid_count, elem_bits=16)[0]
                 keys = rr.vload(sort_key, chunk * 128)
                 idx = rr.varange(chunk * 128, dtypes.uint16)
-                sq = rr.vsqueeze_and_storeunalign_init(
-                    idx, mask=rr.veq(keys, kth, mask=mask16)
-                )
+                sq = rr.vsqueeze_and_storeunalign_init(idx, mask=rr.veq(keys, kth, mask=mask16))
                 rr.vsqueeze_and_storeunalign(tmp_idx, 0, sq, ureg)
             rr.vstore_unalign_post(tmp_idx, 0, ureg)
             rr.vmem_bar("vst_vld")
-
-
-
-
 
     @jit
     def _select_pass(
@@ -790,9 +742,7 @@ class QliRawTopKSelector:
                 count = self.topk - chunk * 128
                 mask16 = rr.update_mask(count, elem_bits=16)[0]
                 pos16 = rr.vload(tmp_idx, chunk * 128)
-                selected_key = rr.vgather(
-                    sort_key, pos16, mask=mask16
-                )
+                selected_key = rr.vgather(sort_key, pos16, mask=mask16)
                 rr.vstore(
                     next_history_key,
                     chunk * 128,
@@ -803,36 +753,26 @@ class QliRawTopKSelector:
             # ASC FindRealIndexVFImpl loads the same compacted positions with
             # DIST_UNPACK_B16, yielding 64 uint32 lanes for history/current
             # index mapping.  Keep this separate from the value gather above.
-            full32 = rr.update_mask(64, elem_bits=32)[0]
+            full32 = rr.update_mask(64, elem_bits=32)[0]  # noqa: F841
             for chunk in dsl_range(ceil_div(self.topk, 64), unroll=1):
                 count = self.topk - chunk * 64
                 mask32 = rr.update_mask(count, elem_bits=32)[0]
                 pos16 = rr.vload(tmp_idx, chunk * 64)
                 pos32 = rr.vunpack(pos16, dtypes.uint32, part="lower")
-                is_current = rr.vges(
-                    pos32, history_prefix, mask=mask32
-                )
-                is_history = rr.vlts(
-                    pos32, history_prefix, mask=mask32
-                )
-                old_idx = rr.vgather(
-                    history_idx_in, pos32, mask=is_history
-                )
+                is_current = rr.vges(pos32, history_prefix, mask=mask32)
+                is_history = rr.vlts(pos32, history_prefix, mask=mask32)
+                old_idx = rr.vgather(history_idx_in, pos32, mask=is_history)
                 current_idx = rr.vadds(
                     rr.vreinterpret(pos32, dtypes.int32),
                     current_global_base - history_prefix,
                     mask=mask32,
                 )
-                global_idx = rr.vselect(
-                    current_idx, old_idx, cond_mask=is_current
-                )
+                global_idx = rr.vselect(current_idx, old_idx, cond_mask=is_current)
                 rr.vstore(history_idx_out, chunk * 64, global_idx, mask32)
             rr.vmem_bar("vst_vld")
 
     @jit
-    def _commit_history(
-        self, next_idx, history_idx, next_history_key, history_key
-    ):
+    def _commit_history(self, next_idx, history_idx, next_history_key, history_key):
         with vf(mode="raw"):
             copy_mask32 = rr.update_mask(64, elem_bits=32)[0]
             copy_mask16 = rr.update_mask(128, elem_bits=16)[0]
@@ -863,7 +803,11 @@ class QliRawTopKSelector:
             for chunk in dsl_range(ceil_div(self.topk, 64), unroll=1):
                 count = self.topk - chunk * 64
                 mask32 = rr.update_mask(count, elem_bits=32)[0]
-                mask16 = rr.mask_and(rr.update_mask(count, elem_bits=16)[0], rr.update_mask(64, elem_bits=16)[0], exec_mask=rr.update_mask(64, elem_bits=16)[0])
+                mask16 = rr.mask_and(
+                    rr.update_mask(count, elem_bits=16)[0],
+                    rr.update_mask(64, elem_bits=16)[0],
+                    exec_mask=rr.update_mask(64, elem_bits=16)[0],
+                )
                 rr.vstore(
                     self.output_idx_stage,
                     chunk * 64,
@@ -881,14 +825,36 @@ class QliRawTopKSelector:
         mem_copy(gm_selected_value_bits, self.output_value_bits_stage)
 
     @jit
-    def select_row(self, gm_sort_key: Tensor, total_tokens, output_valid_count,
-                   gm_sparse_indices: Tensor, gm_selected_value_bits: Tensor,
-                   index_base, need_values=1, cached_hist=0, hist_row=0):
+    def select_row(
+        self,
+        gm_sort_key: Tensor,
+        total_tokens,
+        output_valid_count,
+        gm_sparse_indices: Tensor,
+        gm_selected_value_bits: Tensor,
+        index_base,
+        need_values=1,
+        cached_hist=0,
+        hist_row=0,
+    ):
         if need_values == 0 and total_tokens >= self.topk and total_tokens <= self.trunk_len:
-            self._load_merge(gm_sort_key, self.workspace.history_key, self.workspace.merge_key,
-                             dtypes.int64(0), dtypes.int64(0), total_tokens)
-            self._find_indices_dispatch(self.workspace.merge_key, total_tokens, self.workspace.tmp_idx,
-                               self.workspace.histogram, self.workspace.high_target_carrier, cached_hist, hist_row)
+            self._load_merge(
+                gm_sort_key,
+                self.workspace.history_key,
+                self.workspace.merge_key,
+                dtypes.int64(0),
+                dtypes.int64(0),
+                total_tokens,
+            )
+            self._find_indices_dispatch(
+                self.workspace.merge_key,
+                total_tokens,
+                self.workspace.tmp_idx,
+                self.workspace.histogram,
+                self.workspace.high_target_carrier,
+                cached_hist,
+                hist_row,
+            )
             out = self.output_idx_stage
             tmp = self.workspace.tmp_idx
             with vf(mode="raw"):
@@ -897,18 +863,29 @@ class QliRawTopKSelector:
                     positions = rr.vunpack(rr.vload(tmp, chunk * 64), dtypes.uint32, part="lower")
                     indices = rr.vadds(rr.vreinterpret(positions, dtypes.int32), index_base, mask=mask)
                     valid = rr.vlts(rr.varange(chunk * 64, dtypes.uint32), output_valid_count, mask=mask)
-                    rr.vstore(out, chunk * 64,
-                        rr.vselect(indices, rr.vdups(-1, dtypes.int32, mask=mask), cond_mask=valid), mask)
+                    rr.vstore(
+                        out,
+                        chunk * 64,
+                        rr.vselect(indices, rr.vdups(-1, dtypes.int32, mask=mask), cond_mask=valid),
+                        mask,
+                    )
                 rr.vmem_bar("vst_vld")
             mem_copy(gm_sparse_indices, out)
-        elif (need_values != 0 and total_tokens >= self.topk
-              and total_tokens <= self.trunk_len):
-            self._select_row_single_trunk(gm_sort_key, total_tokens,
-                                          output_valid_count, gm_sparse_indices,
-                                          gm_selected_value_bits, index_base, cached_hist, hist_row)
+        elif need_values != 0 and total_tokens >= self.topk and total_tokens <= self.trunk_len:
+            self._select_row_single_trunk(
+                gm_sort_key,
+                total_tokens,
+                output_valid_count,
+                gm_sparse_indices,
+                gm_selected_value_bits,
+                index_base,
+                cached_hist,
+                hist_row,
+            )
         else:
-            self._select_row_values(gm_sort_key, total_tokens, output_valid_count,
-                                    gm_sparse_indices, gm_selected_value_bits, index_base)
+            self._select_row_values(
+                gm_sort_key, total_tokens, output_valid_count, gm_sparse_indices, gm_selected_value_bits, index_base
+            )
 
     @jit
     def _select_row_single_trunk(
@@ -935,10 +912,12 @@ class QliRawTopKSelector:
         tmp_idx = self.workspace.tmp_idx
         histogram = self.workspace.histogram
         high_target_carrier = self.workspace.high_target_carrier
-        self._load_merge(gm_sort_key, self.workspace.history_key, merge_key,
-                         dtypes.int64(0), dtypes.int64(0), total_tokens)
-        self._find_indices_dispatch(merge_key, total_tokens, tmp_idx,
-                           histogram, high_target_carrier, cached_hist, hist_row)
+        self._load_merge(
+            gm_sort_key, self.workspace.history_key, merge_key, dtypes.int64(0), dtypes.int64(0), total_tokens
+        )
+        self._find_indices_dispatch(
+            merge_key, total_tokens, tmp_idx, histogram, high_target_carrier, cached_hist, hist_row
+        )
         out_idx = self.output_idx_stage
         out_val = self.output_value_bits_stage
         with vf(mode="raw"):
@@ -1026,8 +1005,9 @@ class QliRawTopKSelector:
         tmp_idx = self.cache_tmp
         histogram = self.workspace.histogram
         high_target_carrier = self.workspace.high_target_carrier
-        self._find_indices_dispatch(merge_key, total_tokens, tmp_idx,
-                           histogram, high_target_carrier, cached_hist, hist_row)
+        self._find_indices_dispatch(
+            merge_key, total_tokens, tmp_idx, histogram, high_target_carrier, cached_hist, hist_row
+        )
         out_idx = self.cache_output_idx_stage
         out_val = self.cache_output_value_bits_stage
         with vf(mode="raw"):
@@ -1104,7 +1084,7 @@ class QliRawTopKSelector:
         if output_valid_count > self.topk:
             output_valid_count = self.topk
         merge_key = self.workspace.merge_key
-        current_trunk = self.workspace.current_trunk
+        current_trunk = self.workspace.current_trunk  # noqa: F841
         tmp_idx = self.workspace.tmp_idx
         histogram = self.workspace.histogram
         high_target_carrier = self.workspace.high_target_carrier
@@ -1164,7 +1144,7 @@ class QliRawTopKSelector:
             history_prefix = dtypes.int64(self.topk_pad)
             if full_trunk_count == 0 and tail_len >= self.topk:
                 history_prefix = dtypes.int64(0)
-            tail_len_pad = ((tail_len + 255) // 256) * 256
+            tail_len_pad = ((tail_len + 255) // 256) * 256  # noqa: F841
             self._load_merge(gm_sort_key, history_key, merge_key, tail_offset, history_prefix, tail_len)
             self._select_pass(
                 merge_key,
@@ -1186,7 +1166,11 @@ class QliRawTopKSelector:
             for chunk in dsl_range(ceil_div(self.topk, 64), unroll=1):
                 count = self.topk - chunk * 64
                 mask32 = rr.update_mask(count, elem_bits=32)[0]
-                mask16 = rr.mask_and(rr.update_mask(count, elem_bits=16)[0], rr.update_mask(64, elem_bits=16)[0], exec_mask=rr.update_mask(64, elem_bits=16)[0])
+                mask16 = rr.mask_and(
+                    rr.update_mask(count, elem_bits=16)[0],
+                    rr.update_mask(64, elem_bits=16)[0],
+                    exec_mask=rr.update_mask(64, elem_bits=16)[0],
+                )
                 indices = rr.vadds(rr.vload(final_idx, chunk * 64), index_base, mask=mask32)
                 keys = rr.vload(history_key, chunk * 64)
                 positive = rr.veq(
@@ -1238,20 +1222,30 @@ class QliRawTopKSelector:
         mem_copy(gm_selected_value_bits, out_value_bits)
 
 
-
 class LdTopKSelector(QliRawTopKSelector):
     def __init__(self, topk, workspace, splits):
         super().__init__(topk, workspace)
         self.ld_length = int(splits) * self.topk
         self.ld_indices = Buffer(MemLoc.UB, (1, self.ld_length), dtypes.int32)
         self.ld_bits = Buffer(MemLoc.UB, (1, self.ld_length), dtypes.uint16)
+
     @jit
-    def merge_ld(self, partial_indices, partial_bits, gm_sparse_indices, gm_selected_value_bits, valid_length, output_offset=0, preloaded=False, need_values=1):
+    def merge_ld(
+        self,
+        partial_indices,
+        partial_bits,
+        gm_sparse_indices,
+        gm_selected_value_bits,
+        valid_length,
+        output_offset=0,
+        preloaded=False,
+        need_values=1,
+    ):
         if not preloaded:
             mem_copy(local_slice(self.ld_indices, (1, valid_length)), partial_indices[0:1, 0:valid_length])
             mem_copy(local_slice(self.ld_bits, (1, valid_length)), partial_bits[0:1, 0:valid_length])
         current_trunk = self.workspace.merge_key
-        history_key = self.workspace.history_key
+        history_key = self.workspace.history_key  # noqa: F841
         history_idx = self.workspace.history_idx
         with vf(mode="raw"):
             mask16 = rr.update_mask(64, elem_bits=16)[0]
@@ -1261,24 +1255,38 @@ class LdTopKSelector(QliRawTopKSelector):
                 indices = rr.vload(self.ld_indices, chunk * 64)
                 positive_key = rr.vbitwise_xor(bits, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
                 negative_key = rr.vbitwise_xor(bits, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-                negative = rr.veqs(rr.vbitwise_and(bits, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16), 0x8000, mask=mask16)
+                negative = rr.veqs(
+                    rr.vbitwise_and(bits, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16),
+                    0x8000,
+                    mask=mask16,
+                )
                 keys = rr.vselect(negative_key, positive_key, cond_mask=negative)
-                valid32 = rr.vselect(rr.vdups(1, dtypes.int32, mask=mask32), rr.vdups(0, dtypes.int32, mask=mask32), cond_mask=rr.vges(indices, 0, mask=mask32))
+                valid32 = rr.vselect(
+                    rr.vdups(1, dtypes.int32, mask=mask32),
+                    rr.vdups(0, dtypes.int32, mask=mask32),
+                    cond_mask=rr.vges(indices, 0, mask=mask32),
+                )
                 valid16 = rr.vpack(rr.vreinterpret(valid32, dtypes.uint32), dtypes.uint16, part="lower")
-                keys = rr.vselect(keys, rr.vdups(0, dtypes.uint16, mask=mask16), cond_mask=rr.veqs(valid16, 1, mask=mask16))
+                keys = rr.vselect(
+                    keys, rr.vdups(0, dtypes.uint16, mask=mask16), cond_mask=rr.veqs(valid16, 1, mask=mask16)
+                )
                 rr.vstore(current_trunk, chunk * 64, keys, mask16)
             rr.vmem_bar("vst_vld")
-        self._find_indices(current_trunk, valid_length, self.workspace.tmp_idx,
-                           self.workspace.histogram, self.workspace.high_target_carrier)
-        output_idx_stage = self.output_idx_stage
-        out_value_bits = self.output_value_bits_stage
-        output_valid_count = dtypes.int32(self.topk)
-        final_idx = history_idx
+        self._find_indices(
+            current_trunk,
+            valid_length,
+            self.workspace.tmp_idx,
+            self.workspace.histogram,
+            self.workspace.high_target_carrier,
+        )
+        output_idx_stage = self.output_idx_stage  # noqa: F841
+        out_value_bits = self.output_value_bits_stage  # noqa: F841
+        output_valid_count = dtypes.int32(self.topk)  # noqa: F841
+        final_idx = history_idx  # noqa: F841
         if need_values != 0:
             self._emit_ld_values(current_trunk, output_offset, gm_sparse_indices, gm_selected_value_bits)
         else:
             self._emit_ld_indices(current_trunk, output_offset, gm_sparse_indices)
-
 
     @jit
     def _emit_ld_values(self, current_trunk, output_offset, gm_sparse_indices, gm_selected_value_bits):
@@ -1289,28 +1297,40 @@ class LdTopKSelector(QliRawTopKSelector):
             for chunk in dsl_range(ceil_div(self.topk, 64), unroll=1):
                 count = self.topk - chunk * 64
                 mask32 = rr.update_mask(count, elem_bits=32)[0]
-                mask16 = rr.mask_and(rr.update_mask(count, elem_bits=16)[0], rr.update_mask(64, elem_bits=16)[0], exec_mask=rr.update_mask(64, elem_bits=16)[0])
+                mask16 = rr.mask_and(
+                    rr.update_mask(count, elem_bits=16)[0],
+                    rr.update_mask(64, elem_bits=16)[0],
+                    exec_mask=rr.update_mask(64, elem_bits=16)[0],
+                )
                 positions = rr.vunpack(rr.vload(self.workspace.tmp_idx, chunk * 64), dtypes.uint32, part="lower")
                 indices = rr.vgather(self.ld_indices, rr.vreinterpret(positions, dtypes.uint32), mask=mask32)
                 positions16 = rr.vload(self.workspace.tmp_idx, chunk * 64)
                 keys = rr.vgather(current_trunk, positions16, mask=mask16)
                 value_bits = rr.vgather(self.ld_bits, positions16, mask=mask16)
-                valid_rank32 = rr.vlts(
+                valid_rank32 = rr.vlts(  # noqa: F841
                     rr.varange(chunk * 64, dtypes.uint32),
                     output_valid_count,
                     mask=mask32,
                 )
-                valid_rank16 = rr.vlts(
+                valid_rank16 = rr.vlts(  # noqa: F841
                     rr.varange(chunk * 64, dtypes.uint16),
                     output_valid_count,
                     mask=mask16,
                 )
-                key_valid16 = rr.vselect(rr.vdups(1, dtypes.uint16, mask=mask16), rr.vdups(0, dtypes.uint16, mask=mask16), cond_mask=rr.vges(keys, 1, mask=mask16))
+                key_valid16 = rr.vselect(
+                    rr.vdups(1, dtypes.uint16, mask=mask16),
+                    rr.vdups(0, dtypes.uint16, mask=mask16),
+                    cond_mask=rr.vges(keys, 1, mask=mask16),
+                )
                 key_valid32 = rr.vunpack(key_valid16, dtypes.uint32, part="lower")
-                indices = rr.vselect(indices, rr.vdups(-1, dtypes.int32, mask=mask32), cond_mask=rr.veqs(key_valid32, 1, mask=mask32))
-                valid_flags32 = rr.vselect(rr.vdups(1, dtypes.int32, mask=mask32),
-                                           rr.vdups(0, dtypes.int32, mask=mask32),
-                                           cond_mask=rr.vges(indices, 0, mask=mask32))
+                indices = rr.vselect(
+                    indices, rr.vdups(-1, dtypes.int32, mask=mask32), cond_mask=rr.veqs(key_valid32, 1, mask=mask32)
+                )
+                valid_flags32 = rr.vselect(
+                    rr.vdups(1, dtypes.int32, mask=mask32),
+                    rr.vdups(0, dtypes.int32, mask=mask32),
+                    cond_mask=rr.vges(indices, 0, mask=mask32),
+                )
                 valid_flags16 = rr.vpack(rr.vreinterpret(valid_flags32, dtypes.uint32), dtypes.uint16, part="lower")
                 indices = rr.vselect(
                     indices,
@@ -1322,9 +1342,11 @@ class LdTopKSelector(QliRawTopKSelector):
                     rr.vdups(0, dtypes.uint16, mask=mask16),
                     cond_mask=rr.veqs(valid_flags16, 1, mask=mask16),
                 )
-                indices = rr.vselect(rr.vadds(indices, output_offset, mask=mask32),
+                indices = rr.vselect(
+                    rr.vadds(indices, output_offset, mask=mask32),
                     rr.vdups(-1, dtypes.int32, mask=mask32),
-                    cond_mask=rr.veqs(valid_flags32, 1, mask=mask32))
+                    cond_mask=rr.veqs(valid_flags32, 1, mask=mask32),
+                )
                 rr.vstore(output_idx_stage, chunk * 64, indices, mask32)
                 rr.vstore(out_value_bits, chunk * 64, value_bits, mask16)
             rr.vmem_bar("vst_vld")
@@ -1338,18 +1360,29 @@ class LdTopKSelector(QliRawTopKSelector):
             for chunk in dsl_range(ceil_div(self.topk, 64), unroll=1):
                 count = self.topk - chunk * 64
                 mask32 = rr.update_mask(count, elem_bits=32)[0]
-                mask16 = rr.mask_and(rr.update_mask(count, elem_bits=16)[0], rr.update_mask(64, elem_bits=16)[0], exec_mask=rr.update_mask(64, elem_bits=16)[0])
+                mask16 = rr.mask_and(
+                    rr.update_mask(count, elem_bits=16)[0],
+                    rr.update_mask(64, elem_bits=16)[0],
+                    exec_mask=rr.update_mask(64, elem_bits=16)[0],
+                )
                 positions16 = rr.vload(self.workspace.tmp_idx, chunk * 64)
                 positions32 = rr.vunpack(positions16, dtypes.uint32, part="lower")
                 indices = rr.vgather(self.ld_indices, positions32, mask=mask32)
                 keys = rr.vgather(current_trunk, positions16, mask=mask16)
-                valid16 = rr.vselect(rr.vdups(1, dtypes.uint16, mask=mask16), rr.vdups(0, dtypes.uint16, mask=mask16), cond_mask=rr.vges(keys, 1, mask=mask16))
+                valid16 = rr.vselect(
+                    rr.vdups(1, dtypes.uint16, mask=mask16),
+                    rr.vdups(0, dtypes.uint16, mask=mask16),
+                    cond_mask=rr.vges(keys, 1, mask=mask16),
+                )
                 valid32 = rr.vunpack(valid16, dtypes.uint32, part="lower")
-                indices = rr.vselect(rr.vadds(indices, output_offset, mask=mask32), rr.vdups(-1, dtypes.int32, mask=mask32), cond_mask=rr.veqs(valid32, 1, mask=mask32))
+                indices = rr.vselect(
+                    rr.vadds(indices, output_offset, mask=mask32),
+                    rr.vdups(-1, dtypes.int32, mask=mask32),
+                    cond_mask=rr.veqs(valid32, 1, mask=mask32),
+                )
                 rr.vstore(output_idx_stage, chunk * 64, indices, mask32)
             rr.vmem_bar("vst_vld")
         mem_copy(gm_sparse_indices, output_idx_stage)
-
 
 
 class LdMergeStage:
@@ -1360,8 +1393,21 @@ class LdMergeStage:
         self.selector = LdTopKSelector(topk, self.workspace, splits)
 
     @jit
-    def __call__(self, partial_indices: Tensor, partial_bits: Tensor,
-                 indices: Tensor, bits: Tensor, metadata: Tensor, rows, workers, cu_seqlens_q: Tensor, query_tile_rows, has_cu, output_offset_address=0, need_values=1):
+    def __call__(
+        self,
+        partial_indices: Tensor,
+        partial_bits: Tensor,
+        indices: Tensor,
+        bits: Tensor,
+        metadata: Tensor,
+        rows,
+        workers,
+        cu_seqlens_q: Tensor,
+        query_tile_rows,
+        has_cu,
+        output_offset_address=0,
+        need_values=1,
+    ):
         fd = dtypes.int64(36 + get_block_idx() * 2 + get_subblock_id())
         if metadata[fd, 0] != 0:
             batch_idx = dtypes.int64(metadata[fd, 1])
@@ -1377,8 +1423,10 @@ class LdMergeStage:
                 row = row_base + m
                 output_offset = dtypes.int32(0)
                 if output_offset_address != 0:
-                    offsets = make_tensor(make_pointer(dtypes.int32, dtypes.int64(output_offset_address), MemLoc.GM),
-                        make_layout((rows, 1), stride=(1, 1)))
+                    offsets = make_tensor(
+                        make_pointer(dtypes.int32, dtypes.int64(output_offset_address), MemLoc.GM),
+                        make_layout((rows, 1), stride=(1, 1)),
+                    )
                     output_offset = offsets[row, 0]
                 for first in dsl_range(0, part_count, self.length // self.topk - 1, unroll=1):
                     count = min(part_count - first, self.length // self.topk - 1)
@@ -1386,26 +1434,44 @@ class LdMergeStage:
                     vec_sync_notify(PIPE.V, PIPE.MTE2, 5)
                     vec_sync_wait(PIPE.V, PIPE.MTE2, 5)
                     if first > 0:
-                        mem_copy(local_slice(self.selector.ld_indices,(1,self.topk)),tile_view(indices,(1,self.topk),(row,0)))
-                        mem_copy(local_slice(self.selector.ld_bits,(1,self.topk)),tile_view(bits,(1,self.topk),(row,0)))
+                        mem_copy(
+                            local_slice(self.selector.ld_indices, (1, self.topk)),
+                            tile_view(indices, (1, self.topk), (row, 0)),
+                        )
+                        mem_copy(
+                            local_slice(self.selector.ld_bits, (1, self.topk)),
+                            tile_view(bits, (1, self.topk), (row, 0)),
+                        )
                     for part in dsl_range(0, count, unroll=1):
                         source_row = (workspace_begin + first + part) * query_tile_rows + m
-                        mem_copy(tile_view(self.selector.ld_indices,(1,self.topk),(0,part+carry)),
-                                 tile_view(partial_indices,(1,self.topk),(source_row,0)))
-                        mem_copy(tile_view(self.selector.ld_bits,(1,self.topk),(0,part+carry)),
-                                 tile_view(partial_bits,(1,self.topk),(source_row,0)))
+                        mem_copy(
+                            tile_view(self.selector.ld_indices, (1, self.topk), (0, part + carry)),
+                            tile_view(partial_indices, (1, self.topk), (source_row, 0)),
+                        )
+                        mem_copy(
+                            tile_view(self.selector.ld_bits, (1, self.topk), (0, part + carry)),
+                            tile_view(partial_bits, (1, self.topk), (source_row, 0)),
+                        )
                     vec_sync_notify(PIPE.MTE2, PIPE.V, 5)
                     vec_sync_wait(PIPE.MTE2, PIPE.V, 5)
-                    offset = dtypes.int32(dyn_select(first+count==part_count,output_offset,0))
-                    self.selector.merge_ld(partial_indices,partial_bits,
-                        tile_view(indices,(1,self.topk),(row,0)),
-                        tile_view(bits,(1,self.topk),(row,0)),(count+carry)*self.topk,offset,True,dtypes.int64(dyn_select(first+count==part_count,need_values,1)))
+                    offset = dtypes.int32(dyn_select(first + count == part_count, output_offset, 0))
+                    self.selector.merge_ld(
+                        partial_indices,
+                        partial_bits,
+                        tile_view(indices, (1, self.topk), (row, 0)),
+                        tile_view(bits, (1, self.topk), (row, 0)),
+                        (count + carry) * self.topk,
+                        offset,
+                        True,
+                        dtypes.int64(dyn_select(first + count == part_count, need_values, 1)),
+                    )
                     vec_sync_notify(PIPE.MTE3, PIPE.MTE2, 5)
                     vec_sync_wait(PIPE.MTE3, PIPE.MTE2, 5)
 
 
 # Candidate LD selectors keep their independent 16K merge scratch layout.
 CANDIDATE_LD_TRUNK_LEN = 16384
+
 
 class CandidateQliRawTopKWorkspace:
     """UB scratch shared by sequential Sparse and Candidate TopK stages."""
@@ -1415,40 +1481,27 @@ class CandidateQliRawTopKWorkspace:
         self.max_trunk_len = int(max_trunk_len)
         self.max_topk = int(max_topk)
         self.topk_pad = ceil_div(self.max_topk, 256) * 256
-        self.merge_len_pad = ceil_div(
-            self.topk_pad + self.max_trunk_len, 128
-        ) * 128
+        self.merge_len_pad = ceil_div(self.topk_pad + self.max_trunk_len, 128) * 128
         self.current_trunk = Channel(
             MemLoc.UB,
             (1, self.max_trunk_len),
             dtypes.uint16,
             depth=1,
         )
-        self.merge_key = Buffer(
-            MemLoc.UB, (1, self.merge_len_pad), dtypes.uint16
-        )
-        self.tmp_idx = Buffer(
-            MemLoc.UB, (self.merge_len_pad,), dtypes.uint16
-        )
+        self.merge_key = Buffer(MemLoc.UB, (1, self.merge_len_pad), dtypes.uint16)
+        self.tmp_idx = Buffer(MemLoc.UB, (self.merge_len_pad,), dtypes.uint16)
         self.histogram = Buffer(MemLoc.UB, (256,), dtypes.uint16)
-        self.high_target_carrier = Buffer(
-            MemLoc.UB, (64,), dtypes.int32
-        )
-        self.history_key = Buffer(
-            MemLoc.UB, (2, self.topk_pad), dtypes.uint16
-        )
+        self.high_target_carrier = Buffer(MemLoc.UB, (64,), dtypes.int32)
+        self.history_key = Buffer(MemLoc.UB, (2, self.topk_pad), dtypes.uint16)
         self.next_history_key = Channel(
             MemLoc.UB,
             (1, self.topk_pad),
             dtypes.uint16,
             depth=1,
         )
-        self.history_idx = Buffer(
-            MemLoc.UB, (2, self.topk_pad), dtypes.int32
-        )
-        self.next_idx = Buffer(
-            MemLoc.UB, (self.topk_pad,), dtypes.int32
-        )
+        self.history_idx = Buffer(MemLoc.UB, (2, self.topk_pad), dtypes.int32)
+        self.next_idx = Buffer(MemLoc.UB, (self.topk_pad,), dtypes.int32)
+
 
 class CandidateQliRawTopKSelector:
     """ASC Arch35 uint16 radix TopK with in-AIV trunk/history merge.
@@ -1473,24 +1526,18 @@ class CandidateQliRawTopKSelector:
         self.trunk_len = CANDIDATE_LD_TRUNK_LEN
         # ASC reserves history in 256-element units before the next trunk.
         self.topk_pad = ceil_div(self.topk, 256) * 256
-        self.merge_len_pad = ceil_div(
-            self.topk_pad + CANDIDATE_LD_TRUNK_LEN, 128
-        ) * 128
+        self.merge_len_pad = ceil_div(self.topk_pad + CANDIDATE_LD_TRUNK_LEN, 128) * 128
         self.workspace = workspace
         if (
-            CANDIDATE_LD_TRUNK_LEN > workspace.max_trunk_len
+            CANDIDATE_LD_TRUNK_LEN > workspace.max_trunk_len  # noqa: SIM300
             or self.topk > workspace.max_topk
             or self.merge_len_pad > workspace.merge_len_pad
         ):
             raise ValueError("TopK selector exceeds the shared UB workspace")
         # Final V->MTE3 stages are selector-owned so Sparse and Candidate can
         # share computational scratch without racing each other's GM writes.
-        self.output_idx_stage = Channel(
-            MemLoc.UB, (1, self.topk), dtypes.int32, depth=1
-        )
-        self.output_value_bits_stage = Channel(
-            MemLoc.UB, (1, self.topk), dtypes.uint16, depth=1
-        )
+        self.output_idx_stage = Channel(MemLoc.UB, (1, self.topk), dtypes.int32, depth=1)
+        self.output_value_bits_stage = Channel(MemLoc.UB, (1, self.topk), dtypes.uint16, depth=1)
 
     @jit
     def _build_merge(
@@ -1521,12 +1568,9 @@ class CandidateQliRawTopKSelector:
                 source_offset = chunk * 128
                 count = current_len - source_offset
                 current_mask = rr.update_mask(count, elem_bits=16)[0]
-                selected = rr.vselect(rr.vload(current_trunk, source_offset),
-                                      zero, cond_mask=current_mask)
-                rr.vstore(merge_key, history_prefix + source_offset,
-                          selected, mask16)
-            for chunk in dsl_range(current_chunk_count,
-                                   (current_len_pad + 127) // 128, unroll=1):
+                selected = rr.vselect(rr.vload(current_trunk, source_offset), zero, cond_mask=current_mask)
+                rr.vstore(merge_key, history_prefix + source_offset, selected, mask16)
+            for chunk in dsl_range(current_chunk_count, (current_len_pad + 127) // 128, unroll=1):
                 rr.vstore(merge_key, history_prefix + chunk * 128, zero, mask16)
             rr.vmem_bar("vst_vld")
 
@@ -1535,8 +1579,10 @@ class CandidateQliRawTopKSelector:
         vec_sync_notify(PIPE.V, PIPE.MTE2, 3)
         vec_sync_wait(PIPE.V, PIPE.MTE2, 3)
         copied = ((length + 127) // 128) * 128
-        mem_copy(local_slice(_offset_view(merge, (0, history_prefix)), (1, copied)),
-                 gm_keys[0:1, source_offset:source_offset + copied])
+        mem_copy(
+            local_slice(_offset_view(merge, (0, history_prefix)), (1, copied)),
+            gm_keys[0:1, source_offset : source_offset + copied],
+        )
         vec_sync_notify(PIPE.MTE2, PIPE.V, 3)
         vec_sync_wait(PIPE.MTE2, PIPE.V, 3)
         with vf(mode="raw"):
@@ -1561,9 +1607,7 @@ class CandidateQliRawTopKSelector:
             for chunk in dsl_range((valid_len + 255) // 256, unroll=1):
                 valid_count = valid_len - chunk * 256
                 mask8 = rr.update_mask(valid_count, elem_bits=8)[0]
-                _, high = rr.vload_deinterleave(
-                    sort_key, chunk * 256, width="b8"
-                )
+                _, high = rr.vload_deinterleave(sort_key, chunk * 256, width="b8")
                 h0 = rr.vhistogram_accumulate(h0, high, mask=mask8, bin=0)
                 h1 = rr.vhistogram_accumulate(h1, high, mask=mask8, bin=1)
             rr.vstore(histogram, 0, h0, full16)
@@ -1644,9 +1688,7 @@ class CandidateQliRawTopKSelector:
             for chunk in dsl_range((valid_len + 255) // 256, unroll=1):
                 valid_count = valid_len - chunk * 256
                 mask8 = rr.update_mask(valid_count, elem_bits=8)[0]
-                low, high = rr.vload_deinterleave(
-                    sort_key, chunk * 256, width="b8"
-                )
+                low, high = rr.vload_deinterleave(sort_key, chunk * 256, width="b8")
                 eq_high = rr.veq(high, high_target8, mask=mask8)
                 l0 = rr.vhistogram_accumulate(l0, low, mask=eq_high, bin=0)
                 l1 = rr.vhistogram_accumulate(l1, low, mask=eq_high, bin=1)
@@ -1698,18 +1740,14 @@ class CandidateQliRawTopKSelector:
                 mask16 = rr.update_mask(valid_count, elem_bits=16)[0]
                 keys = rr.vload(sort_key, chunk * 128)
                 idx = rr.varange(chunk * 128, dtypes.uint16)
-                sq = rr.vsqueeze_and_storeunalign_init(
-                    idx, mask=rr.vgt(keys, kth, mask=mask16)
-                )
+                sq = rr.vsqueeze_and_storeunalign_init(idx, mask=rr.vgt(keys, kth, mask=mask16))
                 rr.vsqueeze_and_storeunalign(tmp_idx, 0, sq, ureg)
             for chunk in dsl_range(valid_chunk_count, unroll=1):
                 valid_count = valid_len - chunk * 128
                 mask16 = rr.update_mask(valid_count, elem_bits=16)[0]
                 keys = rr.vload(sort_key, chunk * 128)
                 idx = rr.varange(chunk * 128, dtypes.uint16)
-                sq = rr.vsqueeze_and_storeunalign_init(
-                    idx, mask=rr.veq(keys, kth, mask=mask16)
-                )
+                sq = rr.vsqueeze_and_storeunalign_init(idx, mask=rr.veq(keys, kth, mask=mask16))
                 rr.vsqueeze_and_storeunalign(tmp_idx, 0, sq, ureg)
             rr.vstore_unalign_post(tmp_idx, 0, ureg)
             rr.vmem_bar("vst_vld")
@@ -1725,17 +1763,13 @@ class CandidateQliRawTopKSelector:
             for chunk in dsl_range(0, (valid_len + 255) // 256, 2, unroll=1):
                 valid_count = valid_len - chunk * 256
                 mask8 = rr.update_mask(valid_count, elem_bits=8)[0]
-                _, high = rr.vload_deinterleave(
-                    sort_key, chunk * 256, width="b8"
-                )
+                _, high = rr.vload_deinterleave(sort_key, chunk * 256, width="b8")
                 h0a = rr.vhistogram_accumulate(h0a, high, mask=mask8, bin=0)
                 h1a = rr.vhistogram_accumulate(h1a, high, mask=mask8, bin=1)
             for chunk in dsl_range(1, (valid_len + 255) // 256, 2, unroll=1):
                 valid_count = valid_len - chunk * 256
                 mask8 = rr.update_mask(valid_count, elem_bits=8)[0]
-                _, high = rr.vload_deinterleave(
-                    sort_key, chunk * 256, width="b8"
-                )
+                _, high = rr.vload_deinterleave(sort_key, chunk * 256, width="b8")
                 h0b = rr.vhistogram_accumulate(h0b, high, mask=mask8, bin=0)
                 h1b = rr.vhistogram_accumulate(h1b, high, mask=mask8, bin=1)
             h0 = rr.vadd(h0a, h0b, mask=full16)
@@ -1820,18 +1854,14 @@ class CandidateQliRawTopKSelector:
             for chunk in dsl_range(0, (valid_len + 255) // 256, 2, unroll=1):
                 valid_count = valid_len - chunk * 256
                 mask8 = rr.update_mask(valid_count, elem_bits=8)[0]
-                low, high = rr.vload_deinterleave(
-                    sort_key, chunk * 256, width="b8"
-                )
+                low, high = rr.vload_deinterleave(sort_key, chunk * 256, width="b8")
                 eq_high = rr.veq(high, high_target8, mask=mask8)
                 l0a = rr.vhistogram_accumulate(l0a, low, mask=eq_high, bin=0)
                 l1a = rr.vhistogram_accumulate(l1a, low, mask=eq_high, bin=1)
             for chunk in dsl_range(1, (valid_len + 255) // 256, 2, unroll=1):
                 valid_count = valid_len - chunk * 256
                 mask8 = rr.update_mask(valid_count, elem_bits=8)[0]
-                low, high = rr.vload_deinterleave(
-                    sort_key, chunk * 256, width="b8"
-                )
+                low, high = rr.vload_deinterleave(sort_key, chunk * 256, width="b8")
                 eq_high = rr.veq(high, high_target8, mask=mask8)
                 l0b = rr.vhistogram_accumulate(l0b, low, mask=eq_high, bin=0)
                 l1b = rr.vhistogram_accumulate(l1b, low, mask=eq_high, bin=1)
@@ -1885,22 +1915,17 @@ class CandidateQliRawTopKSelector:
                 mask16 = rr.update_mask(valid_count, elem_bits=16)[0]
                 keys = rr.vload(sort_key, chunk * 128)
                 idx = rr.varange(chunk * 128, dtypes.uint16)
-                sq = rr.vsqueeze_and_storeunalign_init(
-                    idx, mask=rr.vgt(keys, kth, mask=mask16)
-                )
+                sq = rr.vsqueeze_and_storeunalign_init(idx, mask=rr.vgt(keys, kth, mask=mask16))
                 rr.vsqueeze_and_storeunalign(tmp_idx, 0, sq, ureg)
             for chunk in dsl_range(valid_chunk_count, unroll=1):
                 valid_count = valid_len - chunk * 128
                 mask16 = rr.update_mask(valid_count, elem_bits=16)[0]
                 keys = rr.vload(sort_key, chunk * 128)
                 idx = rr.varange(chunk * 128, dtypes.uint16)
-                sq = rr.vsqueeze_and_storeunalign_init(
-                    idx, mask=rr.veq(keys, kth, mask=mask16)
-                )
+                sq = rr.vsqueeze_and_storeunalign_init(idx, mask=rr.veq(keys, kth, mask=mask16))
                 rr.vsqueeze_and_storeunalign(tmp_idx, 0, sq, ureg)
             rr.vstore_unalign_post(tmp_idx, 0, ureg)
             rr.vmem_bar("vst_vld")
-
 
     @jit
     def _select_pass(
@@ -1929,9 +1954,7 @@ class CandidateQliRawTopKSelector:
                 count = self.topk - chunk * 128
                 mask16 = rr.update_mask(count, elem_bits=16)[0]
                 pos16 = rr.vload(tmp_idx, chunk * 128)
-                selected_key = rr.vgather(
-                    sort_key, pos16, mask=mask16
-                )
+                selected_key = rr.vgather(sort_key, pos16, mask=mask16)
                 rr.vstore(
                     next_history_key,
                     chunk * 128,
@@ -1942,36 +1965,26 @@ class CandidateQliRawTopKSelector:
             # ASC FindRealIndexVFImpl loads the same compacted positions with
             # DIST_UNPACK_B16, yielding 64 uint32 lanes for history/current
             # index mapping.  Keep this separate from the value gather above.
-            full32 = rr.update_mask(64, elem_bits=32)[0]
+            full32 = rr.update_mask(64, elem_bits=32)[0]  # noqa: F841
             for chunk in dsl_range(ceil_div(self.topk, 64), unroll=1):
                 count = self.topk - chunk * 64
                 mask32 = rr.update_mask(count, elem_bits=32)[0]
                 pos16 = rr.vload(tmp_idx, chunk * 64)
                 pos32 = rr.vunpack(pos16, dtypes.uint32, part="lower")
-                is_current = rr.vges(
-                    pos32, history_prefix, mask=mask32
-                )
-                is_history = rr.vlts(
-                    pos32, history_prefix, mask=mask32
-                )
-                old_idx = rr.vgather(
-                    history_idx_in, pos32, mask=is_history
-                )
+                is_current = rr.vges(pos32, history_prefix, mask=mask32)
+                is_history = rr.vlts(pos32, history_prefix, mask=mask32)
+                old_idx = rr.vgather(history_idx_in, pos32, mask=is_history)
                 current_idx = rr.vadds(
                     rr.vreinterpret(pos32, dtypes.int32),
                     current_global_base - history_prefix,
                     mask=mask32,
                 )
-                global_idx = rr.vselect(
-                    current_idx, old_idx, cond_mask=is_current
-                )
+                global_idx = rr.vselect(current_idx, old_idx, cond_mask=is_current)
                 rr.vstore(history_idx_out, chunk * 64, global_idx, mask32)
             rr.vmem_bar("vst_vld")
 
     @jit
-    def _commit_history(
-        self, next_idx, history_idx, next_history_key, history_key
-    ):
+    def _commit_history(self, next_idx, history_idx, next_history_key, history_key):
         with vf(mode="raw"):
             copy_mask32 = rr.update_mask(64, elem_bits=32)[0]
             copy_mask16 = rr.update_mask(128, elem_bits=16)[0]
@@ -2002,7 +2015,11 @@ class CandidateQliRawTopKSelector:
             for chunk in dsl_range(ceil_div(self.topk, 64), unroll=1):
                 count = self.topk - chunk * 64
                 mask32 = rr.update_mask(count, elem_bits=32)[0]
-                mask16 = rr.mask_and(rr.update_mask(count, elem_bits=16)[0], rr.update_mask(64, elem_bits=16)[0], exec_mask=rr.update_mask(64, elem_bits=16)[0])
+                mask16 = rr.mask_and(
+                    rr.update_mask(count, elem_bits=16)[0],
+                    rr.update_mask(64, elem_bits=16)[0],
+                    exec_mask=rr.update_mask(64, elem_bits=16)[0],
+                )
                 rr.vstore(
                     self.output_idx_stage,
                     chunk * 64,
@@ -2020,14 +2037,32 @@ class CandidateQliRawTopKSelector:
         mem_copy(gm_selected_value_bits, self.output_value_bits_stage)
 
     @jit
-    def select_row(self, gm_sort_key: Tensor, total_tokens, output_valid_count,
-                   gm_sparse_indices: Tensor, gm_selected_value_bits: Tensor,
-                   index_base, need_values=1):
+    def select_row(
+        self,
+        gm_sort_key: Tensor,
+        total_tokens,
+        output_valid_count,
+        gm_sparse_indices: Tensor,
+        gm_selected_value_bits: Tensor,
+        index_base,
+        need_values=1,
+    ):
         if need_values == 0 and total_tokens >= self.topk and total_tokens <= self.trunk_len:
-            self._load_merge(gm_sort_key, self.workspace.history_key, self.workspace.merge_key,
-                             dtypes.int64(0), dtypes.int64(0), total_tokens)
-            self._find_indices(self.workspace.merge_key, total_tokens, self.workspace.tmp_idx,
-                               self.workspace.histogram, self.workspace.high_target_carrier)
+            self._load_merge(
+                gm_sort_key,
+                self.workspace.history_key,
+                self.workspace.merge_key,
+                dtypes.int64(0),
+                dtypes.int64(0),
+                total_tokens,
+            )
+            self._find_indices(
+                self.workspace.merge_key,
+                total_tokens,
+                self.workspace.tmp_idx,
+                self.workspace.histogram,
+                self.workspace.high_target_carrier,
+            )
             out = self.output_idx_stage
             tmp = self.workspace.tmp_idx
             with vf(mode="raw"):
@@ -2036,18 +2071,27 @@ class CandidateQliRawTopKSelector:
                     positions = rr.vunpack(rr.vload(tmp, chunk * 64), dtypes.uint32, part="lower")
                     indices = rr.vadds(rr.vreinterpret(positions, dtypes.int32), index_base, mask=mask)
                     valid = rr.vlts(rr.varange(chunk * 64, dtypes.uint32), output_valid_count, mask=mask)
-                    rr.vstore(out, chunk * 64,
-                        rr.vselect(indices, rr.vdups(-1, dtypes.int32, mask=mask), cond_mask=valid), mask)
+                    rr.vstore(
+                        out,
+                        chunk * 64,
+                        rr.vselect(indices, rr.vdups(-1, dtypes.int32, mask=mask), cond_mask=valid),
+                        mask,
+                    )
                 rr.vmem_bar("vst_vld")
             mem_copy(gm_sparse_indices, out)
-        elif (self.workspace.candidate_optimized and need_values != 0 and total_tokens >= self.topk
-              and total_tokens <= self.trunk_len):
-            self._select_row_single_trunk(gm_sort_key, total_tokens,
-                                          output_valid_count, gm_sparse_indices,
-                                          gm_selected_value_bits, index_base)
+        elif (
+            self.workspace.candidate_optimized
+            and need_values != 0
+            and total_tokens >= self.topk
+            and total_tokens <= self.trunk_len
+        ):
+            self._select_row_single_trunk(
+                gm_sort_key, total_tokens, output_valid_count, gm_sparse_indices, gm_selected_value_bits, index_base
+            )
         else:
-            self._select_row_values(gm_sort_key, total_tokens, output_valid_count,
-                                    gm_sparse_indices, gm_selected_value_bits, index_base)
+            self._select_row_values(
+                gm_sort_key, total_tokens, output_valid_count, gm_sparse_indices, gm_selected_value_bits, index_base
+            )
 
     @jit
     def _select_row_single_trunk(
@@ -2072,10 +2116,10 @@ class CandidateQliRawTopKSelector:
         tmp_idx = self.workspace.tmp_idx
         histogram = self.workspace.histogram
         high_target_carrier = self.workspace.high_target_carrier
-        self._load_merge(gm_sort_key, self.workspace.history_key, merge_key,
-                         dtypes.int64(0), dtypes.int64(0), total_tokens)
-        self._find_indices(merge_key, total_tokens, tmp_idx,
-                           histogram, high_target_carrier)
+        self._load_merge(
+            gm_sort_key, self.workspace.history_key, merge_key, dtypes.int64(0), dtypes.int64(0), total_tokens
+        )
+        self._find_indices(merge_key, total_tokens, tmp_idx, histogram, high_target_carrier)
         out_idx = self.output_idx_stage
         out_val = self.output_value_bits_stage
         with vf(mode="raw"):
@@ -2152,7 +2196,7 @@ class CandidateQliRawTopKSelector:
         if output_valid_count > self.topk:
             output_valid_count = self.topk
         merge_key = self.workspace.merge_key
-        current_trunk = self.workspace.current_trunk
+        current_trunk = self.workspace.current_trunk  # noqa: F841
         tmp_idx = self.workspace.tmp_idx
         histogram = self.workspace.histogram
         high_target_carrier = self.workspace.high_target_carrier
@@ -2212,7 +2256,7 @@ class CandidateQliRawTopKSelector:
             history_prefix = dtypes.int64(self.topk_pad)
             if full_trunk_count == 0 and tail_len >= self.topk:
                 history_prefix = dtypes.int64(0)
-            tail_len_pad = ((tail_len + 255) // 256) * 256
+            tail_len_pad = ((tail_len + 255) // 256) * 256  # noqa: F841
             self._load_merge(gm_sort_key, history_key, merge_key, tail_offset, history_prefix, tail_len)
             self._select_pass(
                 merge_key,
@@ -2234,7 +2278,11 @@ class CandidateQliRawTopKSelector:
             for chunk in dsl_range(ceil_div(self.topk, 64), unroll=1):
                 count = self.topk - chunk * 64
                 mask32 = rr.update_mask(count, elem_bits=32)[0]
-                mask16 = rr.mask_and(rr.update_mask(count, elem_bits=16)[0], rr.update_mask(64, elem_bits=16)[0], exec_mask=rr.update_mask(64, elem_bits=16)[0])
+                mask16 = rr.mask_and(
+                    rr.update_mask(count, elem_bits=16)[0],
+                    rr.update_mask(64, elem_bits=16)[0],
+                    exec_mask=rr.update_mask(64, elem_bits=16)[0],
+                )
                 indices = rr.vadds(rr.vload(final_idx, chunk * 64), index_base, mask=mask32)
                 keys = rr.vload(history_key, chunk * 64)
                 positive = rr.veq(
@@ -2285,19 +2333,30 @@ class CandidateQliRawTopKSelector:
         mem_copy(gm_sparse_indices, output_idx_stage)
         mem_copy(gm_selected_value_bits, out_value_bits)
 
+
 class CandidateLdTopKSelector(CandidateQliRawTopKSelector):
     def __init__(self, topk, workspace, splits):
         super().__init__(topk, workspace)
         self.ld_length = int(splits) * self.topk
         self.ld_indices = Buffer(MemLoc.UB, (1, self.ld_length), dtypes.int32)
         self.ld_bits = Buffer(MemLoc.UB, (1, self.ld_length), dtypes.uint16)
+
     @jit
-    def merge_ld(self, partial_indices, partial_bits, gm_sparse_indices, gm_selected_value_bits, valid_length, output_offset=0, preloaded=False):
+    def merge_ld(
+        self,
+        partial_indices,
+        partial_bits,
+        gm_sparse_indices,
+        gm_selected_value_bits,
+        valid_length,
+        output_offset=0,
+        preloaded=False,
+    ):
         if not preloaded:
             mem_copy(local_slice(self.ld_indices, (1, valid_length)), partial_indices[0:1, 0:valid_length])
             mem_copy(local_slice(self.ld_bits, (1, valid_length)), partial_bits[0:1, 0:valid_length])
         current_trunk = self.workspace.merge_key
-        history_key = self.workspace.history_key
+        history_key = self.workspace.history_key  # noqa: F841
         history_idx = self.workspace.history_idx
         with vf(mode="raw"):
             mask16 = rr.update_mask(64, elem_bits=16)[0]
@@ -2307,45 +2366,72 @@ class CandidateLdTopKSelector(CandidateQliRawTopKSelector):
                 indices = rr.vload(self.ld_indices, chunk * 64)
                 positive_key = rr.vbitwise_xor(bits, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
                 negative_key = rr.vbitwise_xor(bits, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-                negative = rr.veqs(rr.vbitwise_and(bits, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16), 0x8000, mask=mask16)
+                negative = rr.veqs(
+                    rr.vbitwise_and(bits, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16),
+                    0x8000,
+                    mask=mask16,
+                )
                 keys = rr.vselect(negative_key, positive_key, cond_mask=negative)
-                valid32 = rr.vselect(rr.vdups(1, dtypes.int32, mask=mask32), rr.vdups(0, dtypes.int32, mask=mask32), cond_mask=rr.vges(indices, 0, mask=mask32))
+                valid32 = rr.vselect(
+                    rr.vdups(1, dtypes.int32, mask=mask32),
+                    rr.vdups(0, dtypes.int32, mask=mask32),
+                    cond_mask=rr.vges(indices, 0, mask=mask32),
+                )
                 valid16 = rr.vpack(rr.vreinterpret(valid32, dtypes.uint32), dtypes.uint16, part="lower")
-                keys = rr.vselect(keys, rr.vdups(0, dtypes.uint16, mask=mask16), cond_mask=rr.veqs(valid16, 1, mask=mask16))
+                keys = rr.vselect(
+                    keys, rr.vdups(0, dtypes.uint16, mask=mask16), cond_mask=rr.veqs(valid16, 1, mask=mask16)
+                )
                 rr.vstore(current_trunk, chunk * 64, keys, mask16)
             rr.vmem_bar("vst_vld")
-        self._find_indices(current_trunk, valid_length, self.workspace.tmp_idx,
-                           self.workspace.histogram, self.workspace.high_target_carrier)
+        self._find_indices(
+            current_trunk,
+            valid_length,
+            self.workspace.tmp_idx,
+            self.workspace.histogram,
+            self.workspace.high_target_carrier,
+        )
         output_idx_stage = self.output_idx_stage
         out_value_bits = self.output_value_bits_stage
         output_valid_count = dtypes.int32(self.topk)
-        final_idx = history_idx
+        final_idx = history_idx  # noqa: F841
         with vf(mode="raw"):
             for chunk in dsl_range(ceil_div(self.topk, 64), unroll=1):
                 count = self.topk - chunk * 64
                 mask32 = rr.update_mask(count, elem_bits=32)[0]
-                mask16 = rr.mask_and(rr.update_mask(count, elem_bits=16)[0], rr.update_mask(64, elem_bits=16)[0], exec_mask=rr.update_mask(64, elem_bits=16)[0])
+                mask16 = rr.mask_and(
+                    rr.update_mask(count, elem_bits=16)[0],
+                    rr.update_mask(64, elem_bits=16)[0],
+                    exec_mask=rr.update_mask(64, elem_bits=16)[0],
+                )
                 positions = rr.vunpack(rr.vload(self.workspace.tmp_idx, chunk * 64), dtypes.uint32, part="lower")
                 indices = rr.vgather(self.ld_indices, rr.vreinterpret(positions, dtypes.uint32), mask=mask32)
                 positions16 = rr.vload(self.workspace.tmp_idx, chunk * 64)
                 keys = rr.vgather(current_trunk, positions16, mask=mask16)
                 value_bits = rr.vgather(self.ld_bits, positions16, mask=mask16)
-                valid_rank32 = rr.vlts(
+                valid_rank32 = rr.vlts(  # noqa: F841
                     rr.varange(chunk * 64, dtypes.uint32),
                     output_valid_count,
                     mask=mask32,
                 )
-                valid_rank16 = rr.vlts(
+                valid_rank16 = rr.vlts(  # noqa: F841
                     rr.varange(chunk * 64, dtypes.uint16),
                     output_valid_count,
                     mask=mask16,
                 )
-                key_valid16 = rr.vselect(rr.vdups(1, dtypes.uint16, mask=mask16), rr.vdups(0, dtypes.uint16, mask=mask16), cond_mask=rr.vges(keys, 1, mask=mask16))
+                key_valid16 = rr.vselect(
+                    rr.vdups(1, dtypes.uint16, mask=mask16),
+                    rr.vdups(0, dtypes.uint16, mask=mask16),
+                    cond_mask=rr.vges(keys, 1, mask=mask16),
+                )
                 key_valid32 = rr.vunpack(key_valid16, dtypes.uint32, part="lower")
-                indices = rr.vselect(indices, rr.vdups(-1, dtypes.int32, mask=mask32), cond_mask=rr.veqs(key_valid32, 1, mask=mask32))
-                valid_flags32 = rr.vselect(rr.vdups(1, dtypes.int32, mask=mask32),
-                                           rr.vdups(0, dtypes.int32, mask=mask32),
-                                           cond_mask=rr.vges(indices, 0, mask=mask32))
+                indices = rr.vselect(
+                    indices, rr.vdups(-1, dtypes.int32, mask=mask32), cond_mask=rr.veqs(key_valid32, 1, mask=mask32)
+                )
+                valid_flags32 = rr.vselect(
+                    rr.vdups(1, dtypes.int32, mask=mask32),
+                    rr.vdups(0, dtypes.int32, mask=mask32),
+                    cond_mask=rr.vges(indices, 0, mask=mask32),
+                )
                 valid_flags16 = rr.vpack(rr.vreinterpret(valid_flags32, dtypes.uint32), dtypes.uint16, part="lower")
                 indices = rr.vselect(
                     indices,
@@ -2357,25 +2443,42 @@ class CandidateLdTopKSelector(CandidateQliRawTopKSelector):
                     rr.vdups(0, dtypes.uint16, mask=mask16),
                     cond_mask=rr.veqs(valid_flags16, 1, mask=mask16),
                 )
-                indices = rr.vselect(rr.vadds(indices, output_offset, mask=mask32),
+                indices = rr.vselect(
+                    rr.vadds(indices, output_offset, mask=mask32),
                     rr.vdups(-1, dtypes.int32, mask=mask32),
-                    cond_mask=rr.veqs(valid_flags32, 1, mask=mask32))
+                    cond_mask=rr.veqs(valid_flags32, 1, mask=mask32),
+                )
                 rr.vstore(output_idx_stage, chunk * 64, indices, mask32)
                 rr.vstore(out_value_bits, chunk * 64, value_bits, mask16)
             rr.vmem_bar("vst_vld")
         mem_copy(gm_sparse_indices, output_idx_stage)
         mem_copy(gm_selected_value_bits, out_value_bits)
 
+
 class CandidateLdMergeStage:
     def __init__(self, topk, splits, candidate_optimized=False):
         self.topk = topk
         self.length = topk * splits
-        self.workspace = CandidateQliRawTopKWorkspace(CANDIDATE_LD_TRUNK_LEN, topk, candidate_optimized=candidate_optimized)
+        self.workspace = CandidateQliRawTopKWorkspace(
+            CANDIDATE_LD_TRUNK_LEN, topk, candidate_optimized=candidate_optimized
+        )
         self.selector = CandidateLdTopKSelector(topk, self.workspace, splits)
 
     @jit
-    def __call__(self, partial_indices: Tensor, partial_bits: Tensor,
-                 indices: Tensor, bits: Tensor, metadata: Tensor, rows, workers, cu_seqlens_q: Tensor, query_tile_rows, has_cu, output_offset_address=0):
+    def __call__(
+        self,
+        partial_indices: Tensor,
+        partial_bits: Tensor,
+        indices: Tensor,
+        bits: Tensor,
+        metadata: Tensor,
+        rows,
+        workers,
+        cu_seqlens_q: Tensor,
+        query_tile_rows,
+        has_cu,
+        output_offset_address=0,
+    ):
         fd = dtypes.int64(36 + get_block_idx() * 2 + get_subblock_id())
         if metadata[fd, 0] != 0:
             batch_idx = dtypes.int64(metadata[fd, 1])
@@ -2391,8 +2494,10 @@ class CandidateLdMergeStage:
                 row = row_base + m
                 output_offset = dtypes.int32(0)
                 if output_offset_address != 0:
-                    offsets = make_tensor(make_pointer(dtypes.int32, dtypes.int64(output_offset_address), MemLoc.GM),
-                        make_layout((rows, 1), stride=(1, 1)))
+                    offsets = make_tensor(
+                        make_pointer(dtypes.int32, dtypes.int64(output_offset_address), MemLoc.GM),
+                        make_layout((rows, 1), stride=(1, 1)),
+                    )
                     output_offset = offsets[row, 0]
                 for first in dsl_range(0, part_count, self.length // self.topk - 1, unroll=1):
                     count = min(part_count - first, self.length // self.topk - 1)
@@ -2400,20 +2505,36 @@ class CandidateLdMergeStage:
                     vec_sync_notify(PIPE.V, PIPE.MTE2, 5)
                     vec_sync_wait(PIPE.V, PIPE.MTE2, 5)
                     if first > 0:
-                        mem_copy(local_slice(self.selector.ld_indices,(1,self.topk)),tile_view(indices,(1,self.topk),(row,0)))
-                        mem_copy(local_slice(self.selector.ld_bits,(1,self.topk)),tile_view(bits,(1,self.topk),(row,0)))
+                        mem_copy(
+                            local_slice(self.selector.ld_indices, (1, self.topk)),
+                            tile_view(indices, (1, self.topk), (row, 0)),
+                        )
+                        mem_copy(
+                            local_slice(self.selector.ld_bits, (1, self.topk)),
+                            tile_view(bits, (1, self.topk), (row, 0)),
+                        )
                     for part in dsl_range(0, count, unroll=1):
                         source_row = (workspace_begin + first + part) * query_tile_rows + m
-                        mem_copy(tile_view(self.selector.ld_indices,(1,self.topk),(0,part+carry)),
-                                 tile_view(partial_indices,(1,self.topk),(source_row,0)))
-                        mem_copy(tile_view(self.selector.ld_bits,(1,self.topk),(0,part+carry)),
-                                 tile_view(partial_bits,(1,self.topk),(source_row,0)))
+                        mem_copy(
+                            tile_view(self.selector.ld_indices, (1, self.topk), (0, part + carry)),
+                            tile_view(partial_indices, (1, self.topk), (source_row, 0)),
+                        )
+                        mem_copy(
+                            tile_view(self.selector.ld_bits, (1, self.topk), (0, part + carry)),
+                            tile_view(partial_bits, (1, self.topk), (source_row, 0)),
+                        )
                     vec_sync_notify(PIPE.MTE2, PIPE.V, 5)
                     vec_sync_wait(PIPE.MTE2, PIPE.V, 5)
-                    offset = dtypes.int32(dyn_select(first+count==part_count,output_offset,0))
-                    self.selector.merge_ld(partial_indices,partial_bits,
-                        tile_view(indices,(1,self.topk),(row,0)),
-                        tile_view(bits,(1,self.topk),(row,0)),(count+carry)*self.topk,offset,True)
+                    offset = dtypes.int32(dyn_select(first + count == part_count, output_offset, 0))
+                    self.selector.merge_ld(
+                        partial_indices,
+                        partial_bits,
+                        tile_view(indices, (1, self.topk), (row, 0)),
+                        tile_view(bits, (1, self.topk), (row, 0)),
+                        (count + carry) * self.topk,
+                        offset,
+                        True,
+                    )
                     vec_sync_notify(PIPE.MTE3, PIPE.MTE2, 5)
                     vec_sync_wait(PIPE.MTE3, PIPE.MTE2, 5)
 
@@ -2427,48 +2548,52 @@ class QliCube:
         self.pa_block_size = int(pa_block_size)
         self.copy_rows = gcd(QK_COLUMNS, self.pa_block_size)
         self.q_l1 = Channel(
-            MemLoc.L1, (self.tile_m, LOGICAL_D), dtypes.fp4x2_e2m1,
-            depth=2, data_format="nz",
+            MemLoc.L1,
+            (self.tile_m, LOGICAL_D),
+            dtypes.fp4x2_e2m1,
+            depth=2,
+            data_format="nz",
         )
-        self.k_l1 = Channel(MemLoc.L1, (QK_COLUMNS, LOGICAL_D), dtypes.fp4x2_e2m1,
-                            depth=4, data_format="nz")
+        self.k_l1 = Channel(MemLoc.L1, (QK_COLUMNS, LOGICAL_D), dtypes.fp4x2_e2m1, depth=4, data_format="nz")
         self.q_scale_l1 = Channel(
-            MemLoc.L1, (self.tile_m, 4), dtypes.float8_e8m0,
-            depth=2, data_format="zn",
+            MemLoc.L1,
+            (self.tile_m, 4),
+            dtypes.float8_e8m0,
+            depth=2,
+            data_format="zn",
         )
-        self.k_scale_l1 = Channel(MemLoc.L1, (4, QK_COLUMNS), dtypes.float8_e8m0,
-                                  depth=4, data_format="nz")
+        self.k_scale_l1 = Channel(MemLoc.L1, (4, QK_COLUMNS), dtypes.float8_e8m0, depth=4, data_format="nz")
         self.l0a0 = Channel(MemLoc.L0A, (self.tile_m // 2, LOGICAL_D), dtypes.fp4x2_e2m1, depth=1)
         self.l0a1 = Channel(MemLoc.L0A, (self.tile_m // 2, LOGICAL_D), dtypes.fp4x2_e2m1, depth=1)
         self.l0b = Channel(
-            MemLoc.L0B, (QK_COLUMNS, LOGICAL_D), dtypes.fp4x2_e2m1,
-            depth=2, data_format="nz",
+            MemLoc.L0B,
+            (QK_COLUMNS, LOGICAL_D),
+            dtypes.fp4x2_e2m1,
+            depth=2,
+            data_format="nz",
         )
-        self.l0c = Channel(
-            MemLoc.L0C, (self.tile_m // 2, QK_COLUMNS), dtypes.float32, depth=2
-        )
+        self.l0c = Channel(MemLoc.L0C, (self.tile_m // 2, QK_COLUMNS), dtypes.float32, depth=2)
         self.nd2nz_fp4 = make_copy_engine(
-            format_transform="nd2nz", dtype=dtypes.fp4x2_e2m1,
-            pad_value=0.0, dst_c0_stride=self.tile_m
+            format_transform="nd2nz", dtype=dtypes.fp4x2_e2m1, pad_value=0.0, dst_c0_stride=self.tile_m
         )
         self.nd2nz_key = make_copy_engine(
-            format_transform="nd2nz", dtype=dtypes.fp4x2_e2m1,
-            pad_value=0.0, dst_c0_stride=QK_COLUMNS,
+            format_transform="nd2nz",
+            dtype=dtypes.fp4x2_e2m1,
+            pad_value=0.0,
+            dst_c0_stride=QK_COLUMNS,
         )
         self.scale_a = make_copy_engine(
-            format_transform="mx_scale_and", dtype=dtypes.float8_e8m0,
+            format_transform="mx_scale_and",
+            dtype=dtypes.float8_e8m0,
             pad_value=0.0,
         )
         self.scale_b = make_copy_engine(
-            format_transform="mx_scale_bdn", dtype=dtypes.float8_e8m0,
+            format_transform="mx_scale_bdn",
+            dtype=dtypes.float8_e8m0,
             pad_value=0.0,
         )
-        self.fixpipe_aiv0 = make_copy_engine(
-            dtype=dtypes.bfloat16, dual_dst_ctl=0, sub_block_id=0, unit_flag_mode=3
-        )
-        self.fixpipe_aiv1 = make_copy_engine(
-            dtype=dtypes.bfloat16, dual_dst_ctl=0, sub_block_id=1, unit_flag_mode=3
-        )
+        self.fixpipe_aiv0 = make_copy_engine(dtype=dtypes.bfloat16, dual_dst_ctl=0, sub_block_id=0, unit_flag_mode=3)
+        self.fixpipe_aiv1 = make_copy_engine(dtype=dtypes.bfloat16, dual_dst_ctl=0, sub_block_id=1, unit_flag_mode=3)
 
     @jit
     def load_query(self, query, query_scale, query_token_start):
@@ -2496,17 +2621,33 @@ class QliCube:
         # are ignored by the vector/output path.
         query_read = self.q_l1.wait()
         scale_read = self.q_scale_l1.wait()
-        mem_copy(self.l0a0, tile_view(local_slice(query_read, (self.tile_m, LOGICAL_D)), (self.tile_m // 2, LOGICAL_D), (0, 0)),
-                 mx_scale=tile_view(local_slice(scale_read, (self.tile_m, 4)), (self.tile_m // 2, 4), (0, 0)))
-        mem_copy(self.l0a1, tile_view(local_slice(query_read, (self.tile_m, LOGICAL_D)), (self.tile_m // 2, LOGICAL_D), (1, 0)),
-                 mx_scale=tile_view(local_slice(scale_read, (self.tile_m, 4)), (self.tile_m // 2, 4), (1, 0)))
+        mem_copy(
+            self.l0a0,
+            tile_view(local_slice(query_read, (self.tile_m, LOGICAL_D)), (self.tile_m // 2, LOGICAL_D), (0, 0)),
+            mx_scale=tile_view(local_slice(scale_read, (self.tile_m, 4)), (self.tile_m // 2, 4), (0, 0)),
+        )
+        mem_copy(
+            self.l0a1,
+            tile_view(local_slice(query_read, (self.tile_m, LOGICAL_D)), (self.tile_m // 2, LOGICAL_D), (1, 0)),
+            mx_scale=tile_view(local_slice(scale_read, (self.tile_m, 4)), (self.tile_m // 2, 4), (1, 0)),
+        )
         self.q_l1.release(query_read)
         self.q_scale_l1.release(scale_read)
 
     @jit
-    def compute_qk(self, key, key_scale, block_table, batch_idx, actual_s2,
-                   key_stride0, key_dequant_scale_stride0, has_block_table,
-                   token_tile, qk_handoff):
+    def compute_qk(
+        self,
+        key,
+        key_scale,
+        block_table,
+        batch_idx,
+        actual_s2,
+        key_stride0,
+        key_dequant_scale_stride0,
+        has_block_table,
+        token_tile,
+        qk_handoff,
+    ):
         key_write = self.k_l1.acquire()
         scale_write = self.k_scale_l1.acquire()
         for piece in range(QK_COLUMNS // self.copy_rows):
@@ -2523,12 +2664,12 @@ class QliCube:
             scale_row = physical_page * (key_dequant_scale_stride0 // KEY_SCALE_STORAGE_ROW_ELEMENTS) + page_offset
             mem_copy(
                 tile_view(key_write, (self.copy_rows, LOGICAL_D), (piece, 0)),
-                key[source_row:source_row + self.copy_rows, None],
+                key[source_row : source_row + self.copy_rows, None],
                 engine=self.nd2nz_key,
             )
             mem_copy(
                 tile_view(scale_write, (4, self.copy_rows), (0, piece)),
-                key_scale[scale_row:scale_row + self.copy_rows, None, None],
+                key_scale[scale_row : scale_row + self.copy_rows, None, None],
                 engine=self.scale_b,
             )
         self.k_l1.commit(key_write)
@@ -2537,19 +2678,32 @@ class QliCube:
         key_read = self.l0b.wait()
         dsl_matmul(self.l0c, self.l0a0, key_read, init=True, unit_flag=3)
         acc_read0 = self.l0c.wait()
-        mem_copy(local_slice(qk_handoff, (self.tile_m // 2, 128), stride=(256, 1)),
-                 local_slice(acc_read0, (self.tile_m // 2, 128)), engine=self.fixpipe_aiv0)
-        mem_copy(local_slice(qk_handoff, (self.tile_m // 2, 128), stride=(256, 1), offset=(self.tile_m // 2) * 512),
-                 local_slice(acc_read0, (self.tile_m // 2, 128), offset=(self.tile_m // 2) * 128 * 4), engine=self.fixpipe_aiv0)
+        mem_copy(
+            local_slice(qk_handoff, (self.tile_m // 2, 128), stride=(256, 1)),
+            local_slice(acc_read0, (self.tile_m // 2, 128)),
+            engine=self.fixpipe_aiv0,
+        )
+        mem_copy(
+            local_slice(qk_handoff, (self.tile_m // 2, 128), stride=(256, 1), offset=(self.tile_m // 2) * 512),
+            local_slice(acc_read0, (self.tile_m // 2, 128), offset=(self.tile_m // 2) * 128 * 4),
+            engine=self.fixpipe_aiv0,
+        )
         self.l0c.release(acc_read0)
         dsl_matmul(self.l0c, self.l0a1, key_read, init=True, unit_flag=3)
         acc_read1 = self.l0c.wait()
-        mem_copy(local_slice(qk_handoff, (self.tile_m // 2, 128), stride=(256, 1)),
-                 local_slice(acc_read1, (self.tile_m // 2, 128)), engine=self.fixpipe_aiv1)
-        mem_copy(local_slice(qk_handoff, (self.tile_m // 2, 128), stride=(256, 1), offset=(self.tile_m // 2) * 512),
-                 local_slice(acc_read1, (self.tile_m // 2, 128), offset=(self.tile_m // 2) * 128 * 4), engine=self.fixpipe_aiv1)
+        mem_copy(
+            local_slice(qk_handoff, (self.tile_m // 2, 128), stride=(256, 1)),
+            local_slice(acc_read1, (self.tile_m // 2, 128)),
+            engine=self.fixpipe_aiv1,
+        )
+        mem_copy(
+            local_slice(qk_handoff, (self.tile_m // 2, 128), stride=(256, 1), offset=(self.tile_m // 2) * 512),
+            local_slice(acc_read1, (self.tile_m // 2, 128), offset=(self.tile_m // 2) * 128 * 4),
+            engine=self.fixpipe_aiv1,
+        )
         self.l0c.release(acc_read1)
         self.l0b.release(key_read)
+
 
 class QliVector:
     """Each AIV consumes its 64-row split and produces two QLI rows."""
@@ -2575,23 +2729,23 @@ class QliVector:
         self.cmp_ratio = int(cmp_ratio)
         self.candidate_enabled = bool(candidate_enabled)
         self.candidate_topk_count = int(candidate_topk_count)
-        self.weight_ub = Channel(
-            MemLoc.UB, (self.vec_rows, self.n1), dtypes.float32, depth=1, addr=weight_addr
-        )
+        self.weight_ub = Channel(MemLoc.UB, (self.vec_rows, self.n1), dtypes.float32, depth=1, addr=weight_addr)
         self.packed_weight = Buffer(MemLoc.UB, (self.vec_rows, 128), dtypes.bfloat16)
         self.score_ub = Buffer(MemLoc.UB, (self.vec_rows, QK_COLUMNS), dtypes.bfloat16)
-        self.key_ub = Channel(
-            MemLoc.UB, (self.vec_rows, QK_COLUMNS), dtypes.uint16, depth=2
-        )
+        self.key_ub = Channel(MemLoc.UB, (self.vec_rows, QK_COLUMNS), dtypes.uint16, depth=2)
         if self.candidate_enabled:
             # Each row is written separately before one batched DMA reads them.
             # Buffer models this shared scratch without Channel epoch ambiguity.
             self.candidate_key_ub = Buffer(
-                MemLoc.UB, (self.vec_rows, QK_COLUMNS // CANDIDATE_BLOCK_SIZE),
+                MemLoc.UB,
+                (self.vec_rows, QK_COLUMNS // CANDIDATE_BLOCK_SIZE),
                 dtypes.uint16,
             )
         self.candidate_length_ub = Channel(
-            MemLoc.UB, (1,), dtypes.int32, depth=1,
+            MemLoc.UB,
+            (1,),
+            dtypes.int32,
+            depth=1,
         )
 
     @jit
@@ -2599,29 +2753,24 @@ class QliVector:
         weight_row = dtypes.int64(public_row_base) + dtypes.int64(self.subblock_idx) * self.vec_rows
         if dtypes.int32(self.subblock_idx) * self.vec_rows >= task_span_count:
             weight_row = dtypes.int64(public_row_base)
-        mem_copy(self.weight_ub, tile_view(_offset_view(weights, (weight_row, 0)),
-                                         (self.vec_rows, self.n1), (0, 0)))
+        mem_copy(self.weight_ub, tile_view(_offset_view(weights, (weight_row, 0)), (self.vec_rows, self.n1), (0, 0)))
         with vf(mode="raw"):
             mask32 = rr.update_mask(self.n1, elem_bits=32)[0]
             mask16 = rr.update_mask(self.n1, elem_bits=16)[0]
             for row in range_constexpr(self.vec_rows):
-                weight = rr.vcast(rr.vload(self.weight_ub, row * self.n1), dtypes.bfloat16, mask=mask32, reg_layout=rr.RegLayout.ZERO)
+                weight = rr.vcast(
+                    rr.vload(self.weight_ub, row * self.n1), dtypes.bfloat16, mask=mask32, reg_layout=rr.RegLayout.ZERO
+                )
                 packed = rr.vpack(rr.vreinterpret_lanes(weight, dtypes.uint32), dtypes.uint16, part="lower")
                 rr.vstore(self.packed_weight, row * 128, rr.vreinterpret(packed, dtypes.bfloat16), mask16)
             rr.vmem_bar("vst_vld")
 
-
     @jit
-    def store_empty_candidate_lengths(
-        self, candidate_length_out, public_row_base, task_span_count
-    ):
+    def store_empty_candidate_lengths(self, candidate_length_out, public_row_base, task_span_count):
         """Write zero Candidate length for both rows owned by this AIV."""
         for row_in_subblock in range_constexpr(self.vec_rows):
-            local_row = dtypes.int32(
-                self.subblock_idx * self.vec_rows + row_in_subblock
-            )
+            local_row = dtypes.int32(self.subblock_idx * self.vec_rows + row_in_subblock)
             if local_row < task_span_count:
-
                 with vf(mode="raw"):
                     length_mask = rr.update_mask(1, elem_bits=32)[0]
                     rr.vstore(
@@ -2636,14 +2785,10 @@ class QliVector:
                     tile_view(
                         candidate_length_out,
                         (1,),
-                        (
-                            dtypes.int64(public_row_base)
-                            + dtypes.int64(local_row),
-                        ),
+                        (dtypes.int64(public_row_base) + dtypes.int64(local_row),),
                     ),
                     self.candidate_length_ub,
                 )
-
 
     @jit
     def compute_vector1(
@@ -2674,19 +2819,64 @@ class QliVector:
             group_count = dtypes.int32(self.n1)
         v0 = actual_s2
         if self.mask_mode == 3:
-            v0 = max(0, min(actual_s2, (actual_s2 * self.cmp_ratio + cmp_residual - task_used_q + task_q_offset + dtypes.int32(self.subblock_idx) * self.vec_rows + 0 + 1) // self.cmp_ratio))
+            v0 = max(
+                0,
+                min(
+                    actual_s2,
+                    (
+                        actual_s2 * self.cmp_ratio
+                        + cmp_residual
+                        - task_used_q
+                        + task_q_offset
+                        + dtypes.int32(self.subblock_idx) * self.vec_rows
+                        + 0
+                        + 1
+                    )
+                    // self.cmp_ratio,
+                ),
+            )
         if dtypes.int32(self.subblock_idx) * self.vec_rows + 0 >= task_active_count:
             v0 = 0
         v0 = max(0, min(dtypes.int32(tile_tokens), v0 - dtypes.int32(token_offset)))
         v1 = actual_s2
         if self.mask_mode == 3:
-            v1 = max(0, min(actual_s2, (actual_s2 * self.cmp_ratio + cmp_residual - task_used_q + task_q_offset + dtypes.int32(self.subblock_idx) * self.vec_rows + 1 + 1) // self.cmp_ratio))
+            v1 = max(
+                0,
+                min(
+                    actual_s2,
+                    (
+                        actual_s2 * self.cmp_ratio
+                        + cmp_residual
+                        - task_used_q
+                        + task_q_offset
+                        + dtypes.int32(self.subblock_idx) * self.vec_rows
+                        + 1
+                        + 1
+                    )
+                    // self.cmp_ratio,
+                ),
+            )
         if dtypes.int32(self.subblock_idx) * self.vec_rows + 1 >= task_active_count:
             v1 = 0
         v1 = max(0, min(dtypes.int32(tile_tokens), v1 - dtypes.int32(token_offset)))
         v2 = actual_s2
         if self.mask_mode == 3:
-            v2 = max(0, min(actual_s2, (actual_s2 * self.cmp_ratio + cmp_residual - task_used_q + task_q_offset + dtypes.int32(self.subblock_idx) * self.vec_rows + 2 + 1) // self.cmp_ratio))
+            v2 = max(
+                0,
+                min(
+                    actual_s2,
+                    (
+                        actual_s2 * self.cmp_ratio
+                        + cmp_residual
+                        - task_used_q
+                        + task_q_offset
+                        + dtypes.int32(self.subblock_idx) * self.vec_rows
+                        + 2
+                        + 1
+                    )
+                    // self.cmp_ratio,
+                ),
+            )
         if dtypes.int32(self.subblock_idx) * self.vec_rows + 2 >= task_active_count:
             v2 = 0
         v2 = max(0, min(dtypes.int32(tile_tokens), v2 - dtypes.int32(token_offset)))
@@ -2707,16 +2897,10 @@ class QliVector:
                 self._score_two_hist(qk_handoff, group_count, hist, workspace_token_offset, v0, v1)
             if self.candidate_enabled:
                 for row_in_subblock in range_constexpr(self.vec_rows):
-                    local_row = dtypes.int32(
-                        self.subblock_idx * self.vec_rows + row_in_subblock
-                    )
-                    public_row = (
-                        dtypes.int64(public_row_base) + dtypes.int64(local_row)
-                    )
-                    workspace_row = (
-                        workspace_task_idx * self.query_rows
-                        + self.subblock_idx * self.vec_rows
-                        + row_in_subblock
+                    local_row = dtypes.int32(self.subblock_idx * self.vec_rows + row_in_subblock)
+                    public_row = dtypes.int64(public_row_base) + dtypes.int64(local_row)
+                    workspace_row = (  # noqa: F841
+                        workspace_task_idx * self.query_rows + self.subblock_idx * self.vec_rows + row_in_subblock
                     )
                     valid_s2 = actual_s2
                     if self.mask_mode == 3:
@@ -2726,11 +2910,7 @@ class QliVector:
                             + dtypes.int32(row_in_subblock)
                         )
                         valid_s2 = (
-                            actual_s2 * self.cmp_ratio
-                            + cmp_residual
-                            - task_used_q
-                            + query_in_batch
-                            + 1
+                            actual_s2 * self.cmp_ratio + cmp_residual - task_used_q + query_in_batch + 1
                         ) // self.cmp_ratio
                         if valid_s2 < 0:
                             valid_s2 = 0
@@ -2738,9 +2918,7 @@ class QliVector:
                             valid_s2 = actual_s2
                     if local_row >= task_active_count:
                         valid_s2 = 0
-                    valid_candidate_count = (
-                        valid_s2 + CANDIDATE_BLOCK_SIZE - 1
-                    ) // CANDIDATE_BLOCK_SIZE
+                    valid_candidate_count = (valid_s2 + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
                     local_candidate_count = valid_candidate_count - dtypes.int32(token_offset) // CANDIDATE_BLOCK_SIZE
                     if local_candidate_count < 0:
                         local_candidate_count = 0
@@ -2755,13 +2933,11 @@ class QliVector:
                     if self.candidate_enabled:
                         with vf(mode="raw"):
                             candidate_count = QK_COLUMNS // CANDIDATE_BLOCK_SIZE
-                            candidate_mask16 = rr.update_mask(
-                                candidate_count, elem_bits=16
-                            )[0]
+                            candidate_mask16 = rr.update_mask(candidate_count, elem_bits=16)[0]
                             candidate_idx = rr.vadds(
-                                rr.vmuls(rr.varange(0, dtypes.uint16),
-                                         CANDIDATE_BLOCK_SIZE, mask=candidate_mask16),
-                                row_in_subblock * QK_COLUMNS, mask=candidate_mask16,
+                                rr.vmuls(rr.varange(0, dtypes.uint16), CANDIDATE_BLOCK_SIZE, mask=candidate_mask16),
+                                row_in_subblock * QK_COLUMNS,
+                                mask=candidate_mask16,
                             )
                             candidate_max = rr.vgather(
                                 self.score_ub,
@@ -2818,9 +2994,7 @@ class QliVector:
                             candidate_bits16 = rr.vreinterpret(candidate_max, dtypes.uint16)
                             candidate_key = rr.vbitwise_xor(
                                 candidate_bits16,
-                                rr.vdups(
-                                    0x8000, dtypes.uint16, mask=candidate_mask16
-                                ),
+                                rr.vdups(0x8000, dtypes.uint16, mask=candidate_mask16),
                                 mask=candidate_mask16,
                             )
                             # Negative IEEE values require inverted bits to preserve numeric order.
@@ -2854,16 +3028,15 @@ class QliVector:
                             rr.vstore(
                                 self.candidate_key_ub,
                                 row_in_subblock * (QK_COLUMNS // CANDIDATE_BLOCK_SIZE),
-                                candidate_key, candidate_mask16,
+                                candidate_key,
+                                candidate_mask16,
                             )
                             rr.vmem_bar("vst_vld")
 
                     if self.candidate_enabled:
                         if local_row < task_span_count:
                             if token_offset == 0:
-                                length = (
-                                    valid_s2 + CANDIDATE_BLOCK_SIZE - 1
-                                ) // CANDIDATE_BLOCK_SIZE
+                                length = (valid_s2 + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
                                 if length > self.candidate_topk_count:
                                     length = dtypes.int32(self.candidate_topk_count)
                                 with vf(mode="raw"):
@@ -2885,29 +3058,37 @@ class QliVector:
             if rows_to_store > self.vec_rows:
                 rows_to_store = self.vec_rows
             first_workspace_row = workspace_task_idx * self.query_rows + self.subblock_idx * self.vec_rows
-            mem_copy(tile_view(_offset_view(key_out, (first_workspace_row, workspace_token_offset)),
-                               (self.vec_rows, QK_COLUMNS), (0, 0)),
-                     local_slice(self.key_ub, (dtypes.int64(rows_to_store), QK_COLUMNS)))
+            mem_copy(
+                tile_view(
+                    _offset_view(key_out, (first_workspace_row, workspace_token_offset)),
+                    (self.vec_rows, QK_COLUMNS),
+                    (0, 0),
+                ),
+                local_slice(self.key_ub, (dtypes.int64(rows_to_store), QK_COLUMNS)),
+            )
             if self.candidate_enabled:
                 vec_sync_notify(PIPE.V, PIPE.MTE3, 4)
                 vec_sync_wait(PIPE.V, PIPE.MTE3, 4)
                 mem_copy(
-                    tile_view(_offset_view(candidate_key_out,
-                              (first_workspace_row, workspace_token_offset // CANDIDATE_BLOCK_SIZE)),
-                              (self.vec_rows, QK_COLUMNS // CANDIDATE_BLOCK_SIZE), (0, 0)),
-                    local_slice(self.candidate_key_ub,
-                                (dtypes.int64(rows_to_store), QK_COLUMNS // CANDIDATE_BLOCK_SIZE)),
+                    tile_view(
+                        _offset_view(
+                            candidate_key_out, (first_workspace_row, workspace_token_offset // CANDIDATE_BLOCK_SIZE)
+                        ),
+                        (self.vec_rows, QK_COLUMNS // CANDIDATE_BLOCK_SIZE),
+                        (0, 0),
+                    ),
+                    local_slice(
+                        self.candidate_key_ub, (dtypes.int64(rows_to_store), QK_COLUMNS // CANDIDATE_BLOCK_SIZE)
+                    ),
                 )
                 vec_sync_notify(PIPE.MTE3, PIPE.V, 4)
                 vec_sync_wait(PIPE.MTE3, PIPE.V, 4)
-
-
 
     @jit
     def _score_two(self, qk_handoff, group_count):
         with vf(mode="raw"):
             mask16 = rr.update_mask(128, elem_bits=16)[0]
-            weight_mask = rr.update_mask(self.n1, elem_bits=32)[0]
+            weight_mask = rr.update_mask(self.n1, elem_bits=32)[0]  # noqa: F841
             bf16_weight0 = rr.vload(self.packed_weight, 0 * 128)
             acc0_0 = rr.vdups(0.0, dtypes.bfloat16, mask=mask16)
             acc0_1 = rr.vdups(0.0, dtypes.bfloat16, mask=mask16)
@@ -2918,13 +3099,29 @@ class QliVector:
                 lane = rr.vdups(group, dtypes.uint16, mask=mask16)
                 w0 = rr.vgather_reg(bf16_weight0, lane)
                 w1 = rr.vgather_reg(bf16_weight1, lane)
-                qk0_0 = rr.vmaxs(rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk0_0 = rr.vmaxs(
+                    rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc0_0 = rr.vmadd(qk0_0, w0, acc0_0, mask=mask16)
-                qk0_1 = rr.vmaxs(rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk0_1 = rr.vmaxs(
+                    rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc0_1 = rr.vmadd(qk0_1, w0, acc0_1, mask=mask16)
-                qk1_0 = rr.vmaxs(rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk1_0 = rr.vmaxs(
+                    rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc1_0 = rr.vmadd(qk1_0, w1, acc1_0, mask=mask16)
-                qk1_1 = rr.vmaxs(rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk1_1 = rr.vmaxs(
+                    rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc1_1 = rr.vmadd(qk1_1, w1, acc1_1, mask=mask16)
             acc0_0 = rr.vadds(acc0_0, 0.0, mask=mask16)
             if self.candidate_enabled:
@@ -2934,7 +3131,12 @@ class QliVector:
             negative0_0 = rr.veqs(sign0_0, 0x8000, mask=mask16)
             positive_key0_0 = rr.vbitwise_xor(bits0_0, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key0_0 = rr.vbitwise_xor(bits0_0, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.key_ub, 0 * QK_COLUMNS + 0 * 128, rr.vselect(negative_key0_0, positive_key0_0, cond_mask=negative0_0), mask16)
+            rr.vstore(
+                self.key_ub,
+                0 * QK_COLUMNS + 0 * 128,
+                rr.vselect(negative_key0_0, positive_key0_0, cond_mask=negative0_0),
+                mask16,
+            )
             acc0_1 = rr.vadds(acc0_1, 0.0, mask=mask16)
             if self.candidate_enabled:
                 rr.vstore(self.score_ub, 0 * QK_COLUMNS + 1 * 128, acc0_1, mask16)
@@ -2943,7 +3145,12 @@ class QliVector:
             negative0_1 = rr.veqs(sign0_1, 0x8000, mask=mask16)
             positive_key0_1 = rr.vbitwise_xor(bits0_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key0_1 = rr.vbitwise_xor(bits0_1, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.key_ub, 0 * QK_COLUMNS + 1 * 128, rr.vselect(negative_key0_1, positive_key0_1, cond_mask=negative0_1), mask16)
+            rr.vstore(
+                self.key_ub,
+                0 * QK_COLUMNS + 1 * 128,
+                rr.vselect(negative_key0_1, positive_key0_1, cond_mask=negative0_1),
+                mask16,
+            )
             acc1_0 = rr.vadds(acc1_0, 0.0, mask=mask16)
             if self.candidate_enabled:
                 rr.vstore(self.score_ub, 1 * QK_COLUMNS + 0 * 128, acc1_0, mask16)
@@ -2952,7 +3159,12 @@ class QliVector:
             negative1_0 = rr.veqs(sign1_0, 0x8000, mask=mask16)
             positive_key1_0 = rr.vbitwise_xor(bits1_0, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key1_0 = rr.vbitwise_xor(bits1_0, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.key_ub, 1 * QK_COLUMNS + 0 * 128, rr.vselect(negative_key1_0, positive_key1_0, cond_mask=negative1_0), mask16)
+            rr.vstore(
+                self.key_ub,
+                1 * QK_COLUMNS + 0 * 128,
+                rr.vselect(negative_key1_0, positive_key1_0, cond_mask=negative1_0),
+                mask16,
+            )
             acc1_1 = rr.vadds(acc1_1, 0.0, mask=mask16)
             if self.candidate_enabled:
                 rr.vstore(self.score_ub, 1 * QK_COLUMNS + 1 * 128, acc1_1, mask16)
@@ -2961,17 +3173,23 @@ class QliVector:
             negative1_1 = rr.veqs(sign1_1, 0x8000, mask=mask16)
             positive_key1_1 = rr.vbitwise_xor(bits1_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key1_1 = rr.vbitwise_xor(bits1_1, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.key_ub, 1 * QK_COLUMNS + 1 * 128, rr.vselect(negative_key1_1, positive_key1_1, cond_mask=negative1_1), mask16)
+            rr.vstore(
+                self.key_ub,
+                1 * QK_COLUMNS + 1 * 128,
+                rr.vselect(negative_key1_1, positive_key1_1, cond_mask=negative1_1),
+                mask16,
+            )
             rr.vmem_bar("vst_vld")
-
 
     @jit
     def _score_two_hist(self, qk_handoff, group_count, hist, workspace_offset, valid0, valid1):
         with vf(mode="raw"):
             mask16 = rr.update_mask(128, elem_bits=16)[0]
             zero_hist = rr.vdups(0, dtypes.uint16, mask=mask16)
-            reset16 = rr.veqs(rr.vdups(dtypes.int32(workspace_offset < 512), dtypes.uint16, mask=mask16), 1, mask=mask16)
-            weight_mask = rr.update_mask(self.n1, elem_bits=32)[0]
+            reset16 = rr.veqs(
+                rr.vdups(dtypes.int32(workspace_offset < 512), dtypes.uint16, mask=mask16), 1, mask=mask16
+            )
+            weight_mask = rr.update_mask(self.n1, elem_bits=32)[0]  # noqa: F841
             bf16_weight0 = rr.vload(self.packed_weight, 0 * 128)
             acc0_0 = rr.vdups(0.0, dtypes.bfloat16, mask=mask16)
             acc0_1 = rr.vdups(0.0, dtypes.bfloat16, mask=mask16)
@@ -2982,13 +3200,29 @@ class QliVector:
                 lane = rr.vdups(group, dtypes.uint16, mask=mask16)
                 w0 = rr.vgather_reg(bf16_weight0, lane)
                 w1 = rr.vgather_reg(bf16_weight1, lane)
-                qk0_0 = rr.vmaxs(rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk0_0 = rr.vmaxs(
+                    rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc0_0 = rr.vmadd(qk0_0, w0, acc0_0, mask=mask16)
-                qk0_1 = rr.vmaxs(rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk0_1 = rr.vmaxs(
+                    rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc0_1 = rr.vmadd(qk0_1, w0, acc0_1, mask=mask16)
-                qk1_0 = rr.vmaxs(rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk1_0 = rr.vmaxs(
+                    rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc1_0 = rr.vmadd(qk1_0, w1, acc1_0, mask=mask16)
-                qk1_1 = rr.vmaxs(rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk1_1 = rr.vmaxs(
+                    rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc1_1 = rr.vmadd(qk1_1, w1, acc1_1, mask=mask16)
             acc0_0 = rr.vadds(acc0_0, 0.0, mask=mask16)
             bits0_0 = rr.vreinterpret(acc0_0, dtypes.uint16)
@@ -2996,14 +3230,24 @@ class QliVector:
             negative0_0 = rr.veqs(sign0_0, 0x8000, mask=mask16)
             positive_key0_0 = rr.vbitwise_xor(bits0_0, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key0_0 = rr.vbitwise_xor(bits0_0, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.key_ub, 0 * QK_COLUMNS + 0 * 128, rr.vselect(negative_key0_0, positive_key0_0, cond_mask=negative0_0), mask16)
+            rr.vstore(
+                self.key_ub,
+                0 * QK_COLUMNS + 0 * 128,
+                rr.vselect(negative_key0_0, positive_key0_0, cond_mask=negative0_0),
+                mask16,
+            )
             acc0_1 = rr.vadds(acc0_1, 0.0, mask=mask16)
             bits0_1 = rr.vreinterpret(acc0_1, dtypes.uint16)
             sign0_1 = rr.vbitwise_and(bits0_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative0_1 = rr.veqs(sign0_1, 0x8000, mask=mask16)
             positive_key0_1 = rr.vbitwise_xor(bits0_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key0_1 = rr.vbitwise_xor(bits0_1, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.key_ub, 0 * QK_COLUMNS + 1 * 128, rr.vselect(negative_key0_1, positive_key0_1, cond_mask=negative0_1), mask16)
+            rr.vstore(
+                self.key_ub,
+                0 * QK_COLUMNS + 1 * 128,
+                rr.vselect(negative_key0_1, positive_key0_1, cond_mask=negative0_1),
+                mask16,
+            )
             h0 = rr.vselect(zero_hist, rr.vload(hist, 0), cond_mask=reset16)
             h1 = rr.vselect(zero_hist, rr.vload(hist, 256), cond_mask=reset16)
             key_high = rr.vshr(rr.vselect(negative_key0_0, positive_key0_0, cond_mask=negative0_0), 8, mask=mask16)
@@ -3025,14 +3269,24 @@ class QliVector:
             negative1_0 = rr.veqs(sign1_0, 0x8000, mask=mask16)
             positive_key1_0 = rr.vbitwise_xor(bits1_0, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key1_0 = rr.vbitwise_xor(bits1_0, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.key_ub, 1 * QK_COLUMNS + 0 * 128, rr.vselect(negative_key1_0, positive_key1_0, cond_mask=negative1_0), mask16)
+            rr.vstore(
+                self.key_ub,
+                1 * QK_COLUMNS + 0 * 128,
+                rr.vselect(negative_key1_0, positive_key1_0, cond_mask=negative1_0),
+                mask16,
+            )
             acc1_1 = rr.vadds(acc1_1, 0.0, mask=mask16)
             bits1_1 = rr.vreinterpret(acc1_1, dtypes.uint16)
             sign1_1 = rr.vbitwise_and(bits1_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative1_1 = rr.veqs(sign1_1, 0x8000, mask=mask16)
             positive_key1_1 = rr.vbitwise_xor(bits1_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key1_1 = rr.vbitwise_xor(bits1_1, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.key_ub, 1 * QK_COLUMNS + 1 * 128, rr.vselect(negative_key1_1, positive_key1_1, cond_mask=negative1_1), mask16)
+            rr.vstore(
+                self.key_ub,
+                1 * QK_COLUMNS + 1 * 128,
+                rr.vselect(negative_key1_1, positive_key1_1, cond_mask=negative1_1),
+                mask16,
+            )
             h0 = rr.vselect(zero_hist, rr.vload(hist, 512), cond_mask=reset16)
             h1 = rr.vselect(zero_hist, rr.vload(hist, 768), cond_mask=reset16)
             key_high = rr.vshr(rr.vselect(negative_key1_0, positive_key1_0, cond_mask=negative1_0), 8, mask=mask16)
@@ -3055,8 +3309,10 @@ class QliVector:
         with vf(mode="raw"):
             mask16 = rr.update_mask(128, elem_bits=16)[0]
             zero_hist = rr.vdups(0, dtypes.uint16, mask=mask16)
-            reset16 = rr.veqs(rr.vdups(dtypes.int32(workspace_offset < 512), dtypes.uint16, mask=mask16), 1, mask=mask16)
-            weight_mask = rr.update_mask(self.n1, elem_bits=32)[0]
+            reset16 = rr.veqs(
+                rr.vdups(dtypes.int32(workspace_offset < 512), dtypes.uint16, mask=mask16), 1, mask=mask16
+            )
+            weight_mask = rr.update_mask(self.n1, elem_bits=32)[0]  # noqa: F841
             bf16_weight0 = rr.vload(self.packed_weight, 0 * 128)
             acc0_0 = rr.vdups(0.0, dtypes.bfloat16, mask=mask16)
             acc0_1 = rr.vdups(0.0, dtypes.bfloat16, mask=mask16)
@@ -3067,13 +3323,29 @@ class QliVector:
                 lane = rr.vdups(group, dtypes.uint16, mask=mask16)
                 w0 = rr.vgather_reg(bf16_weight0, lane)
                 w1 = rr.vgather_reg(bf16_weight1, lane)
-                qk0_0 = rr.vmaxs(rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk0_0 = rr.vmaxs(
+                    rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc0_0 = rr.vmadd(qk0_0, w0, acc0_0, mask=mask16)
-                qk0_1 = rr.vmaxs(rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk0_1 = rr.vmaxs(
+                    rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc0_1 = rr.vmadd(qk0_1, w0, acc0_1, mask=mask16)
-                qk1_0 = rr.vmaxs(rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk1_0 = rr.vmaxs(
+                    rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc1_0 = rr.vmadd(qk1_0, w1, acc1_0, mask=mask16)
-                qk1_1 = rr.vmaxs(rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk1_1 = rr.vmaxs(
+                    rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc1_1 = rr.vmadd(qk1_1, w1, acc1_1, mask=mask16)
             acc0_0 = rr.vadds(acc0_0, 0.0, mask=mask16)
             bits0_0 = rr.vreinterpret(acc0_0, dtypes.uint16)
@@ -3081,14 +3353,24 @@ class QliVector:
             negative0_0 = rr.veqs(sign0_0, 0x8000, mask=mask16)
             positive_key0_0 = rr.vbitwise_xor(bits0_0, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key0_0 = rr.vbitwise_xor(bits0_0, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.full_key_cache, 0 * CACHE_TOKENS + dtypes.int32(workspace_offset) + 0 * 128, rr.vselect(negative_key0_0, positive_key0_0, cond_mask=negative0_0), mask16)
+            rr.vstore(
+                self.full_key_cache,
+                0 * CACHE_TOKENS + dtypes.int32(workspace_offset) + 0 * 128,
+                rr.vselect(negative_key0_0, positive_key0_0, cond_mask=negative0_0),
+                mask16,
+            )
             acc0_1 = rr.vadds(acc0_1, 0.0, mask=mask16)
             bits0_1 = rr.vreinterpret(acc0_1, dtypes.uint16)
             sign0_1 = rr.vbitwise_and(bits0_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative0_1 = rr.veqs(sign0_1, 0x8000, mask=mask16)
             positive_key0_1 = rr.vbitwise_xor(bits0_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key0_1 = rr.vbitwise_xor(bits0_1, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.full_key_cache, 0 * CACHE_TOKENS + dtypes.int32(workspace_offset) + 1 * 128, rr.vselect(negative_key0_1, positive_key0_1, cond_mask=negative0_1), mask16)
+            rr.vstore(
+                self.full_key_cache,
+                0 * CACHE_TOKENS + dtypes.int32(workspace_offset) + 1 * 128,
+                rr.vselect(negative_key0_1, positive_key0_1, cond_mask=negative0_1),
+                mask16,
+            )
             h0 = rr.vselect(zero_hist, rr.vload(hist, 0), cond_mask=reset16)
             h1 = rr.vselect(zero_hist, rr.vload(hist, 256), cond_mask=reset16)
             key_high = rr.vshr(rr.vselect(negative_key0_0, positive_key0_0, cond_mask=negative0_0), 8, mask=mask16)
@@ -3110,14 +3392,24 @@ class QliVector:
             negative1_0 = rr.veqs(sign1_0, 0x8000, mask=mask16)
             positive_key1_0 = rr.vbitwise_xor(bits1_0, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key1_0 = rr.vbitwise_xor(bits1_0, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.full_key_cache, 1 * CACHE_TOKENS + dtypes.int32(workspace_offset) + 0 * 128, rr.vselect(negative_key1_0, positive_key1_0, cond_mask=negative1_0), mask16)
+            rr.vstore(
+                self.full_key_cache,
+                1 * CACHE_TOKENS + dtypes.int32(workspace_offset) + 0 * 128,
+                rr.vselect(negative_key1_0, positive_key1_0, cond_mask=negative1_0),
+                mask16,
+            )
             acc1_1 = rr.vadds(acc1_1, 0.0, mask=mask16)
             bits1_1 = rr.vreinterpret(acc1_1, dtypes.uint16)
             sign1_1 = rr.vbitwise_and(bits1_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative1_1 = rr.veqs(sign1_1, 0x8000, mask=mask16)
             positive_key1_1 = rr.vbitwise_xor(bits1_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key1_1 = rr.vbitwise_xor(bits1_1, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.full_key_cache, 1 * CACHE_TOKENS + dtypes.int32(workspace_offset) + 1 * 128, rr.vselect(negative_key1_1, positive_key1_1, cond_mask=negative1_1), mask16)
+            rr.vstore(
+                self.full_key_cache,
+                1 * CACHE_TOKENS + dtypes.int32(workspace_offset) + 1 * 128,
+                rr.vselect(negative_key1_1, positive_key1_1, cond_mask=negative1_1),
+                mask16,
+            )
             h0 = rr.vselect(zero_hist, rr.vload(hist, 512), cond_mask=reset16)
             h1 = rr.vselect(zero_hist, rr.vload(hist, 768), cond_mask=reset16)
             key_high = rr.vshr(rr.vselect(negative_key1_0, positive_key1_0, cond_mask=negative1_0), 8, mask=mask16)
@@ -3139,7 +3431,7 @@ class QliVector:
     def _score_three(self, qk_handoff, group_count):
         with vf(mode="raw"):
             mask16 = rr.update_mask(128, elem_bits=16)[0]
-            weight_mask = rr.update_mask(self.n1, elem_bits=32)[0]
+            weight_mask = rr.update_mask(self.n1, elem_bits=32)[0]  # noqa: F841
             bf16_weight0 = rr.vload(self.packed_weight, 0 * 128)
             acc0_0 = rr.vdups(0.0, dtypes.bfloat16, mask=mask16)
             acc0_1 = rr.vdups(0.0, dtypes.bfloat16, mask=mask16)
@@ -3154,17 +3446,41 @@ class QliVector:
                 w0 = rr.vgather_reg(bf16_weight0, lane)
                 w1 = rr.vgather_reg(bf16_weight1, lane)
                 w2 = rr.vgather_reg(bf16_weight2, lane)
-                qk0_0 = rr.vmaxs(rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk0_0 = rr.vmaxs(
+                    rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc0_0 = rr.vmadd(qk0_0, w0, acc0_0, mask=mask16)
-                qk0_1 = rr.vmaxs(rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk0_1 = rr.vmaxs(
+                    rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc0_1 = rr.vmadd(qk0_1, w0, acc0_1, mask=mask16)
-                qk1_0 = rr.vmaxs(rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk1_0 = rr.vmaxs(
+                    rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc1_0 = rr.vmadd(qk1_0, w1, acc1_0, mask=mask16)
-                qk1_1 = rr.vmaxs(rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk1_1 = rr.vmaxs(
+                    rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc1_1 = rr.vmadd(qk1_1, w1, acc1_1, mask=mask16)
-                qk2_0 = rr.vmaxs(rr.vload(qk_handoff, (2 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk2_0 = rr.vmaxs(
+                    rr.vload(qk_handoff, (2 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc2_0 = rr.vmadd(qk2_0, w2, acc2_0, mask=mask16)
-                qk2_1 = rr.vmaxs(rr.vload(qk_handoff, (2 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk2_1 = rr.vmaxs(
+                    rr.vload(qk_handoff, (2 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc2_1 = rr.vmadd(qk2_1, w2, acc2_1, mask=mask16)
             acc0_0 = rr.vadds(acc0_0, 0.0, mask=mask16)
             if self.candidate_enabled:
@@ -3174,7 +3490,12 @@ class QliVector:
             negative0_0 = rr.veqs(sign0_0, 0x8000, mask=mask16)
             positive_key0_0 = rr.vbitwise_xor(bits0_0, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key0_0 = rr.vbitwise_xor(bits0_0, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.key_ub, 0 * QK_COLUMNS + 0 * 128, rr.vselect(negative_key0_0, positive_key0_0, cond_mask=negative0_0), mask16)
+            rr.vstore(
+                self.key_ub,
+                0 * QK_COLUMNS + 0 * 128,
+                rr.vselect(negative_key0_0, positive_key0_0, cond_mask=negative0_0),
+                mask16,
+            )
             acc0_1 = rr.vadds(acc0_1, 0.0, mask=mask16)
             if self.candidate_enabled:
                 rr.vstore(self.score_ub, 0 * QK_COLUMNS + 1 * 128, acc0_1, mask16)
@@ -3183,7 +3504,12 @@ class QliVector:
             negative0_1 = rr.veqs(sign0_1, 0x8000, mask=mask16)
             positive_key0_1 = rr.vbitwise_xor(bits0_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key0_1 = rr.vbitwise_xor(bits0_1, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.key_ub, 0 * QK_COLUMNS + 1 * 128, rr.vselect(negative_key0_1, positive_key0_1, cond_mask=negative0_1), mask16)
+            rr.vstore(
+                self.key_ub,
+                0 * QK_COLUMNS + 1 * 128,
+                rr.vselect(negative_key0_1, positive_key0_1, cond_mask=negative0_1),
+                mask16,
+            )
             acc1_0 = rr.vadds(acc1_0, 0.0, mask=mask16)
             if self.candidate_enabled:
                 rr.vstore(self.score_ub, 1 * QK_COLUMNS + 0 * 128, acc1_0, mask16)
@@ -3192,7 +3518,12 @@ class QliVector:
             negative1_0 = rr.veqs(sign1_0, 0x8000, mask=mask16)
             positive_key1_0 = rr.vbitwise_xor(bits1_0, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key1_0 = rr.vbitwise_xor(bits1_0, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.key_ub, 1 * QK_COLUMNS + 0 * 128, rr.vselect(negative_key1_0, positive_key1_0, cond_mask=negative1_0), mask16)
+            rr.vstore(
+                self.key_ub,
+                1 * QK_COLUMNS + 0 * 128,
+                rr.vselect(negative_key1_0, positive_key1_0, cond_mask=negative1_0),
+                mask16,
+            )
             acc1_1 = rr.vadds(acc1_1, 0.0, mask=mask16)
             if self.candidate_enabled:
                 rr.vstore(self.score_ub, 1 * QK_COLUMNS + 1 * 128, acc1_1, mask16)
@@ -3201,7 +3532,12 @@ class QliVector:
             negative1_1 = rr.veqs(sign1_1, 0x8000, mask=mask16)
             positive_key1_1 = rr.vbitwise_xor(bits1_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key1_1 = rr.vbitwise_xor(bits1_1, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.key_ub, 1 * QK_COLUMNS + 1 * 128, rr.vselect(negative_key1_1, positive_key1_1, cond_mask=negative1_1), mask16)
+            rr.vstore(
+                self.key_ub,
+                1 * QK_COLUMNS + 1 * 128,
+                rr.vselect(negative_key1_1, positive_key1_1, cond_mask=negative1_1),
+                mask16,
+            )
             acc2_0 = rr.vadds(acc2_0, 0.0, mask=mask16)
             if self.candidate_enabled:
                 rr.vstore(self.score_ub, 2 * QK_COLUMNS + 0 * 128, acc2_0, mask16)
@@ -3210,7 +3546,12 @@ class QliVector:
             negative2_0 = rr.veqs(sign2_0, 0x8000, mask=mask16)
             positive_key2_0 = rr.vbitwise_xor(bits2_0, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key2_0 = rr.vbitwise_xor(bits2_0, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.key_ub, 2 * QK_COLUMNS + 0 * 128, rr.vselect(negative_key2_0, positive_key2_0, cond_mask=negative2_0), mask16)
+            rr.vstore(
+                self.key_ub,
+                2 * QK_COLUMNS + 0 * 128,
+                rr.vselect(negative_key2_0, positive_key2_0, cond_mask=negative2_0),
+                mask16,
+            )
             acc2_1 = rr.vadds(acc2_1, 0.0, mask=mask16)
             if self.candidate_enabled:
                 rr.vstore(self.score_ub, 2 * QK_COLUMNS + 1 * 128, acc2_1, mask16)
@@ -3219,17 +3560,23 @@ class QliVector:
             negative2_1 = rr.veqs(sign2_1, 0x8000, mask=mask16)
             positive_key2_1 = rr.vbitwise_xor(bits2_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key2_1 = rr.vbitwise_xor(bits2_1, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.key_ub, 2 * QK_COLUMNS + 1 * 128, rr.vselect(negative_key2_1, positive_key2_1, cond_mask=negative2_1), mask16)
+            rr.vstore(
+                self.key_ub,
+                2 * QK_COLUMNS + 1 * 128,
+                rr.vselect(negative_key2_1, positive_key2_1, cond_mask=negative2_1),
+                mask16,
+            )
             rr.vmem_bar("vst_vld")
-
 
     @jit
     def _score_three_hist(self, qk_handoff, group_count, hist, workspace_offset, valid0, valid1, valid2):
         with vf(mode="raw"):
             mask16 = rr.update_mask(128, elem_bits=16)[0]
             zero_hist = rr.vdups(0, dtypes.uint16, mask=mask16)
-            reset16 = rr.veqs(rr.vdups(dtypes.int32(workspace_offset < 512), dtypes.uint16, mask=mask16), 1, mask=mask16)
-            weight_mask = rr.update_mask(self.n1, elem_bits=32)[0]
+            reset16 = rr.veqs(
+                rr.vdups(dtypes.int32(workspace_offset < 512), dtypes.uint16, mask=mask16), 1, mask=mask16
+            )
+            weight_mask = rr.update_mask(self.n1, elem_bits=32)[0]  # noqa: F841
             bf16_weight0 = rr.vload(self.packed_weight, 0 * 128)
             acc0_0 = rr.vdups(0.0, dtypes.bfloat16, mask=mask16)
             acc0_1 = rr.vdups(0.0, dtypes.bfloat16, mask=mask16)
@@ -3244,17 +3591,41 @@ class QliVector:
                 w0 = rr.vgather_reg(bf16_weight0, lane)
                 w1 = rr.vgather_reg(bf16_weight1, lane)
                 w2 = rr.vgather_reg(bf16_weight2, lane)
-                qk0_0 = rr.vmaxs(rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk0_0 = rr.vmaxs(
+                    rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc0_0 = rr.vmadd(qk0_0, w0, acc0_0, mask=mask16)
-                qk0_1 = rr.vmaxs(rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk0_1 = rr.vmaxs(
+                    rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc0_1 = rr.vmadd(qk0_1, w0, acc0_1, mask=mask16)
-                qk1_0 = rr.vmaxs(rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk1_0 = rr.vmaxs(
+                    rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc1_0 = rr.vmadd(qk1_0, w1, acc1_0, mask=mask16)
-                qk1_1 = rr.vmaxs(rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk1_1 = rr.vmaxs(
+                    rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc1_1 = rr.vmadd(qk1_1, w1, acc1_1, mask=mask16)
-                qk2_0 = rr.vmaxs(rr.vload(qk_handoff, (2 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk2_0 = rr.vmaxs(
+                    rr.vload(qk_handoff, (2 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc2_0 = rr.vmadd(qk2_0, w2, acc2_0, mask=mask16)
-                qk2_1 = rr.vmaxs(rr.vload(qk_handoff, (2 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk2_1 = rr.vmaxs(
+                    rr.vload(qk_handoff, (2 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc2_1 = rr.vmadd(qk2_1, w2, acc2_1, mask=mask16)
             acc0_0 = rr.vadds(acc0_0, 0.0, mask=mask16)
             bits0_0 = rr.vreinterpret(acc0_0, dtypes.uint16)
@@ -3262,14 +3633,24 @@ class QliVector:
             negative0_0 = rr.veqs(sign0_0, 0x8000, mask=mask16)
             positive_key0_0 = rr.vbitwise_xor(bits0_0, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key0_0 = rr.vbitwise_xor(bits0_0, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.key_ub, 0 * QK_COLUMNS + 0 * 128, rr.vselect(negative_key0_0, positive_key0_0, cond_mask=negative0_0), mask16)
+            rr.vstore(
+                self.key_ub,
+                0 * QK_COLUMNS + 0 * 128,
+                rr.vselect(negative_key0_0, positive_key0_0, cond_mask=negative0_0),
+                mask16,
+            )
             acc0_1 = rr.vadds(acc0_1, 0.0, mask=mask16)
             bits0_1 = rr.vreinterpret(acc0_1, dtypes.uint16)
             sign0_1 = rr.vbitwise_and(bits0_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative0_1 = rr.veqs(sign0_1, 0x8000, mask=mask16)
             positive_key0_1 = rr.vbitwise_xor(bits0_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key0_1 = rr.vbitwise_xor(bits0_1, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.key_ub, 0 * QK_COLUMNS + 1 * 128, rr.vselect(negative_key0_1, positive_key0_1, cond_mask=negative0_1), mask16)
+            rr.vstore(
+                self.key_ub,
+                0 * QK_COLUMNS + 1 * 128,
+                rr.vselect(negative_key0_1, positive_key0_1, cond_mask=negative0_1),
+                mask16,
+            )
             h0 = rr.vselect(zero_hist, rr.vload(hist, 0), cond_mask=reset16)
             h1 = rr.vselect(zero_hist, rr.vload(hist, 256), cond_mask=reset16)
             key_high = rr.vshr(rr.vselect(negative_key0_0, positive_key0_0, cond_mask=negative0_0), 8, mask=mask16)
@@ -3291,14 +3672,24 @@ class QliVector:
             negative1_0 = rr.veqs(sign1_0, 0x8000, mask=mask16)
             positive_key1_0 = rr.vbitwise_xor(bits1_0, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key1_0 = rr.vbitwise_xor(bits1_0, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.key_ub, 1 * QK_COLUMNS + 0 * 128, rr.vselect(negative_key1_0, positive_key1_0, cond_mask=negative1_0), mask16)
+            rr.vstore(
+                self.key_ub,
+                1 * QK_COLUMNS + 0 * 128,
+                rr.vselect(negative_key1_0, positive_key1_0, cond_mask=negative1_0),
+                mask16,
+            )
             acc1_1 = rr.vadds(acc1_1, 0.0, mask=mask16)
             bits1_1 = rr.vreinterpret(acc1_1, dtypes.uint16)
             sign1_1 = rr.vbitwise_and(bits1_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative1_1 = rr.veqs(sign1_1, 0x8000, mask=mask16)
             positive_key1_1 = rr.vbitwise_xor(bits1_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key1_1 = rr.vbitwise_xor(bits1_1, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.key_ub, 1 * QK_COLUMNS + 1 * 128, rr.vselect(negative_key1_1, positive_key1_1, cond_mask=negative1_1), mask16)
+            rr.vstore(
+                self.key_ub,
+                1 * QK_COLUMNS + 1 * 128,
+                rr.vselect(negative_key1_1, positive_key1_1, cond_mask=negative1_1),
+                mask16,
+            )
             h0 = rr.vselect(zero_hist, rr.vload(hist, 512), cond_mask=reset16)
             h1 = rr.vselect(zero_hist, rr.vload(hist, 768), cond_mask=reset16)
             key_high = rr.vshr(rr.vselect(negative_key1_0, positive_key1_0, cond_mask=negative1_0), 8, mask=mask16)
@@ -3320,14 +3711,24 @@ class QliVector:
             negative2_0 = rr.veqs(sign2_0, 0x8000, mask=mask16)
             positive_key2_0 = rr.vbitwise_xor(bits2_0, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key2_0 = rr.vbitwise_xor(bits2_0, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.key_ub, 2 * QK_COLUMNS + 0 * 128, rr.vselect(negative_key2_0, positive_key2_0, cond_mask=negative2_0), mask16)
+            rr.vstore(
+                self.key_ub,
+                2 * QK_COLUMNS + 0 * 128,
+                rr.vselect(negative_key2_0, positive_key2_0, cond_mask=negative2_0),
+                mask16,
+            )
             acc2_1 = rr.vadds(acc2_1, 0.0, mask=mask16)
             bits2_1 = rr.vreinterpret(acc2_1, dtypes.uint16)
             sign2_1 = rr.vbitwise_and(bits2_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative2_1 = rr.veqs(sign2_1, 0x8000, mask=mask16)
             positive_key2_1 = rr.vbitwise_xor(bits2_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key2_1 = rr.vbitwise_xor(bits2_1, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.key_ub, 2 * QK_COLUMNS + 1 * 128, rr.vselect(negative_key2_1, positive_key2_1, cond_mask=negative2_1), mask16)
+            rr.vstore(
+                self.key_ub,
+                2 * QK_COLUMNS + 1 * 128,
+                rr.vselect(negative_key2_1, positive_key2_1, cond_mask=negative2_1),
+                mask16,
+            )
             h0 = rr.vselect(zero_hist, rr.vload(hist, 1024), cond_mask=reset16)
             h1 = rr.vselect(zero_hist, rr.vload(hist, 1280), cond_mask=reset16)
             key_high = rr.vshr(rr.vselect(negative_key2_0, positive_key2_0, cond_mask=negative2_0), 8, mask=mask16)
@@ -3350,8 +3751,10 @@ class QliVector:
         with vf(mode="raw"):
             mask16 = rr.update_mask(128, elem_bits=16)[0]
             zero_hist = rr.vdups(0, dtypes.uint16, mask=mask16)
-            reset16 = rr.veqs(rr.vdups(dtypes.int32(workspace_offset < 512), dtypes.uint16, mask=mask16), 1, mask=mask16)
-            weight_mask = rr.update_mask(self.n1, elem_bits=32)[0]
+            reset16 = rr.veqs(
+                rr.vdups(dtypes.int32(workspace_offset < 512), dtypes.uint16, mask=mask16), 1, mask=mask16
+            )
+            weight_mask = rr.update_mask(self.n1, elem_bits=32)[0]  # noqa: F841
             bf16_weight0 = rr.vload(self.packed_weight, 0 * 128)
             acc0_0 = rr.vdups(0.0, dtypes.bfloat16, mask=mask16)
             acc0_1 = rr.vdups(0.0, dtypes.bfloat16, mask=mask16)
@@ -3366,17 +3769,41 @@ class QliVector:
                 w0 = rr.vgather_reg(bf16_weight0, lane)
                 w1 = rr.vgather_reg(bf16_weight1, lane)
                 w2 = rr.vgather_reg(bf16_weight2, lane)
-                qk0_0 = rr.vmaxs(rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk0_0 = rr.vmaxs(
+                    rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc0_0 = rr.vmadd(qk0_0, w0, acc0_0, mask=mask16)
-                qk0_1 = rr.vmaxs(rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk0_1 = rr.vmaxs(
+                    rr.vload(qk_handoff, (0 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc0_1 = rr.vmadd(qk0_1, w0, acc0_1, mask=mask16)
-                qk1_0 = rr.vmaxs(rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk1_0 = rr.vmaxs(
+                    rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc1_0 = rr.vmadd(qk1_0, w1, acc1_0, mask=mask16)
-                qk1_1 = rr.vmaxs(rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk1_1 = rr.vmaxs(
+                    rr.vload(qk_handoff, (1 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc1_1 = rr.vmadd(qk1_1, w1, acc1_1, mask=mask16)
-                qk2_0 = rr.vmaxs(rr.vload(qk_handoff, (2 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk2_0 = rr.vmaxs(
+                    rr.vload(qk_handoff, (2 * self.n1 + group) * 256 + 0 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc2_0 = rr.vmadd(qk2_0, w2, acc2_0, mask=mask16)
-                qk2_1 = rr.vmaxs(rr.vload(qk_handoff, (2 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256), 0.0, mask=mask16)
+                qk2_1 = rr.vmaxs(
+                    rr.vload(qk_handoff, (2 * self.n1 + group) * 256 + 1 * (self.n1 * self.vec_rows) * 256),
+                    0.0,
+                    mask=mask16,
+                )
                 acc2_1 = rr.vmadd(qk2_1, w2, acc2_1, mask=mask16)
             acc0_0 = rr.vadds(acc0_0, 0.0, mask=mask16)
             bits0_0 = rr.vreinterpret(acc0_0, dtypes.uint16)
@@ -3384,14 +3811,24 @@ class QliVector:
             negative0_0 = rr.veqs(sign0_0, 0x8000, mask=mask16)
             positive_key0_0 = rr.vbitwise_xor(bits0_0, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key0_0 = rr.vbitwise_xor(bits0_0, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.full_key_cache, 0 * CACHE_TOKENS + dtypes.int32(workspace_offset) + 0 * 128, rr.vselect(negative_key0_0, positive_key0_0, cond_mask=negative0_0), mask16)
+            rr.vstore(
+                self.full_key_cache,
+                0 * CACHE_TOKENS + dtypes.int32(workspace_offset) + 0 * 128,
+                rr.vselect(negative_key0_0, positive_key0_0, cond_mask=negative0_0),
+                mask16,
+            )
             acc0_1 = rr.vadds(acc0_1, 0.0, mask=mask16)
             bits0_1 = rr.vreinterpret(acc0_1, dtypes.uint16)
             sign0_1 = rr.vbitwise_and(bits0_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative0_1 = rr.veqs(sign0_1, 0x8000, mask=mask16)
             positive_key0_1 = rr.vbitwise_xor(bits0_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key0_1 = rr.vbitwise_xor(bits0_1, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.full_key_cache, 0 * CACHE_TOKENS + dtypes.int32(workspace_offset) + 1 * 128, rr.vselect(negative_key0_1, positive_key0_1, cond_mask=negative0_1), mask16)
+            rr.vstore(
+                self.full_key_cache,
+                0 * CACHE_TOKENS + dtypes.int32(workspace_offset) + 1 * 128,
+                rr.vselect(negative_key0_1, positive_key0_1, cond_mask=negative0_1),
+                mask16,
+            )
             h0 = rr.vselect(zero_hist, rr.vload(hist, 0), cond_mask=reset16)
             h1 = rr.vselect(zero_hist, rr.vload(hist, 256), cond_mask=reset16)
             key_high = rr.vshr(rr.vselect(negative_key0_0, positive_key0_0, cond_mask=negative0_0), 8, mask=mask16)
@@ -3413,14 +3850,24 @@ class QliVector:
             negative1_0 = rr.veqs(sign1_0, 0x8000, mask=mask16)
             positive_key1_0 = rr.vbitwise_xor(bits1_0, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key1_0 = rr.vbitwise_xor(bits1_0, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.full_key_cache, 1 * CACHE_TOKENS + dtypes.int32(workspace_offset) + 0 * 128, rr.vselect(negative_key1_0, positive_key1_0, cond_mask=negative1_0), mask16)
+            rr.vstore(
+                self.full_key_cache,
+                1 * CACHE_TOKENS + dtypes.int32(workspace_offset) + 0 * 128,
+                rr.vselect(negative_key1_0, positive_key1_0, cond_mask=negative1_0),
+                mask16,
+            )
             acc1_1 = rr.vadds(acc1_1, 0.0, mask=mask16)
             bits1_1 = rr.vreinterpret(acc1_1, dtypes.uint16)
             sign1_1 = rr.vbitwise_and(bits1_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative1_1 = rr.veqs(sign1_1, 0x8000, mask=mask16)
             positive_key1_1 = rr.vbitwise_xor(bits1_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key1_1 = rr.vbitwise_xor(bits1_1, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.full_key_cache, 1 * CACHE_TOKENS + dtypes.int32(workspace_offset) + 1 * 128, rr.vselect(negative_key1_1, positive_key1_1, cond_mask=negative1_1), mask16)
+            rr.vstore(
+                self.full_key_cache,
+                1 * CACHE_TOKENS + dtypes.int32(workspace_offset) + 1 * 128,
+                rr.vselect(negative_key1_1, positive_key1_1, cond_mask=negative1_1),
+                mask16,
+            )
             h0 = rr.vselect(zero_hist, rr.vload(hist, 512), cond_mask=reset16)
             h1 = rr.vselect(zero_hist, rr.vload(hist, 768), cond_mask=reset16)
             key_high = rr.vshr(rr.vselect(negative_key1_0, positive_key1_0, cond_mask=negative1_0), 8, mask=mask16)
@@ -3442,14 +3889,24 @@ class QliVector:
             negative2_0 = rr.veqs(sign2_0, 0x8000, mask=mask16)
             positive_key2_0 = rr.vbitwise_xor(bits2_0, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key2_0 = rr.vbitwise_xor(bits2_0, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.full_key_cache, 2 * CACHE_TOKENS + dtypes.int32(workspace_offset) + 0 * 128, rr.vselect(negative_key2_0, positive_key2_0, cond_mask=negative2_0), mask16)
+            rr.vstore(
+                self.full_key_cache,
+                2 * CACHE_TOKENS + dtypes.int32(workspace_offset) + 0 * 128,
+                rr.vselect(negative_key2_0, positive_key2_0, cond_mask=negative2_0),
+                mask16,
+            )
             acc2_1 = rr.vadds(acc2_1, 0.0, mask=mask16)
             bits2_1 = rr.vreinterpret(acc2_1, dtypes.uint16)
             sign2_1 = rr.vbitwise_and(bits2_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative2_1 = rr.veqs(sign2_1, 0x8000, mask=mask16)
             positive_key2_1 = rr.vbitwise_xor(bits2_1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key2_1 = rr.vbitwise_xor(bits2_1, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-            rr.vstore(self.full_key_cache, 2 * CACHE_TOKENS + dtypes.int32(workspace_offset) + 1 * 128, rr.vselect(negative_key2_1, positive_key2_1, cond_mask=negative2_1), mask16)
+            rr.vstore(
+                self.full_key_cache,
+                2 * CACHE_TOKENS + dtypes.int32(workspace_offset) + 1 * 128,
+                rr.vselect(negative_key2_1, positive_key2_1, cond_mask=negative2_1),
+                mask16,
+            )
             h0 = rr.vselect(zero_hist, rr.vload(hist, 1024), cond_mask=reset16)
             h1 = rr.vselect(zero_hist, rr.vload(hist, 1280), cond_mask=reset16)
             key_high = rr.vshr(rr.vselect(negative_key2_0, positive_key2_0, cond_mask=negative2_0), 8, mask=mask16)
@@ -3466,8 +3923,6 @@ class QliVector:
             rr.vstore(hist, 1280, h1, mask16)
 
             rr.vmem_bar("vst_vld")
-
-
 
 
 class QliFusedKernel:
@@ -3507,10 +3962,8 @@ class QliFusedKernel:
         self.has_seqused_k = bool(has_seqused_k)
         self.has_cmp_residual_k = self.mask_mode == 3 and self.cmp_ratio != 1
         self.has_block_table = bool(has_block_table)
-        self.qk_slot0 = Buffer(MemLoc.UB, (self.tile_m, 128), dtypes.bfloat16,
-                               stride=(256, 1), addr=0)
-        self.qk_slot1 = Buffer(MemLoc.UB, (self.tile_m, 128), dtypes.bfloat16,
-                               stride=(256, 1), addr=256)
+        self.qk_slot0 = Buffer(MemLoc.UB, (self.tile_m, 128), dtypes.bfloat16, stride=(256, 1), addr=0)
+        self.qk_slot1 = Buffer(MemLoc.UB, (self.tile_m, 128), dtypes.bfloat16, stride=(256, 1), addr=256)
         self.cube = QliCube(pa_block_size, n1, query_rows)
         self.topk_workspace = QliRawTopKWorkspace(
             TOPK_TRUNK_LEN if self.cache_enabled else 16384,
@@ -3520,9 +3973,7 @@ class QliFusedKernel:
             ),
             pipelined=self.cache_enabled,
         )
-        self.topk = QliRawTopKSelector(
-            self.topk_count, self.topk_workspace
-        )
+        self.topk = QliRawTopKSelector(self.topk_count, self.topk_workspace)
         if self.candidate_enabled:
             self.candidate_topk = QliRawTopKSelector(
                 self.candidate_topk_count,
@@ -3534,13 +3985,27 @@ class QliFusedKernel:
             self.mask_mode,
             self.cmp_ratio,
             self.candidate_enabled,
-            self.candidate_topk_count, n1, query_rows,
+            self.candidate_topk_count,
+            n1,
+            query_rows,
             255488 if self.cache_enabled else self.tile_m * 512 + 12288,
             self.cache_enabled,
         )
         # Dedicated 512B-strided bank-separated histogram slots, main phase only.
-        self.hist_slot0 = Buffer(MemLoc.UB, (self.vec_rows * 2, 128), dtypes.uint16, stride=(256, 1), addr=251904 if self.cache_enabled else self.tile_m * 512 + 16384)
-        self.hist_slot1 = Buffer(MemLoc.UB, (self.vec_rows * 2, 128), dtypes.uint16, stride=(256, 1), addr=252160 if self.cache_enabled else self.tile_m * 512 + 16640)
+        self.hist_slot0 = Buffer(
+            MemLoc.UB,
+            (self.vec_rows * 2, 128),
+            dtypes.uint16,
+            stride=(256, 1),
+            addr=251904 if self.cache_enabled else self.tile_m * 512 + 16384,
+        )
+        self.hist_slot1 = Buffer(
+            MemLoc.UB,
+            (self.vec_rows * 2, 128),
+            dtypes.uint16,
+            stride=(256, 1),
+            addr=252160 if self.cache_enabled else self.tile_m * 512 + 16640,
+        )
         self.topk.hist_slot0 = self.hist_slot0
         self.topk.hist_slot1 = self.hist_slot1
         # Main phase: QK [0,98304), cached keys [98304,251904),
@@ -3550,16 +4015,21 @@ class QliFusedKernel:
             self.full_key_cache = Buffer(MemLoc.UB, (self.vec_rows, CACHE_TOKENS), dtypes.uint16, addr=98304)
             self.vector.full_key_cache = self.full_key_cache
             self.topk.cache_tmp = Buffer(MemLoc.UB, (CACHE_TOKENS,), dtypes.uint16, addr=0)
-            self.topk.cache_output_idx_stage = Channel(MemLoc.UB, (1, self.topk_count), dtypes.int32, depth=1, addr=52224)
-            self.topk.cache_output_value_bits_stage = Channel(MemLoc.UB, (1, self.topk_count), dtypes.uint16, depth=1, addr=54272)
-
+            self.topk.cache_output_idx_stage = Channel(
+                MemLoc.UB, (1, self.topk_count), dtypes.int32, depth=1, addr=52224
+            )
+            self.topk.cache_output_value_bits_stage = Channel(
+                MemLoc.UB, (1, self.topk_count), dtypes.uint16, depth=1, addr=54272
+            )
 
     @jit
     def _combine_hist(self, row):
         with vf(mode="raw"):
             mask = rr.update_mask(128, elem_bits=16)[0]
             h0 = rr.vadd(rr.vload(self.hist_slot0, row * 512), rr.vload(self.hist_slot1, row * 512), mask=mask)
-            h1 = rr.vadd(rr.vload(self.hist_slot0, row * 512 + 256), rr.vload(self.hist_slot1, row * 512 + 256), mask=mask)
+            h1 = rr.vadd(
+                rr.vload(self.hist_slot0, row * 512 + 256), rr.vload(self.hist_slot1, row * 512 + 256), mask=mask
+            )
             rr.vstore(self.topk_workspace.histogram, 0, h0, mask)
             rr.vstore(self.topk_workspace.histogram, 128, h1, mask)
             rr.vmem_bar("vst_vld")
@@ -3606,11 +4076,24 @@ class QliFusedKernel:
             stream_hist = dtypes.int32(tokens >= self.topk_count and tokens <= self.topk_workspace.max_trunk_len)
         cache_min_valid = actual_s2
         if self.mask_mode == 3:
-            cache_min_valid = max(0, min(actual_s2, (actual_s2 * self.cmp_ratio + cmp_residual - used_q + query_offset + 1) // self.cmp_ratio))
+            cache_min_valid = max(
+                0,
+                min(
+                    actual_s2, (actual_s2 * self.cmp_ratio + cmp_residual - used_q + query_offset + 1) // self.cmp_ratio
+                ),
+            )
         cache_task = dtypes.int32(0)
         if self.cache_enabled:
-            cache_task = dtypes.int32(self.topk_count == 512 and tokens >= self.topk_count and tokens <= CACHE_TOKENS and task_active_count == self.query_rows and task_span_count == self.query_rows and self.need_topk_values != 0 and dtypes.int64(cache_min_valid) - tile_begin * TILE_N >= self.topk_count)
-        token_tiles = tokens // TILE_N
+            cache_task = dtypes.int32(
+                self.topk_count == 512
+                and tokens >= self.topk_count
+                and tokens <= CACHE_TOKENS
+                and task_active_count == self.query_rows
+                and task_span_count == self.query_rows
+                and self.need_topk_values != 0
+                and dtypes.int64(cache_min_valid) - tile_begin * TILE_N >= self.topk_count
+            )
+        token_tiles = tokens // TILE_N  # noqa: F841
         candidate_tokens = tokens // CANDIDATE_BLOCK_SIZE
         vec_sync_intra_arrive(PIPE.V, 8)
         vec_sync_intra_arrive(PIPE.V, 9)
@@ -3621,9 +4104,16 @@ class QliFusedKernel:
                 cube_sync_intra_wait(PIPE.FIXPIPE, 24)
                 qk_write = self.qk_slot0
                 self.cube.compute_qk(
-                    key, key_scale, block_table, batch_idx, actual_s2,
-                    key_stride0, key_dequant_scale_stride0,
-                    self.has_block_table, token_tile, qk_write,
+                    key,
+                    key_scale,
+                    block_table,
+                    batch_idx,
+                    actual_s2,
+                    key_stride0,
+                    key_dequant_scale_stride0,
+                    self.has_block_table,
+                    token_tile,
+                    qk_write,
                 )
                 cube_sync_intra_arrive(PIPE.FIXPIPE, 8)
                 cube_sync_intra_arrive(PIPE.FIXPIPE, 24)
@@ -3658,9 +4148,16 @@ class QliFusedKernel:
                 cube_sync_intra_wait(PIPE.FIXPIPE, 25)
                 qk_write = self.qk_slot1
                 self.cube.compute_qk(
-                    key, key_scale, block_table, batch_idx, actual_s2,
-                    key_stride0, key_dequant_scale_stride0,
-                    self.has_block_table, token_tile, qk_write,
+                    key,
+                    key_scale,
+                    block_table,
+                    batch_idx,
+                    actual_s2,
+                    key_stride0,
+                    key_dequant_scale_stride0,
+                    self.has_block_table,
+                    token_tile,
+                    qk_write,
                 )
                 cube_sync_intra_arrive(PIPE.FIXPIPE, 9)
                 cube_sync_intra_arrive(PIPE.FIXPIPE, 25)
@@ -3700,16 +4197,10 @@ class QliFusedKernel:
         # JIT boundary.  It emits into this top-level kernel and does not
         # launch a second kernel.
         for row_in_subblock in dsl_range(self.query_rows // 2, unroll=1):
-            local_row = dtypes.int32(
-                get_subblock_id() * (self.query_rows // 2) + row_in_subblock
-            )
-            public_row = (
-                dtypes.int64(public_row_base) + dtypes.int64(local_row)
-            )
+            local_row = dtypes.int32(get_subblock_id() * (self.query_rows // 2) + row_in_subblock)
+            public_row = dtypes.int64(public_row_base) + dtypes.int64(local_row)
             workspace_row = (
-                workspace_task_idx * self.query_rows
-                + get_subblock_id() * (self.query_rows // 2)
-                + row_in_subblock
+                workspace_task_idx * self.query_rows + get_subblock_id() * (self.query_rows // 2) + row_in_subblock
             )
             valid_s2 = actual_s2
             if self.mask_mode == 3:
@@ -3718,13 +4209,7 @@ class QliFusedKernel:
                     + dtypes.int32(get_subblock_id()) * (self.query_rows // 2)
                     + dtypes.int32(row_in_subblock)
                 )
-                valid_s2 = (
-                    actual_s2 * self.cmp_ratio
-                    + cmp_residual
-                    - used_q
-                    + query_in_batch
-                    + 1
-                ) // self.cmp_ratio
+                valid_s2 = (actual_s2 * self.cmp_ratio + cmp_residual - used_q + query_in_batch + 1) // self.cmp_ratio
                 if valid_s2 < 0:
                     valid_s2 = 0
                 if valid_s2 > actual_s2:
@@ -3739,8 +4224,10 @@ class QliFusedKernel:
             if local_row < task_span_count:
                 output_offset = dtypes.int32(0)
                 if self.output_offset_address != 0 and row_ld == 0:
-                    offsets = make_tensor(make_pointer(dtypes.int32, dtypes.int64(self.output_offset_address), MemLoc.GM),
-                        make_layout((weights.shape[0], 1), stride=(1, 1)))
+                    offsets = make_tensor(
+                        make_pointer(dtypes.int32, dtypes.int64(self.output_offset_address), MemLoc.GM),
+                        make_layout((weights.shape[0], 1), stride=(1, 1)),
+                    )
                     output_offset = offsets[public_row, 0]
                 if self.cache_enabled and cache_task:
                     self.topk._select_row_cached_ub(
@@ -3782,9 +4269,7 @@ class QliFusedKernel:
                         row_in_subblock,
                     )
                 if self.candidate_enabled:
-                    valid_candidate_count = (
-                        valid_s2 + CANDIDATE_BLOCK_SIZE - 1
-                    ) // CANDIDATE_BLOCK_SIZE
+                    valid_candidate_count = (valid_s2 + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
                     self.candidate_topk.select_row(
                         _offset_view(candidate_key_out, (workspace_row, 0)),
                         candidate_tokens,
@@ -3868,16 +4353,10 @@ class QliFusedKernel:
             )
         else:
             for row_in_subblock in range_constexpr(self.query_rows // 2):
-                local_row = dtypes.int32(
-                    get_subblock_id() * (self.query_rows // 2) + row_in_subblock
-                )
-                public_row = (
-                    dtypes.int64(public_row_base) + dtypes.int64(local_row)
-                )
-                workspace_row = (
-                    workspace_task_idx * self.query_rows
-                    + get_subblock_id() * (self.query_rows // 2)
-                    + row_in_subblock
+                local_row = dtypes.int32(get_subblock_id() * (self.query_rows // 2) + row_in_subblock)
+                public_row = dtypes.int64(public_row_base) + dtypes.int64(local_row)
+                workspace_row = (  # noqa: F841
+                    workspace_task_idx * self.query_rows + get_subblock_id() * (self.query_rows // 2) + row_in_subblock
                 )
                 if local_row < task_span_count:
                     self.topk.store_empty_row(
@@ -3906,9 +4385,7 @@ class QliFusedKernel:
                             ),
                         )
             if self.candidate_enabled:
-                self.vector.store_empty_candidate_lengths(
-                    candidate_length, public_row_base, task_span_count
-                )
+                self.vector.store_empty_candidate_lengths(candidate_length, public_row_base, task_span_count)
 
     @jit
     def __call__(
@@ -3940,8 +4417,14 @@ class QliFusedKernel:
         metadata: Tensor,
         splits,
         task_count,
-        partial_idx_address, partial_bits_address, partial_candidate_address, partial_candidate_bits_address,
-        final_idx_address, final_bits_address, final_candidate_address, final_candidate_bits_address,
+        partial_idx_address,
+        partial_bits_address,
+        partial_candidate_address,
+        partial_candidate_bits_address,
+        final_idx_address,
+        final_bits_address,
+        final_candidate_address,
+        final_candidate_bits_address,
     ):
         worker = dtypes.int64(get_block_idx())
         workspace_cursor = dtypes.int64(metadata[worker, 7])
@@ -3976,7 +4459,14 @@ class QliFusedKernel:
                     active = min(span, max(dtypes.int32(0), used_q - query_offset))
                     visible = actual_s2
                     if self.mask_mode == 3:
-                        visible = min(actual_s2, max(dtypes.int32(0), (actual_s2 * self.cmp_ratio + remainder - used_q + query_offset + active) // self.cmp_ratio))
+                        visible = min(
+                            actual_s2,
+                            max(
+                                dtypes.int32(0),
+                                (actual_s2 * self.cmp_ratio + remainder - used_q + query_offset + active)
+                                // self.cmp_ratio,
+                            ),
+                        )
                     if active == 0:
                         visible = dtypes.int32(0)
                     tile_begin = dtypes.int64(0)
@@ -3986,42 +4476,127 @@ class QliFusedKernel:
                     if batch_idx == last_b and m_idx == dtypes.int64(metadata[worker, 5]):
                         tile_end = min(tile_end, dtypes.int64(metadata[worker, 6]))
                     row_ld = tile_begin > 0 or tile_end < (dtypes.int64(visible) + TILE_N - 1) // TILE_N
-                    delta = (workspace_cursor * self.query_rows - dtypes.int64(public_row))
-                    idx_address = dtypes.int64(dyn_select(row_ld, dtypes.int64(partial_idx_address)+delta*self.topk_count*4, final_idx_address))
-                    bits_address = dtypes.int64(dyn_select(row_ld, dtypes.int64(partial_bits_address)+delta*self.topk_count*2, final_bits_address))
-                    candidate_address = dtypes.int64(dyn_select(row_ld, dtypes.int64(partial_candidate_address)+delta*self.candidate_topk_count*4, final_candidate_address))
-                    candidate_bits_address = dtypes.int64(dyn_select(row_ld, dtypes.int64(partial_candidate_bits_address)+delta*self.candidate_topk_count*2, final_candidate_bits_address))
-                    row_indices = make_tensor(make_pointer(dtypes.int32,idx_address,MemLoc.GM),make_layout((total_q,self.topk_count),stride=(self.topk_count,1)))
-                    row_bits = make_tensor(make_pointer(dtypes.uint16,bits_address,MemLoc.GM),make_layout((total_q,self.topk_count),stride=(self.topk_count,1)))
-                    row_candidates = make_tensor(make_pointer(dtypes.int32,candidate_address,MemLoc.GM),make_layout((total_q,self.candidate_topk_count),stride=(self.candidate_topk_count,1)))
-                    row_candidate_bits = make_tensor(make_pointer(dtypes.uint16,candidate_bits_address,MemLoc.GM),make_layout((total_q,self.candidate_topk_count),stride=(self.candidate_topk_count,1)))
+                    delta = workspace_cursor * self.query_rows - dtypes.int64(public_row)
+                    idx_address = dtypes.int64(
+                        dyn_select(
+                            row_ld, dtypes.int64(partial_idx_address) + delta * self.topk_count * 4, final_idx_address
+                        )
+                    )
+                    bits_address = dtypes.int64(
+                        dyn_select(
+                            row_ld, dtypes.int64(partial_bits_address) + delta * self.topk_count * 2, final_bits_address
+                        )
+                    )
+                    candidate_address = dtypes.int64(
+                        dyn_select(
+                            row_ld,
+                            dtypes.int64(partial_candidate_address) + delta * self.candidate_topk_count * 4,
+                            final_candidate_address,
+                        )
+                    )
+                    candidate_bits_address = dtypes.int64(
+                        dyn_select(
+                            row_ld,
+                            dtypes.int64(partial_candidate_bits_address) + delta * self.candidate_topk_count * 2,
+                            final_candidate_bits_address,
+                        )
+                    )
+                    row_indices = make_tensor(
+                        make_pointer(dtypes.int32, idx_address, MemLoc.GM),
+                        make_layout((total_q, self.topk_count), stride=(self.topk_count, 1)),
+                    )
+                    row_bits = make_tensor(
+                        make_pointer(dtypes.uint16, bits_address, MemLoc.GM),
+                        make_layout((total_q, self.topk_count), stride=(self.topk_count, 1)),
+                    )
+                    row_candidates = make_tensor(
+                        make_pointer(dtypes.int32, candidate_address, MemLoc.GM),
+                        make_layout((total_q, self.candidate_topk_count), stride=(self.candidate_topk_count, 1)),
+                    )
+                    row_candidate_bits = make_tensor(
+                        make_pointer(dtypes.uint16, candidate_bits_address, MemLoc.GM),
+                        make_layout((total_q, self.candidate_topk_count), stride=(self.candidate_topk_count, 1)),
+                    )
                     self._compute_task(
-                        query, key, weights, query_scale, key_scale,
-                        key_stride0, key_dequant_scale_stride0, block_table,
-                        key_out, candidate_key_out,
+                        query,
+                        key,
+                        weights,
+                        query_scale,
+                        key_scale,
+                        key_stride0,
+                        key_dequant_scale_stride0,
+                        block_table,
+                        key_out,
+                        candidate_key_out,
                         row_indices,
                         row_bits,
                         row_candidates,
                         row_candidate_bits,
                         candidate_length,
-                        batch_idx, public_row, query_offset, span, active, used_q,
-                        actual_s2, remainder, worker, tokens, tile_begin, tile_end, visible, row_ld)
+                        batch_idx,
+                        public_row,
+                        query_offset,
+                        span,
+                        active,
+                        used_q,
+                        actual_s2,
+                        remainder,
+                        worker,
+                        tokens,
+                        tile_begin,
+                        tile_end,
+                        visible,
+                        row_ld,
+                    )
                     # FD tasks cover active rows only. The first partial owner
                     # initializes inactive public rows directly in the final output.
                     if row_ld and tile_begin == 0:
-                        final_indices = make_tensor(make_pointer(dtypes.int32,dtypes.int64(final_idx_address),MemLoc.GM),make_layout((total_q,self.topk_count),stride=(self.topk_count,1)))
-                        final_bits = make_tensor(make_pointer(dtypes.uint16,dtypes.int64(final_bits_address),MemLoc.GM),make_layout((total_q,self.topk_count),stride=(self.topk_count,1)))
-                        final_candidates = make_tensor(make_pointer(dtypes.int32,dtypes.int64(final_candidate_address),MemLoc.GM),make_layout((total_q,self.candidate_topk_count),stride=(self.candidate_topk_count,1)))
-                        final_candidate_bits = make_tensor(make_pointer(dtypes.uint16,dtypes.int64(final_candidate_bits_address),MemLoc.GM),make_layout((total_q,self.candidate_topk_count),stride=(self.candidate_topk_count,1)))
+                        final_indices = make_tensor(
+                            make_pointer(dtypes.int32, dtypes.int64(final_idx_address), MemLoc.GM),
+                            make_layout((total_q, self.topk_count), stride=(self.topk_count, 1)),
+                        )
+                        final_bits = make_tensor(
+                            make_pointer(dtypes.uint16, dtypes.int64(final_bits_address), MemLoc.GM),
+                            make_layout((total_q, self.topk_count), stride=(self.topk_count, 1)),
+                        )
+                        final_candidates = make_tensor(
+                            make_pointer(dtypes.int32, dtypes.int64(final_candidate_address), MemLoc.GM),
+                            make_layout((total_q, self.candidate_topk_count), stride=(self.candidate_topk_count, 1)),
+                        )
+                        final_candidate_bits = make_tensor(
+                            make_pointer(dtypes.uint16, dtypes.int64(final_candidate_bits_address), MemLoc.GM),
+                            make_layout((total_q, self.candidate_topk_count), stride=(self.candidate_topk_count, 1)),
+                        )
                         for local in range_constexpr(self.query_rows // 2):
                             r = dtypes.int32(get_subblock_id() * (self.query_rows // 2) + local)
                             if r >= active and r < span:
-                                self.topk.store_empty_row(tile_view(final_indices,(1,self.topk_count),(dtypes.int64(public_row)+dtypes.int64(r),0)),tile_view(final_bits,(1,self.topk_count),(dtypes.int64(public_row)+dtypes.int64(r),0)))
+                                self.topk.store_empty_row(
+                                    tile_view(
+                                        final_indices,
+                                        (1, self.topk_count),
+                                        (dtypes.int64(public_row) + dtypes.int64(r), 0),
+                                    ),
+                                    tile_view(
+                                        final_bits,
+                                        (1, self.topk_count),
+                                        (dtypes.int64(public_row) + dtypes.int64(r), 0),
+                                    ),
+                                )
                                 if self.candidate_enabled:
-                                    self.candidate_topk.store_empty_row(tile_view(final_candidates,(1,self.candidate_topk_count),(dtypes.int64(public_row)+dtypes.int64(r),0)),tile_view(final_candidate_bits,(1,self.candidate_topk_count),(dtypes.int64(public_row)+dtypes.int64(r),0)))
+                                    self.candidate_topk.store_empty_row(
+                                        tile_view(
+                                            final_candidates,
+                                            (1, self.candidate_topk_count),
+                                            (dtypes.int64(public_row) + dtypes.int64(r), 0),
+                                        ),
+                                        tile_view(
+                                            final_candidate_bits,
+                                            (1, self.candidate_topk_count),
+                                            (dtypes.int64(public_row) + dtypes.int64(r), 0),
+                                        ),
+                                    )
                     if row_ld:
                         workspace_cursor += 1
-
 
 
 _COMPILED_KERNEL: dict[tuple[object, ...], object] = {}
@@ -4093,15 +4668,38 @@ def _build_compiled_fused_runner(
         output_offset_address,
     ):
         ld_enabled = metadata[36, 0] != 0
-        final_sparse_indices = make_tensor(make_pointer(dtypes.int32, dtypes.int64(final_sparse_indices_address), MemLoc.GM),
-            make_layout((total_q, topk), stride=(topk, 1)))
-        sparse_indices = make_tensor(make_pointer(dtypes.int32,dtypes.int64(sparse_indices_address),MemLoc.GM),make_layout((64*query_tile_rows,topk),stride=(topk,1)))
-        sparse_value_bits = make_tensor(make_pointer(dtypes.uint16,dtypes.int64(sparse_value_bits_address),MemLoc.GM),make_layout((64*query_tile_rows,topk),stride=(topk,1)))
-        final_sparse_bits = make_tensor(make_pointer(dtypes.uint16,dtypes.int64(final_sparse_bits_address),MemLoc.GM),make_layout((total_q,topk),stride=(topk,1)))
-        final_candidate_indices = make_tensor(make_pointer(dtypes.int32,dtypes.int64(final_candidate_indices_address),MemLoc.GM),make_layout((total_q,candidate_topk),stride=(candidate_topk,1)))
-        final_candidate_bits = make_tensor(make_pointer(dtypes.uint16,dtypes.int64(final_candidate_bits_address),MemLoc.GM),make_layout((total_q,candidate_topk),stride=(candidate_topk,1)))
-        candidate_indices = make_tensor(make_pointer(dtypes.int32,dtypes.int64(candidate_indices_address),MemLoc.GM),make_layout((64*query_tile_rows,candidate_topk),stride=(candidate_topk,1)))
-        candidate_value_bits = make_tensor(make_pointer(dtypes.uint16,dtypes.int64(candidate_value_bits_address),MemLoc.GM),make_layout((64*query_tile_rows,candidate_topk),stride=(candidate_topk,1)))
+        final_sparse_indices = make_tensor(
+            make_pointer(dtypes.int32, dtypes.int64(final_sparse_indices_address), MemLoc.GM),
+            make_layout((total_q, topk), stride=(topk, 1)),
+        )
+        sparse_indices = make_tensor(
+            make_pointer(dtypes.int32, dtypes.int64(sparse_indices_address), MemLoc.GM),
+            make_layout((64 * query_tile_rows, topk), stride=(topk, 1)),
+        )
+        sparse_value_bits = make_tensor(
+            make_pointer(dtypes.uint16, dtypes.int64(sparse_value_bits_address), MemLoc.GM),
+            make_layout((64 * query_tile_rows, topk), stride=(topk, 1)),
+        )
+        final_sparse_bits = make_tensor(
+            make_pointer(dtypes.uint16, dtypes.int64(final_sparse_bits_address), MemLoc.GM),
+            make_layout((total_q, topk), stride=(topk, 1)),
+        )
+        final_candidate_indices = make_tensor(
+            make_pointer(dtypes.int32, dtypes.int64(final_candidate_indices_address), MemLoc.GM),
+            make_layout((total_q, candidate_topk), stride=(candidate_topk, 1)),
+        )
+        final_candidate_bits = make_tensor(
+            make_pointer(dtypes.uint16, dtypes.int64(final_candidate_bits_address), MemLoc.GM),
+            make_layout((total_q, candidate_topk), stride=(candidate_topk, 1)),
+        )
+        candidate_indices = make_tensor(
+            make_pointer(dtypes.int32, dtypes.int64(candidate_indices_address), MemLoc.GM),
+            make_layout((64 * query_tile_rows, candidate_topk), stride=(candidate_topk, 1)),
+        )
+        candidate_value_bits = make_tensor(
+            make_pointer(dtypes.uint16, dtypes.int64(candidate_value_bits_address), MemLoc.GM),
+            make_layout((64 * query_tile_rows, candidate_topk), stride=(candidate_topk, 1)),
+        )
         query = make_tensor(
             make_pointer(dtypes.fp4x2_e2m1, dtypes.int64(query_address), MemLoc.GM),
             make_layout((total_q * N1, LOGICAL_D), stride=(LOGICAL_D, 1)),
@@ -4124,7 +4722,12 @@ def _build_compiled_fused_runner(
             has_seqused_q,
             has_seqused_k,
             has_block_table,
-            pa_block_size, N1, query_tile_rows, metadata, output_offset_address, return_values,
+            pa_block_size,
+            N1,
+            query_tile_rows,
+            metadata,
+            output_offset_address,
+            return_values,
         )(
             query,
             key,
@@ -4153,27 +4756,63 @@ def _build_compiled_fused_runner(
             metadata,
             split_count,
             task_count,
-            sparse_indices_address, sparse_value_bits_address, candidate_indices_address, candidate_value_bits_address,
-            final_sparse_indices_address, final_sparse_bits_address, final_candidate_indices_address, final_candidate_bits_address,
+            sparse_indices_address,
+            sparse_value_bits_address,
+            candidate_indices_address,
+            candidate_value_bits_address,
+            final_sparse_indices_address,
+            final_sparse_bits_address,
+            final_candidate_indices_address,
+            final_candidate_bits_address,
         )
         if ld_enabled:
             global_sync_all()
             channel_rewind(reset_sync_id=True)
             if candidate_enabled:
                 CandidateLdMergeStage(topk, split_count, candidate_optimized=True)(
-                    sparse_indices, sparse_value_bits, final_sparse_indices,
-                    final_sparse_bits, metadata, total_q, worker_count * 2, cu_seqlens_q, query_tile_rows, has_cu_seqlens_q, output_offset_address)
+                    sparse_indices,
+                    sparse_value_bits,
+                    final_sparse_indices,
+                    final_sparse_bits,
+                    metadata,
+                    total_q,
+                    worker_count * 2,
+                    cu_seqlens_q,
+                    query_tile_rows,
+                    has_cu_seqlens_q,
+                    output_offset_address,
+                )
             else:
                 LdMergeStage(topk, split_count)(
-                    sparse_indices, sparse_value_bits, final_sparse_indices,
-                    final_sparse_bits, metadata, total_q, worker_count * 2, cu_seqlens_q, query_tile_rows, has_cu_seqlens_q, output_offset_address, return_values)
+                    sparse_indices,
+                    sparse_value_bits,
+                    final_sparse_indices,
+                    final_sparse_bits,
+                    metadata,
+                    total_q,
+                    worker_count * 2,
+                    cu_seqlens_q,
+                    query_tile_rows,
+                    has_cu_seqlens_q,
+                    output_offset_address,
+                    return_values,
+                )
 
             if candidate_enabled:
                 vec_sync_all()
                 channel_rewind(reset_sync_id=False)
                 CandidateLdMergeStage(candidate_topk, split_count, candidate_optimized=True)(
-                    candidate_indices, candidate_value_bits, final_candidate_indices,
-                    final_candidate_bits, metadata, total_q, worker_count * 2, cu_seqlens_q, query_tile_rows, has_cu_seqlens_q)
+                    candidate_indices,
+                    candidate_value_bits,
+                    final_candidate_indices,
+                    final_candidate_bits,
+                    metadata,
+                    total_q,
+                    worker_count * 2,
+                    cu_seqlens_q,
+                    query_tile_rows,
+                    has_cu_seqlens_q,
+                )
 
     def run_fused_cv(
         query_address,
@@ -4212,45 +4851,62 @@ def _build_compiled_fused_runner(
         merge_workers,
         output_offset_address,
     ):
-
-        fused_body[worker_count](query_address, key_address, weights, query_scale, key_scale_address, key_stride0, key_dequant_scale_stride0, cu_seqlens_q, seqused_q, seqused_k, cmp_residual_k, block_table, key_out, candidate_key_out, sparse_indices_address, sparse_value_bits_address, candidate_indices_address, candidate_value_bits_address, candidate_length, worker_count, total_q, batch_count, tokens, max_tasks_per_batch, key_rows, scale_rows, metadata, task_count, final_sparse_indices_address, final_sparse_bits_address, final_candidate_indices_address, final_candidate_bits_address, return_values, merge_workers, output_offset_address)
+        fused_body[worker_count](
+            query_address,
+            key_address,
+            weights,
+            query_scale,
+            key_scale_address,
+            key_stride0,
+            key_dequant_scale_stride0,
+            cu_seqlens_q,
+            seqused_q,
+            seqused_k,
+            cmp_residual_k,
+            block_table,
+            key_out,
+            candidate_key_out,
+            sparse_indices_address,
+            sparse_value_bits_address,
+            candidate_indices_address,
+            candidate_value_bits_address,
+            candidate_length,
+            worker_count,
+            total_q,
+            batch_count,
+            tokens,
+            max_tasks_per_batch,
+            key_rows,
+            scale_rows,
+            metadata,
+            task_count,
+            final_sparse_indices_address,
+            final_sparse_bits_address,
+            final_candidate_indices_address,
+            final_candidate_bits_address,
+            return_values,
+            merge_workers,
+            output_offset_address,
+        )
 
     query_rows_dim = cannbotdsl.Dim("T1")
     batch_dim = cannbotdsl.Dim("B")
     block_table_width_dim = cannbotdsl.Dim("MAX_BLOCKS")
     token_capacity_dim = cannbotdsl.Dim("S2_PAD")
     candidate_capacity_dim = cannbotdsl.Dim("CANDIDATE_PAD")
-    sparse_width = cannbotdsl.Dim("SPARSE_WIDTH")
+    sparse_width = cannbotdsl.Dim("SPARSE_WIDTH")  # noqa: F841
     candidate_width = cannbotdsl.Dim("CANDIDATE_WIDTH")
     partial_rows = cannbotdsl.Dim("PARTIAL_ROWS")
-    metadata_tasks = cannbotdsl.Dim("METADATA_TASKS")
+    metadata_tasks = cannbotdsl.Dim("METADATA_TASKS")  # noqa: F841
     workspace_rows = MAX_CUBE_WORKERS * (TILE_M // N1)
     fake = TensorSpec
     dummy_i32_spec = fake((1,), dtypes.int32)
-    cu_spec = (
-        fake((batch_dim + 1,), dtypes.int32)
-        if has_cu_seqlens_q
-        else dummy_i32_spec
-    )
-    seqused_q_spec = (
-        fake((batch_dim,), dtypes.int32)
-        if has_seqused_q
-        else dummy_i32_spec
-    )
-    seqused_k_spec = (
-        fake((batch_dim,), dtypes.int32)
-        if has_seqused_k
-        else dummy_i32_spec
-    )
-    residual_spec = (
-        fake((batch_dim,), dtypes.int32)
-        if has_cmp_residual_k
-        else dummy_i32_spec
-    )
+    cu_spec = fake((batch_dim + 1,), dtypes.int32) if has_cu_seqlens_q else dummy_i32_spec
+    seqused_q_spec = fake((batch_dim,), dtypes.int32) if has_seqused_q else dummy_i32_spec
+    seqused_k_spec = fake((batch_dim,), dtypes.int32) if has_seqused_k else dummy_i32_spec
+    residual_spec = fake((batch_dim,), dtypes.int32) if has_cmp_residual_k else dummy_i32_spec
     block_table_spec = (
-        fake((batch_dim, block_table_width_dim), dtypes.int32)
-        if has_block_table
-        else fake((1, 1), dtypes.int32)
+        fake((batch_dim, block_table_width_dim), dtypes.int32) if has_block_table else fake((1, 1), dtypes.int32)
     )
     candidate_key_spec = (
         fake(
@@ -4263,7 +4919,7 @@ def _build_compiled_fused_runner(
         if candidate_enabled
         else fake((workspace_rows, 1), dtypes.uint16)
     )
-    candidate_index_spec = (
+    candidate_index_spec = (  # noqa: F841
         fake((query_rows_dim, candidate_width), dtypes.int32)
         if candidate_enabled
         else fake((1, candidate_width), dtypes.int32)
@@ -4273,9 +4929,7 @@ def _build_compiled_fused_runner(
         dtypes.int64,
         dtypes.int64,
         fake((query_rows_dim, N1), dtypes.float32),
-        fake(
-            (query_rows_dim * N1, 2, 2), dtypes.float8_e8m0
-        ),
+        fake((query_rows_dim * N1, 2, 2), dtypes.float8_e8m0),
         dtypes.int64,
         dtypes.int64,
         dtypes.int64,
@@ -4312,7 +4966,7 @@ def _build_compiled_fused_runner(
 
 
 def clear_caches():
-    """Close cached dynamic executables before and after native export."""
+    """Close cached dynamic executables."""
     with _COMPILED_KERNEL_LOCK:
         for compiled in _COMPILED_KERNEL.values():
             compiled.close()
@@ -4321,7 +4975,6 @@ def clear_caches():
 
 def _get_compiled_fused_runner(*config):
     """Cache the dynamic QLI executable, independently of B/T/S2."""
-    # DSL native policy is process-wide; never compile a missing runtime binary.
     cache_key = tuple(config)
     with _COMPILED_KERNEL_LOCK:
         compiled = _COMPILED_KERNEL.get(cache_key)
@@ -4337,14 +4990,14 @@ def quant_lightning_indexer(
     w: torch.Tensor,
     descale_q: torch.Tensor,
     descale_k: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_k: Optional[torch.Tensor] = None,
-    seqused_q: Optional[torch.Tensor] = None,
-    seqused_k: Optional[torch.Tensor] = None,
-    cmp_residual_k: Optional[torch.Tensor] = None,
-    block_table: Optional[torch.Tensor] = None,
-    output_idx_offset: Optional[torch.Tensor] = None,
-    metadata: Optional[torch.Tensor] = None,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
+    cmp_residual_k: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+    output_idx_offset: torch.Tensor | None = None,
+    metadata: torch.Tensor | None = None,
     *,
     topk: int,
     quant_mode: int,
@@ -4370,17 +5023,34 @@ def quant_lightning_indexer(
         raise ValueError("QLI requires N1=32 and logical D=128")
     if layout_k == "TND":
         return _run_tnd(
-            q, k, w, descale_q, descale_k, cu_seqlens_q, cu_seqlens_k,
-            seqused_q, seqused_k, cmp_residual_k, block_table,
-            output_idx_offset, metadata, topk=topk, quant_mode=quant_mode,
-            max_seqlen_q=max_seqlen_q, mask_mode=mask_mode, cmp_ratio=cmp_ratio,
-            layout_q=layout_q, layout_k=layout_k, return_value=return_value,
+            q,
+            k,
+            w,
+            descale_q,
+            descale_k,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            cmp_residual_k,
+            block_table,
+            output_idx_offset,
+            metadata,
+            topk=topk,
+            quant_mode=quant_mode,
+            max_seqlen_q=max_seqlen_q,
+            mask_mode=mask_mode,
+            cmp_ratio=cmp_ratio,
+            layout_q=layout_q,
+            layout_k=layout_k,
+            return_value=return_value,
             candidate_topk_blocks=candidate_topk_blocks,
-            candidate_block_size=candidate_block_size)
+            candidate_block_size=candidate_block_size,
+        )
     if metadata is None:
         raise ValueError("metadata is required; call quant_lightning_indexer_metadata before this operator")
     if q.ndim != 3 or int(q.shape[1]) not in (32, 64):
-        raise ValueError('q must have shape [T1,N1,64], N1=32 or 64')
+        raise ValueError("q must have shape [T1,N1,64], N1=32 or 64")
     N1 = int(q.shape[1])
     query_tile_rows = min(QUERY_TILE_ROWS, 256 // N1)
     TILE_M = N1 * query_tile_rows
@@ -4406,10 +5076,7 @@ def quant_lightning_indexer(
         raise ValueError("descale_q is a required xlsx input")
     expected_q_scale = (*query.shape[:2], LOGICAL_D // 64, 2)
     if tuple(query_dequant_scale.shape) != expected_q_scale:
-        raise ValueError(
-            "descale_q must have corrected xlsx shape "
-            "(T1,N1,D/64,2)"
-        )
+        raise ValueError("descale_q must have corrected xlsx shape (T1,N1,D/64,2)")
     if key_dequant_scale is None:
         raise ValueError("descale_k is a required xlsx input")
     expected = tuple(key.shape[:3]) + (2, 2)
@@ -4502,19 +5169,13 @@ def quant_lightning_indexer(
     validate_metadata("seqused_k", seqused_k, (batch,))
     if int(mask_mode) == 3 and int(cmp_ratio) != 1:
         if cmp_residual_k is None:
-            raise ValueError(
-                "cmp_residual_k is required for mask_mode=3 and cmp_ratio!=1"
-            )
+            raise ValueError("cmp_residual_k is required for mask_mode=3 and cmp_ratio!=1")
         validate_metadata("cmp_residual_k", cmp_residual_k, (batch,))
     elif cmp_residual_k is not None:
-        raise ValueError(
-            "cmp_residual_k must be None unless mask_mode=3 and cmp_ratio!=1"
-        )
+        raise ValueError("cmp_residual_k must be None unless mask_mode=3 and cmp_ratio!=1")
     if block_table is not None:
         if block_table.ndim != 2 or int(block_table.shape[0]) != batch:
-            raise ValueError(
-                "block_table must have shape (B,max_num_blocks_per_seq)"
-            )
+            raise ValueError("block_table must have shape (B,max_num_blocks_per_seq)")
         if block_table.dtype != torch.int32:
             raise TypeError("block_table must be int32")
         if block_table.device != query.device:
@@ -4538,9 +5199,7 @@ def quant_lightning_indexer(
     cu_kernel = cu_seqlens_q if has_cu_seqlens_q else dummy_i32
     seqused_q_kernel = seqused_q if has_seqused_q else dummy_i32
     seqused_k_kernel = seqused_k if has_seqused_k else dummy_i32
-    cmp_residual_kernel = (
-        cmp_residual_k if has_cmp_residual_k else dummy_i32
-    )
+    cmp_residual_kernel = cmp_residual_k if has_cmp_residual_k else dummy_i32
     block_table_kernel = block_table if has_block_table else dummy_table
 
     max_query_length = int(max_seqlen_q) if int(max_seqlen_q) > 0 else t
@@ -4611,7 +5270,9 @@ def quant_lightning_indexer(
         has_block_table,
         pa_block_size,
         split_count,
-        auto_metadata, N1, query_tile_rows,
+        auto_metadata,
+        N1,
+        query_tile_rows,
     )(
         query_address,
         key_storage.data_ptr(),
@@ -4656,69 +5317,30 @@ def quant_lightning_indexer(
     candidate_length_1d = candidate_length_1d[:t]
     return (
         sparse_indices_2d.view(t, N2, int(topk)),
-        sparse_values_2d.view(t, N2, int(topk))
-        if return_value else sparse_values_2d.reshape(-1)[:0],
-        candidate_indices_2d.view(t, N2, candidate_count)
-        if candidate_enabled else candidate_indices_2d.reshape(-1),
-        candidate_length_1d.view(t, N2)
-        if candidate_enabled else candidate_length_1d[:0],
+        sparse_values_2d.view(t, N2, int(topk)) if return_value else sparse_values_2d.reshape(-1)[:0],
+        candidate_indices_2d.view(t, N2, candidate_count) if candidate_enabled else candidate_indices_2d.reshape(-1),
+        candidate_length_1d.view(t, N2) if candidate_enabled else candidate_length_1d[:0],
     )
 
 
 __all__ = ["quant_lightning_indexer"]
 
 
-
-
-from cannbotdsl.package.native import register
-
-
-@register("qli")
-def export_qli():
-    """Export static profiles with dynamic tensor axes, without NPU execution."""
-    import json
-    import os
-
-    defaults = {'topk': 512, 'candidate_enabled': True, 'candidate_topk': 2048, 'mask_mode': 3, 'cmp_ratio': 1, 'has_cu_seqlens_q': True, 'has_seqused_q': True, 'has_seqused_k': True, 'has_block_table': True, 'pa_block_size': 128, 'split_count': 8, 'auto_metadata': False, 'n1': 32, 'query_tile_rows': 6}
-    profiles = [
-        dict(candidate_enabled=enabled, candidate_topk=2048 if enabled else 1,
-             mask_mode=mask, cmp_ratio=ratio, pa_block_size=page, n1=heads, query_tile_rows=qrows)
-        for enabled in (False, True)
-        for mask in (0, 3)
-        for ratio in (1, 2)
-        for page in (64, 128)
-        for heads, qrows in ((32, 4), (64, 4), (32, 6))
-    ]
-    profile_path = os.environ.get("CANNBOTDSL_DS41_PROFILES")
-    if profile_path:
-        with open(profile_path, encoding="utf-8") as stream:
-            profiles = json.load(stream).get("qli", profiles)
-    clear_caches()
-    try:
-        exported = set()
-        for profile in profiles:
-            unknown = set(profile) - set(defaults)
-            if unknown:
-                raise ValueError(f"Unknown export profile fields: {sorted(unknown)}")
-            config = dict(defaults, **profile)
-            # cmp_ratio is unused without the causal mask; export one binary.
-            identity = tuple(
-                (name, value) for name, value in config.items()
-                if name != "cmp_ratio" or config["mask_mode"] == 3
-            )
-            if identity in exported:
-                continue
-            exported.add(identity)
-            _get_compiled_fused_runner(*(config[name] for name in defaults))
-    finally:
-        clear_caches()
-
-
 class QliTndCube(QliCube):
     @jit
-    def compute_qk(self, key, key_scale, block_table, batch_idx, actual_s2,
-                   key_stride0, key_dequant_scale_stride0, has_block_table,
-                   token_tile, qk_handoff):
+    def compute_qk(
+        self,
+        key,
+        key_scale,
+        block_table,
+        batch_idx,
+        actual_s2,
+        key_stride0,
+        key_dequant_scale_stride0,
+        has_block_table,
+        token_tile,
+        qk_handoff,
+    ):
         key_write = self.k_l1.acquire()
         scale_write = self.k_scale_l1.acquire()
         base = dtypes.int64(block_table[batch_idx])
@@ -4727,12 +5349,12 @@ class QliTndCube(QliCube):
         source_row = base + logical_row
         mem_copy(
             key_write,
-            key[source_row:source_row + count, None],
+            key[source_row : source_row + count, None],
             engine=self.nd2nz_key,
         )
         mem_copy(
             scale_write,
-            key_scale[source_row:source_row + count, None, None],
+            key_scale[source_row : source_row + count, None, None],
             engine=self.scale_b,
         )
         self.k_l1.commit(key_write)
@@ -4741,17 +5363,29 @@ class QliTndCube(QliCube):
         key_read = self.l0b.wait()
         dsl_matmul(self.l0c, self.l0a0, key_read, init=True, unit_flag=3)
         acc_read0 = self.l0c.wait()
-        mem_copy(local_slice(qk_handoff, (self.tile_m // 2, 128), stride=(256, 1)),
-                 local_slice(acc_read0, (self.tile_m // 2, 128)), engine=self.fixpipe_aiv0)
-        mem_copy(local_slice(qk_handoff, (self.tile_m // 2, 128), stride=(256, 1), offset=(self.tile_m // 2) * 512),
-                 local_slice(acc_read0, (self.tile_m // 2, 128), offset=(self.tile_m // 2) * 128 * 4), engine=self.fixpipe_aiv0)
+        mem_copy(
+            local_slice(qk_handoff, (self.tile_m // 2, 128), stride=(256, 1)),
+            local_slice(acc_read0, (self.tile_m // 2, 128)),
+            engine=self.fixpipe_aiv0,
+        )
+        mem_copy(
+            local_slice(qk_handoff, (self.tile_m // 2, 128), stride=(256, 1), offset=(self.tile_m // 2) * 512),
+            local_slice(acc_read0, (self.tile_m // 2, 128), offset=(self.tile_m // 2) * 128 * 4),
+            engine=self.fixpipe_aiv0,
+        )
         self.l0c.release(acc_read0)
         dsl_matmul(self.l0c, self.l0a1, key_read, init=True, unit_flag=3)
         acc_read1 = self.l0c.wait()
-        mem_copy(local_slice(qk_handoff, (self.tile_m // 2, 128), stride=(256, 1)),
-                 local_slice(acc_read1, (self.tile_m // 2, 128)), engine=self.fixpipe_aiv1)
-        mem_copy(local_slice(qk_handoff, (self.tile_m // 2, 128), stride=(256, 1), offset=(self.tile_m // 2) * 512),
-                 local_slice(acc_read1, (self.tile_m // 2, 128), offset=(self.tile_m // 2) * 128 * 4), engine=self.fixpipe_aiv1)
+        mem_copy(
+            local_slice(qk_handoff, (self.tile_m // 2, 128), stride=(256, 1)),
+            local_slice(acc_read1, (self.tile_m // 2, 128)),
+            engine=self.fixpipe_aiv1,
+        )
+        mem_copy(
+            local_slice(qk_handoff, (self.tile_m // 2, 128), stride=(256, 1), offset=(self.tile_m // 2) * 512),
+            local_slice(acc_read1, (self.tile_m // 2, 128), offset=(self.tile_m // 2) * 128 * 4),
+            engine=self.fixpipe_aiv1,
+        )
         self.l0c.release(acc_read1)
         self.l0b.release(key_read)
 
@@ -4793,10 +5427,8 @@ class QliTndFusedKernel(QliFusedKernel):
         self.has_seqused_k = bool(has_seqused_k)
         self.has_cmp_residual_k = self.mask_mode == 3 and self.cmp_ratio != 1
         self.has_block_table = bool(has_block_table)
-        self.qk_slot0 = Buffer(MemLoc.UB, (self.tile_m, 128), dtypes.bfloat16,
-                               stride=(256, 1), addr=0)
-        self.qk_slot1 = Buffer(MemLoc.UB, (self.tile_m, 128), dtypes.bfloat16,
-                               stride=(256, 1), addr=256)
+        self.qk_slot0 = Buffer(MemLoc.UB, (self.tile_m, 128), dtypes.bfloat16, stride=(256, 1), addr=0)
+        self.qk_slot1 = Buffer(MemLoc.UB, (self.tile_m, 128), dtypes.bfloat16, stride=(256, 1), addr=256)
         self.cube = QliTndCube(pa_block_size, n1, query_rows)
         self.topk_workspace = QliRawTopKWorkspace(
             TOPK_TRUNK_LEN if self.cache_enabled else 16384,
@@ -4806,9 +5438,7 @@ class QliTndFusedKernel(QliFusedKernel):
             ),
             pipelined=self.cache_enabled,
         )
-        self.topk = QliRawTopKSelector(
-            self.topk_count, self.topk_workspace
-        )
+        self.topk = QliRawTopKSelector(self.topk_count, self.topk_workspace)
         if self.candidate_enabled:
             self.candidate_topk = QliRawTopKSelector(
                 self.candidate_topk_count,
@@ -4820,13 +5450,27 @@ class QliTndFusedKernel(QliFusedKernel):
             self.mask_mode,
             self.cmp_ratio,
             self.candidate_enabled,
-            self.candidate_topk_count, n1, query_rows,
+            self.candidate_topk_count,
+            n1,
+            query_rows,
             255488 if self.cache_enabled else self.tile_m * 512 + 12288,
             self.cache_enabled,
         )
         # Dedicated 512B-strided bank-separated histogram slots, main phase only.
-        self.hist_slot0 = Buffer(MemLoc.UB, (self.vec_rows * 2, 128), dtypes.uint16, stride=(256, 1), addr=251904 if self.cache_enabled else self.tile_m * 512 + 16384)
-        self.hist_slot1 = Buffer(MemLoc.UB, (self.vec_rows * 2, 128), dtypes.uint16, stride=(256, 1), addr=252160 if self.cache_enabled else self.tile_m * 512 + 16640)
+        self.hist_slot0 = Buffer(
+            MemLoc.UB,
+            (self.vec_rows * 2, 128),
+            dtypes.uint16,
+            stride=(256, 1),
+            addr=251904 if self.cache_enabled else self.tile_m * 512 + 16384,
+        )
+        self.hist_slot1 = Buffer(
+            MemLoc.UB,
+            (self.vec_rows * 2, 128),
+            dtypes.uint16,
+            stride=(256, 1),
+            addr=252160 if self.cache_enabled else self.tile_m * 512 + 16640,
+        )
         self.topk.hist_slot0 = self.hist_slot0
         self.topk.hist_slot1 = self.hist_slot1
         # Main phase: QK [0,98304), cached keys [98304,251904),
@@ -4836,8 +5480,12 @@ class QliTndFusedKernel(QliFusedKernel):
             self.full_key_cache = Buffer(MemLoc.UB, (self.vec_rows, CACHE_TOKENS), dtypes.uint16, addr=98304)
             self.vector.full_key_cache = self.full_key_cache
             self.topk.cache_tmp = Buffer(MemLoc.UB, (CACHE_TOKENS,), dtypes.uint16, addr=0)
-            self.topk.cache_output_idx_stage = Channel(MemLoc.UB, (1, self.topk_count), dtypes.int32, depth=1, addr=52224)
-            self.topk.cache_output_value_bits_stage = Channel(MemLoc.UB, (1, self.topk_count), dtypes.uint16, depth=1, addr=54272)
+            self.topk.cache_output_idx_stage = Channel(
+                MemLoc.UB, (1, self.topk_count), dtypes.int32, depth=1, addr=52224
+            )
+            self.topk.cache_output_value_bits_stage = Channel(
+                MemLoc.UB, (1, self.topk_count), dtypes.uint16, depth=1, addr=54272
+            )
 
 
 def _build_tnd_compiled_fused_runner(
@@ -4905,15 +5553,38 @@ def _build_tnd_compiled_fused_runner(
         output_offset_address,
     ):
         ld_enabled = metadata[36, 0] != 0
-        final_sparse_indices = make_tensor(make_pointer(dtypes.int32, dtypes.int64(final_sparse_indices_address), MemLoc.GM),
-            make_layout((total_q, topk), stride=(topk, 1)))
-        sparse_indices = make_tensor(make_pointer(dtypes.int32,dtypes.int64(sparse_indices_address),MemLoc.GM),make_layout((64*query_tile_rows,topk),stride=(topk,1)))
-        sparse_value_bits = make_tensor(make_pointer(dtypes.uint16,dtypes.int64(sparse_value_bits_address),MemLoc.GM),make_layout((64*query_tile_rows,topk),stride=(topk,1)))
-        final_sparse_bits = make_tensor(make_pointer(dtypes.uint16,dtypes.int64(final_sparse_bits_address),MemLoc.GM),make_layout((total_q,topk),stride=(topk,1)))
-        final_candidate_indices = make_tensor(make_pointer(dtypes.int32,dtypes.int64(final_candidate_indices_address),MemLoc.GM),make_layout((total_q,candidate_topk),stride=(candidate_topk,1)))
-        final_candidate_bits = make_tensor(make_pointer(dtypes.uint16,dtypes.int64(final_candidate_bits_address),MemLoc.GM),make_layout((total_q,candidate_topk),stride=(candidate_topk,1)))
-        candidate_indices = make_tensor(make_pointer(dtypes.int32,dtypes.int64(candidate_indices_address),MemLoc.GM),make_layout((64*query_tile_rows,candidate_topk),stride=(candidate_topk,1)))
-        candidate_value_bits = make_tensor(make_pointer(dtypes.uint16,dtypes.int64(candidate_value_bits_address),MemLoc.GM),make_layout((64*query_tile_rows,candidate_topk),stride=(candidate_topk,1)))
+        final_sparse_indices = make_tensor(
+            make_pointer(dtypes.int32, dtypes.int64(final_sparse_indices_address), MemLoc.GM),
+            make_layout((total_q, topk), stride=(topk, 1)),
+        )
+        sparse_indices = make_tensor(
+            make_pointer(dtypes.int32, dtypes.int64(sparse_indices_address), MemLoc.GM),
+            make_layout((64 * query_tile_rows, topk), stride=(topk, 1)),
+        )
+        sparse_value_bits = make_tensor(
+            make_pointer(dtypes.uint16, dtypes.int64(sparse_value_bits_address), MemLoc.GM),
+            make_layout((64 * query_tile_rows, topk), stride=(topk, 1)),
+        )
+        final_sparse_bits = make_tensor(
+            make_pointer(dtypes.uint16, dtypes.int64(final_sparse_bits_address), MemLoc.GM),
+            make_layout((total_q, topk), stride=(topk, 1)),
+        )
+        final_candidate_indices = make_tensor(
+            make_pointer(dtypes.int32, dtypes.int64(final_candidate_indices_address), MemLoc.GM),
+            make_layout((total_q, candidate_topk), stride=(candidate_topk, 1)),
+        )
+        final_candidate_bits = make_tensor(
+            make_pointer(dtypes.uint16, dtypes.int64(final_candidate_bits_address), MemLoc.GM),
+            make_layout((total_q, candidate_topk), stride=(candidate_topk, 1)),
+        )
+        candidate_indices = make_tensor(
+            make_pointer(dtypes.int32, dtypes.int64(candidate_indices_address), MemLoc.GM),
+            make_layout((64 * query_tile_rows, candidate_topk), stride=(candidate_topk, 1)),
+        )
+        candidate_value_bits = make_tensor(
+            make_pointer(dtypes.uint16, dtypes.int64(candidate_value_bits_address), MemLoc.GM),
+            make_layout((64 * query_tile_rows, candidate_topk), stride=(candidate_topk, 1)),
+        )
         query = make_tensor(
             make_pointer(dtypes.fp4x2_e2m1, dtypes.int64(query_address), MemLoc.GM),
             make_layout((total_q * N1, LOGICAL_D), stride=(LOGICAL_D, 1)),
@@ -4936,7 +5607,12 @@ def _build_tnd_compiled_fused_runner(
             has_seqused_q,
             has_seqused_k,
             has_block_table,
-            pa_block_size, N1, query_tile_rows, metadata, output_offset_address, return_values,
+            pa_block_size,
+            N1,
+            query_tile_rows,
+            metadata,
+            output_offset_address,
+            return_values,
         )(
             query,
             key,
@@ -4965,27 +5641,63 @@ def _build_tnd_compiled_fused_runner(
             metadata,
             split_count,
             task_count,
-            sparse_indices_address, sparse_value_bits_address, candidate_indices_address, candidate_value_bits_address,
-            final_sparse_indices_address, final_sparse_bits_address, final_candidate_indices_address, final_candidate_bits_address,
+            sparse_indices_address,
+            sparse_value_bits_address,
+            candidate_indices_address,
+            candidate_value_bits_address,
+            final_sparse_indices_address,
+            final_sparse_bits_address,
+            final_candidate_indices_address,
+            final_candidate_bits_address,
         )
         if ld_enabled:
             global_sync_all()
             channel_rewind(reset_sync_id=True)
             if candidate_enabled:
                 CandidateLdMergeStage(topk, split_count, candidate_optimized=True)(
-                    sparse_indices, sparse_value_bits, final_sparse_indices,
-                    final_sparse_bits, metadata, total_q, worker_count * 2, cu_seqlens_q, query_tile_rows, has_cu_seqlens_q, output_offset_address)
+                    sparse_indices,
+                    sparse_value_bits,
+                    final_sparse_indices,
+                    final_sparse_bits,
+                    metadata,
+                    total_q,
+                    worker_count * 2,
+                    cu_seqlens_q,
+                    query_tile_rows,
+                    has_cu_seqlens_q,
+                    output_offset_address,
+                )
             else:
                 LdMergeStage(topk, split_count)(
-                    sparse_indices, sparse_value_bits, final_sparse_indices,
-                    final_sparse_bits, metadata, total_q, worker_count * 2, cu_seqlens_q, query_tile_rows, has_cu_seqlens_q, output_offset_address, return_values)
+                    sparse_indices,
+                    sparse_value_bits,
+                    final_sparse_indices,
+                    final_sparse_bits,
+                    metadata,
+                    total_q,
+                    worker_count * 2,
+                    cu_seqlens_q,
+                    query_tile_rows,
+                    has_cu_seqlens_q,
+                    output_offset_address,
+                    return_values,
+                )
 
             if candidate_enabled:
                 vec_sync_all()
                 channel_rewind(reset_sync_id=False)
                 CandidateLdMergeStage(candidate_topk, split_count, candidate_optimized=True)(
-                    candidate_indices, candidate_value_bits, final_candidate_indices,
-                    final_candidate_bits, metadata, total_q, worker_count * 2, cu_seqlens_q, query_tile_rows, has_cu_seqlens_q)
+                    candidate_indices,
+                    candidate_value_bits,
+                    final_candidate_indices,
+                    final_candidate_bits,
+                    metadata,
+                    total_q,
+                    worker_count * 2,
+                    cu_seqlens_q,
+                    query_tile_rows,
+                    has_cu_seqlens_q,
+                )
 
     def run_fused_cv(
         query_address,
@@ -5024,46 +5736,61 @@ def _build_tnd_compiled_fused_runner(
         merge_workers,
         output_offset_address,
     ):
-
-        fused_body[worker_count](query_address, key_address, weights, query_scale, key_scale_address, key_stride0, key_dequant_scale_stride0, cu_seqlens_q, seqused_q, seqused_k, cmp_residual_k, block_table, key_out, candidate_key_out, sparse_indices_address, sparse_value_bits_address, candidate_indices_address, candidate_value_bits_address, candidate_length, worker_count, total_q, batch_count, tokens, max_tasks_per_batch, key_rows, scale_rows, metadata, task_count, final_sparse_indices_address, final_sparse_bits_address, final_candidate_indices_address, final_candidate_bits_address, return_values, merge_workers, output_offset_address)
+        fused_body[worker_count](
+            query_address,
+            key_address,
+            weights,
+            query_scale,
+            key_scale_address,
+            key_stride0,
+            key_dequant_scale_stride0,
+            cu_seqlens_q,
+            seqused_q,
+            seqused_k,
+            cmp_residual_k,
+            block_table,
+            key_out,
+            candidate_key_out,
+            sparse_indices_address,
+            sparse_value_bits_address,
+            candidate_indices_address,
+            candidate_value_bits_address,
+            candidate_length,
+            worker_count,
+            total_q,
+            batch_count,
+            tokens,
+            max_tasks_per_batch,
+            key_rows,
+            scale_rows,
+            metadata,
+            task_count,
+            final_sparse_indices_address,
+            final_sparse_bits_address,
+            final_candidate_indices_address,
+            final_candidate_bits_address,
+            return_values,
+            merge_workers,
+            output_offset_address,
+        )
 
     query_rows_dim = cannbotdsl.Dim("T1")
     batch_dim = cannbotdsl.Dim("B")
-    block_table_width_dim = cannbotdsl.Dim("MAX_BLOCKS")
+    block_table_width_dim = cannbotdsl.Dim("MAX_BLOCKS")  # noqa: F841
     token_capacity_dim = cannbotdsl.Dim("S2_PAD")
     candidate_capacity_dim = cannbotdsl.Dim("CANDIDATE_PAD")
-    sparse_width = cannbotdsl.Dim("SPARSE_WIDTH")
+    sparse_width = cannbotdsl.Dim("SPARSE_WIDTH")  # noqa: F841
     candidate_width = cannbotdsl.Dim("CANDIDATE_WIDTH")
     partial_rows = cannbotdsl.Dim("PARTIAL_ROWS")
-    metadata_tasks = cannbotdsl.Dim("METADATA_TASKS")
+    metadata_tasks = cannbotdsl.Dim("METADATA_TASKS")  # noqa: F841
     workspace_rows = MAX_CUBE_WORKERS * (TILE_M // N1)
     fake = TensorSpec
     dummy_i32_spec = fake((1,), dtypes.int32)
-    cu_spec = (
-        fake((batch_dim + 1,), dtypes.int32)
-        if has_cu_seqlens_q
-        else dummy_i32_spec
-    )
-    seqused_q_spec = (
-        fake((batch_dim,), dtypes.int32)
-        if has_seqused_q
-        else dummy_i32_spec
-    )
-    seqused_k_spec = (
-        fake((batch_dim,), dtypes.int32)
-        if has_seqused_k
-        else dummy_i32_spec
-    )
-    residual_spec = (
-        fake((batch_dim,), dtypes.int32)
-        if has_cmp_residual_k
-        else dummy_i32_spec
-    )
-    block_table_spec = (
-        fake((batch_dim + 1,), dtypes.int32)
-        if has_block_table
-        else fake((1, 1), dtypes.int32)
-    )
+    cu_spec = fake((batch_dim + 1,), dtypes.int32) if has_cu_seqlens_q else dummy_i32_spec
+    seqused_q_spec = fake((batch_dim,), dtypes.int32) if has_seqused_q else dummy_i32_spec
+    seqused_k_spec = fake((batch_dim,), dtypes.int32) if has_seqused_k else dummy_i32_spec
+    residual_spec = fake((batch_dim,), dtypes.int32) if has_cmp_residual_k else dummy_i32_spec
+    block_table_spec = fake((batch_dim + 1,), dtypes.int32) if has_block_table else fake((1, 1), dtypes.int32)
     candidate_key_spec = (
         fake(
             (
@@ -5075,7 +5802,7 @@ def _build_tnd_compiled_fused_runner(
         if candidate_enabled
         else fake((workspace_rows, 1), dtypes.uint16)
     )
-    candidate_index_spec = (
+    candidate_index_spec = (  # noqa: F841
         fake((query_rows_dim, candidate_width), dtypes.int32)
         if candidate_enabled
         else fake((1, candidate_width), dtypes.int32)
@@ -5085,9 +5812,7 @@ def _build_tnd_compiled_fused_runner(
         dtypes.int64,
         dtypes.int64,
         fake((query_rows_dim, N1), dtypes.float32),
-        fake(
-            (query_rows_dim * N1, 2, 2), dtypes.float8_e8m0
-        ),
+        fake((query_rows_dim * N1, 2, 2), dtypes.float8_e8m0),
         dtypes.int64,
         dtypes.int64,
         dtypes.int64,
@@ -5126,8 +5851,9 @@ def _build_tnd_compiled_fused_runner(
 _TND_COMPILED_KERNEL = {}
 _TND_COMPILED_KERNEL_LOCK = threading.Lock()
 
+
 def clear_tnd_caches():
-    """Close cached dynamic executables before and after native export."""
+    """Close cached dynamic executables."""
     with _TND_COMPILED_KERNEL_LOCK:
         for compiled in _TND_COMPILED_KERNEL.values():
             compiled.close()
@@ -5136,7 +5862,6 @@ def clear_tnd_caches():
 
 def _get_tnd_compiled_fused_runner(*config):
     """Cache the dynamic QLI executable, independently of B/T/S2."""
-    # DSL native policy is process-wide; never compile a missing runtime binary.
     cache_key = tuple(config)
     with _TND_COMPILED_KERNEL_LOCK:
         compiled = _TND_COMPILED_KERNEL.get(cache_key)
@@ -5161,14 +5886,14 @@ def _run_tnd(
     w: torch.Tensor,
     descale_q: torch.Tensor,
     descale_k: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_k: Optional[torch.Tensor] = None,
-    seqused_q: Optional[torch.Tensor] = None,
-    seqused_k: Optional[torch.Tensor] = None,
-    cmp_residual_k: Optional[torch.Tensor] = None,
-    block_table: Optional[torch.Tensor] = None,
-    output_idx_offset: Optional[torch.Tensor] = None,
-    metadata: Optional[torch.Tensor] = None,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
+    cmp_residual_k: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+    output_idx_offset: torch.Tensor | None = None,
+    metadata: torch.Tensor | None = None,
     *,
     topk: int,
     quant_mode: int,
@@ -5186,7 +5911,7 @@ def _run_tnd(
     if int(max_seqlen_q) < -1:
         raise ValueError("max_seqlen_q must be -1 or non-negative")
     if q.ndim != 3 or int(q.shape[1]) not in (32, 64):
-        raise ValueError('q must have shape [T1,N1,64], N1=32 or 64')
+        raise ValueError("q must have shape [T1,N1,64], N1=32 or 64")
     N1 = int(q.shape[1])
     query_tile_rows = min(QUERY_TILE_ROWS, 256 // N1)
     TILE_M = N1 * query_tile_rows
@@ -5212,18 +5937,14 @@ def _run_tnd(
         raise ValueError("descale_q is a required xlsx input")
     expected_q_scale = (*query.shape[:2], LOGICAL_D // 64, 2)
     if tuple(query_dequant_scale.shape) != expected_q_scale:
-        raise ValueError(
-            "descale_q must have corrected xlsx shape "
-            "(T1,N1,D/64,2)"
-        )
+        raise ValueError("descale_q must have corrected xlsx shape (T1,N1,D/64,2)")
     if key_dequant_scale is None:
         raise ValueError("descale_k is a required xlsx input")
     expected = tuple(key.shape[:2]) + (2, 2)
     if tuple(key_dequant_scale.shape) != expected:
         raise ValueError("descale_k must have shape (T2,1,2,2)")
     key_stride0 = _tnd_axis0_stride(key, "k", (PACKED_D, 1), PACKED_D)
-    key_dequant_scale_stride0 = _tnd_axis0_stride(
-        key_dequant_scale, "descale_k", (4, 2, 1), 4)
+    key_dequant_scale_stride0 = _tnd_axis0_stride(key_dequant_scale, "descale_k", (4, 2, 1), 4)
     if key.device != query.device or key_dequant_scale.device != query.device:
         raise ValueError("q, k and descale_k must share an NPU device")
     key_storage_rows = int(key.shape[0])
@@ -5288,14 +6009,10 @@ def _run_tnd(
     validate_metadata("seqused_k", seqused_k, (batch,))
     if int(mask_mode) == 3 and int(cmp_ratio) != 1:
         if cmp_residual_k is None:
-            raise ValueError(
-                "cmp_residual_k is required for mask_mode=3 and cmp_ratio!=1"
-            )
+            raise ValueError("cmp_residual_k is required for mask_mode=3 and cmp_ratio!=1")
         validate_metadata("cmp_residual_k", cmp_residual_k, (batch,))
     elif cmp_residual_k is not None:
-        raise ValueError(
-            "cmp_residual_k must be None unless mask_mode=3 and cmp_ratio!=1"
-        )
+        raise ValueError("cmp_residual_k must be None unless mask_mode=3 and cmp_ratio!=1")
     if cu_seqlens_k is None:
         if batch != 1:
             raise ValueError("cu_seqlens_k is required for multiple TND batches")
@@ -5315,13 +6032,11 @@ def _run_tnd(
     # uninitialized carrier is sufficient because the JIT specialization
     # compiles out every load when the corresponding tensor is absent.
     dummy_i32 = torch.empty((1,), dtype=torch.int32, device=query.device)
-    dummy_table = torch.empty((1, 1), dtype=torch.int32, device=query.device)
+    dummy_table = torch.empty((1, 1), dtype=torch.int32, device=query.device)  # noqa: F841
     cu_kernel = cu_seqlens_q if has_cu_seqlens_q else dummy_i32
     seqused_q_kernel = seqused_q if has_seqused_q else dummy_i32
     seqused_k_kernel = seqused_k if has_seqused_k else dummy_i32
-    cmp_residual_kernel = (
-        cmp_residual_k if has_cmp_residual_k else dummy_i32
-    )
+    cmp_residual_kernel = cmp_residual_k if has_cmp_residual_k else dummy_i32
     block_table_kernel = cu_seqlens_k
 
     max_query_length = int(max_seqlen_q) if int(max_seqlen_q) > 0 else t
@@ -5392,7 +6107,9 @@ def _run_tnd(
         has_block_table,
         pa_block_size,
         split_count,
-        auto_metadata, N1, query_tile_rows,
+        auto_metadata,
+        N1,
+        query_tile_rows,
     )(
         query_address,
         key_storage.data_ptr(),
@@ -5439,10 +6156,7 @@ def _run_tnd(
     candidate_length_1d = candidate_length_1d[:t]
     return (
         sparse_indices_2d.view(t, N2, int(topk)),
-        sparse_values_2d.view(t, N2, int(topk))
-        if return_value else sparse_values_2d.reshape(-1)[:0],
-        candidate_indices_2d.view(t, N2, candidate_count)
-        if candidate_enabled else candidate_indices_2d.reshape(-1),
-        candidate_length_1d.view(t, N2)
-        if candidate_enabled else candidate_length_1d[:0],
+        sparse_values_2d.view(t, N2, int(topk)) if return_value else sparse_values_2d.reshape(-1)[:0],
+        candidate_indices_2d.view(t, N2, candidate_count) if candidate_enabled else candidate_indices_2d.reshape(-1),
+        candidate_length_1d.view(t, N2) if candidate_enabled else candidate_length_1d[:0],
     )

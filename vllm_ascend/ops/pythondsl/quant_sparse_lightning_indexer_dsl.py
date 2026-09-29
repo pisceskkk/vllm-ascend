@@ -11,18 +11,20 @@ No-LD records write directly to public outputs.
 
 from __future__ import annotations
 
-import os
 import threading
-from typing import Optional
 
 import cannbotdsl
 import torch
-
-from cannbotdsl import ChannelKind, MemLoc, Tensor, dtypes, select as dyn_select
+from cannbotdsl import MemLoc, Tensor, channel_rewind, dtypes
+from cannbotdsl import select as dyn_select
+from cannbotdsl._mlir import ir
+from cannbotdsl._mlir.dialects import arith, ascvec
+from cannbotdsl.ascir import extract_buffer
 from cannbotdsl.buffer import Buffer
 from cannbotdsl.channel import Channel
-from cannbotdsl.lang.control_flow import range as dsl_range
+from cannbotdsl.core.scalar_conversion import coerce_scalar_value
 from cannbotdsl.lang.constexpr import range_constexpr
+from cannbotdsl.lang.control_flow import range as dsl_range
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.lang.vf import vf
@@ -32,21 +34,26 @@ from cannbotdsl.ops.matmul import matmul as dsl_matmul
 from cannbotdsl.ops.memcpy import make_copy_engine, mem_copy
 from cannbotdsl.ops.sync import (
     PIPE,
-    cube_sync_intra_wait,
     cube_sync_intra_arrive,
+    cube_sync_intra_wait,
+    global_sync_all,
+    vec_sync_intra_arrive,
     vec_sync_intra_wait,
     vec_sync_notify,
     vec_sync_wait,
-    vec_sync_intra_arrive,
 )
-from cannbotdsl.tensor import make_partition_tiler, tile_view, make_pointer, make_tensor, make_layout, make_bounded_tiler, local_slice
-from cannbotdsl._mlir import ir
-from cannbotdsl._mlir.dialects import arith, ascvec
-from cannbotdsl.ascir import extract_buffer
-from cannbotdsl.core.scalar_conversion import coerce_scalar_value
+from cannbotdsl.tensor import (
+    local_slice,
+    make_layout,
+    make_pointer,
+    make_tensor,
+    tile_view,
+)
+
 
 def _to_index(value):
     return coerce_scalar_value(value, ir.IndexType.get())
+
 
 TILE_M = 32
 TILE_N = 512
@@ -95,10 +102,6 @@ def _validate_pa_dim0_stride(tensor: torch.Tensor, name: str) -> int:
     return strides[0]
 
 
-from cannbotdsl.ops.sync import global_sync_all
-from cannbotdsl import channel_rewind
-
-
 class QsliMergeTopKWorkspace:
     """UB scratch shared by sequential Sparse and Candidate TopK stages."""
 
@@ -106,40 +109,26 @@ class QsliMergeTopKWorkspace:
         self.max_trunk_len = int(max_trunk_len)
         self.max_topk = int(max_topk)
         self.topk_pad = ceil_div(self.max_topk, 256) * 256
-        self.merge_len_pad = ceil_div(
-            self.topk_pad + self.max_trunk_len, 128
-        ) * 128
+        self.merge_len_pad = ceil_div(self.topk_pad + self.max_trunk_len, 128) * 128
         self.current_trunk = Channel(
             MemLoc.UB,
             (1, self.max_trunk_len),
             dtypes.uint16,
             depth=1,
         )
-        self.merge_key = Buffer(
-            MemLoc.UB, (1, self.merge_len_pad), dtypes.uint16
-        )
-        self.tmp_idx = Buffer(
-            MemLoc.UB, (self.merge_len_pad,), dtypes.uint16
-        )
+        self.merge_key = Buffer(MemLoc.UB, (1, self.merge_len_pad), dtypes.uint16)
+        self.tmp_idx = Buffer(MemLoc.UB, (self.merge_len_pad,), dtypes.uint16)
         self.histogram = Buffer(MemLoc.UB, (256,), dtypes.uint16)
-        self.high_target_carrier = Buffer(
-            MemLoc.UB, (64,), dtypes.int32
-        )
-        self.history_key = Buffer(
-            MemLoc.UB, (2, self.topk_pad), dtypes.uint16
-        )
+        self.high_target_carrier = Buffer(MemLoc.UB, (64,), dtypes.int32)
+        self.history_key = Buffer(MemLoc.UB, (2, self.topk_pad), dtypes.uint16)
         self.next_history_key = Channel(
             MemLoc.UB,
             (1, self.topk_pad),
             dtypes.uint16,
             depth=1,
         )
-        self.history_idx = Buffer(
-            MemLoc.UB, (2, self.topk_pad), dtypes.int32
-        )
-        self.next_idx = Buffer(
-            MemLoc.UB, (self.topk_pad,), dtypes.int32
-        )
+        self.history_idx = Buffer(MemLoc.UB, (2, self.topk_pad), dtypes.int32)
+        self.next_idx = Buffer(MemLoc.UB, (self.topk_pad,), dtypes.int32)
 
 
 class QsliRawTopKSelector:
@@ -159,24 +148,18 @@ class QsliRawTopKSelector:
         self.trunk_len = TOPK_TRUNK_LEN
         # ASC reserves history in 256-element units before the next trunk.
         self.topk_pad = ceil_div(self.topk, 256) * 256
-        self.merge_len_pad = ceil_div(
-            self.topk_pad + TOPK_TRUNK_LEN, 128
-        ) * 128
+        self.merge_len_pad = ceil_div(self.topk_pad + TOPK_TRUNK_LEN, 128) * 128
         self.workspace = workspace
         if (
-            TOPK_TRUNK_LEN > workspace.max_trunk_len
+            TOPK_TRUNK_LEN > workspace.max_trunk_len  # noqa: SIM300
             or self.topk > workspace.max_topk
             or self.merge_len_pad > workspace.merge_len_pad
         ):
             raise ValueError("TopK selector exceeds the shared UB workspace")
         # Final V->MTE3 stages are selector-owned so Sparse and Candidate can
         # share computational scratch without racing each other's GM writes.
-        self.output_idx_stage = Channel(
-            MemLoc.UB, (1, self.topk), dtypes.int32, depth=1
-        )
-        self.output_value_bits_stage = Channel(
-            MemLoc.UB, (1, self.topk), dtypes.uint16, depth=1
-        )
+        self.output_idx_stage = Channel(MemLoc.UB, (1, self.topk), dtypes.int32, depth=1)
+        self.output_value_bits_stage = Channel(MemLoc.UB, (1, self.topk), dtypes.uint16, depth=1)
 
     @jit
     def _find_indices(self, sort_key, valid_len, tmp_idx, histogram, high_target_carrier):
@@ -187,9 +170,7 @@ class QsliRawTopKSelector:
             for chunk in dsl_range((valid_len + 255) // 256, unroll=1):
                 valid_count = valid_len - chunk * 256
                 mask8 = rr.update_mask(valid_count, elem_bits=8)[0]
-                _, high = rr.vload_deinterleave(
-                    sort_key, chunk * 256, width="b8"
-                )
+                _, high = rr.vload_deinterleave(sort_key, chunk * 256, width="b8")
                 h0 = rr.vhistogram_accumulate(h0, high, mask=mask8, bin=0)
                 h1 = rr.vhistogram_accumulate(h1, high, mask=mask8, bin=1)
             rr.vstore(histogram, 0, h0, full16)
@@ -270,9 +251,7 @@ class QsliRawTopKSelector:
             for chunk in dsl_range((valid_len + 255) // 256, unroll=1):
                 valid_count = valid_len - chunk * 256
                 mask8 = rr.update_mask(valid_count, elem_bits=8)[0]
-                low, high = rr.vload_deinterleave(
-                    sort_key, chunk * 256, width="b8"
-                )
+                low, high = rr.vload_deinterleave(sort_key, chunk * 256, width="b8")
                 eq_high = rr.veq(high, high_target8, mask=mask8)
                 l0 = rr.vhistogram_accumulate(l0, low, mask=eq_high, bin=0)
                 l1 = rr.vhistogram_accumulate(l1, low, mask=eq_high, bin=1)
@@ -324,18 +303,14 @@ class QsliRawTopKSelector:
                 mask16 = rr.update_mask(valid_count, elem_bits=16)[0]
                 keys = rr.vload(sort_key, chunk * 128)
                 idx = rr.varange(chunk * 128, dtypes.uint16)
-                sq = rr.vsqueeze_and_storeunalign_init(
-                    idx, mask=rr.vgt(keys, kth, mask=mask16)
-                )
+                sq = rr.vsqueeze_and_storeunalign_init(idx, mask=rr.vgt(keys, kth, mask=mask16))
                 rr.vsqueeze_and_storeunalign(tmp_idx, 0, sq, ureg)
             for chunk in dsl_range(valid_chunk_count, unroll=1):
                 valid_count = valid_len - chunk * 128
                 mask16 = rr.update_mask(valid_count, elem_bits=16)[0]
                 keys = rr.vload(sort_key, chunk * 128)
                 idx = rr.varange(chunk * 128, dtypes.uint16)
-                sq = rr.vsqueeze_and_storeunalign_init(
-                    idx, mask=rr.veq(keys, kth, mask=mask16)
-                )
+                sq = rr.vsqueeze_and_storeunalign_init(idx, mask=rr.veq(keys, kth, mask=mask16))
                 rr.vsqueeze_and_storeunalign(tmp_idx, 0, sq, ureg)
             rr.vstore_unalign_post(tmp_idx, 0, ureg)
             rr.vmem_bar("vst_vld")
@@ -347,13 +322,23 @@ class LdTopKSelector(QsliRawTopKSelector):
         self.ld_length = int(splits) * self.topk
         self.ld_indices = Buffer(MemLoc.UB, (1, self.ld_length), dtypes.int32)
         self.ld_bits = Buffer(MemLoc.UB, (1, self.ld_length), dtypes.uint16)
+
     @jit
-    def merge_ld(self, partial_indices, partial_bits, gm_sparse_indices, gm_selected_value_bits, valid_length, output_offset=0, preloaded=False):
+    def merge_ld(
+        self,
+        partial_indices,
+        partial_bits,
+        gm_sparse_indices,
+        gm_selected_value_bits,
+        valid_length,
+        output_offset=0,
+        preloaded=False,
+    ):
         if not preloaded:
             mem_copy(local_slice(self.ld_indices, (1, valid_length)), partial_indices[0:1, 0:valid_length])
             mem_copy(local_slice(self.ld_bits, (1, valid_length)), partial_bits[0:1, 0:valid_length])
         current_trunk = self.workspace.merge_key
-        history_key = self.workspace.history_key
+        history_key = self.workspace.history_key  # noqa: F841
         history_idx = self.workspace.history_idx
         with vf(mode="raw"):
             mask16 = rr.update_mask(64, elem_bits=16)[0]
@@ -363,45 +348,72 @@ class LdTopKSelector(QsliRawTopKSelector):
                 indices = rr.vload(self.ld_indices, chunk * 64)
                 positive_key = rr.vbitwise_xor(bits, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
                 negative_key = rr.vbitwise_xor(bits, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
-                negative = rr.veqs(rr.vbitwise_and(bits, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16), 0x8000, mask=mask16)
+                negative = rr.veqs(
+                    rr.vbitwise_and(bits, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16),
+                    0x8000,
+                    mask=mask16,
+                )
                 keys = rr.vselect(negative_key, positive_key, cond_mask=negative)
-                valid32 = rr.vselect(rr.vdups(1, dtypes.int32, mask=mask32), rr.vdups(0, dtypes.int32, mask=mask32), cond_mask=rr.vges(indices, 0, mask=mask32))
+                valid32 = rr.vselect(
+                    rr.vdups(1, dtypes.int32, mask=mask32),
+                    rr.vdups(0, dtypes.int32, mask=mask32),
+                    cond_mask=rr.vges(indices, 0, mask=mask32),
+                )
                 valid16 = rr.vpack(rr.vreinterpret(valid32, dtypes.uint32), dtypes.uint16, part="lower")
-                keys = rr.vselect(keys, rr.vdups(0, dtypes.uint16, mask=mask16), cond_mask=rr.veqs(valid16, 1, mask=mask16))
+                keys = rr.vselect(
+                    keys, rr.vdups(0, dtypes.uint16, mask=mask16), cond_mask=rr.veqs(valid16, 1, mask=mask16)
+                )
                 rr.vstore(current_trunk, chunk * 64, keys, mask16)
             rr.vmem_bar("vst_vld")
-        self._find_indices(current_trunk, valid_length, self.workspace.tmp_idx,
-                           self.workspace.histogram, self.workspace.high_target_carrier)
+        self._find_indices(
+            current_trunk,
+            valid_length,
+            self.workspace.tmp_idx,
+            self.workspace.histogram,
+            self.workspace.high_target_carrier,
+        )
         output_idx_stage = self.output_idx_stage
         out_value_bits = self.output_value_bits_stage
         output_valid_count = dtypes.int32(self.topk)
-        final_idx = history_idx
+        final_idx = history_idx  # noqa: F841
         with vf(mode="raw"):
             for chunk in dsl_range(ceil_div(self.topk, 64), unroll=1):
                 count = self.topk - chunk * 64
                 mask32 = rr.update_mask(count, elem_bits=32)[0]
-                mask16 = rr.mask_and(rr.update_mask(count, elem_bits=16)[0], rr.update_mask(64, elem_bits=16)[0], exec_mask=rr.update_mask(64, elem_bits=16)[0])
+                mask16 = rr.mask_and(
+                    rr.update_mask(count, elem_bits=16)[0],
+                    rr.update_mask(64, elem_bits=16)[0],
+                    exec_mask=rr.update_mask(64, elem_bits=16)[0],
+                )
                 positions = rr.vunpack(rr.vload(self.workspace.tmp_idx, chunk * 64), dtypes.uint32, part="lower")
                 indices = rr.vgather(self.ld_indices, rr.vreinterpret(positions, dtypes.uint32), mask=mask32)
                 positions16 = rr.vload(self.workspace.tmp_idx, chunk * 64)
                 keys = rr.vgather(current_trunk, positions16, mask=mask16)
                 value_bits = rr.vgather(self.ld_bits, positions16, mask=mask16)
-                valid_rank32 = rr.vlts(
+                valid_rank32 = rr.vlts(  # noqa: F841
                     rr.varange(chunk * 64, dtypes.uint32),
                     output_valid_count,
                     mask=mask32,
                 )
-                valid_rank16 = rr.vlts(
+                valid_rank16 = rr.vlts(  # noqa: F841
                     rr.varange(chunk * 64, dtypes.uint16),
                     output_valid_count,
                     mask=mask16,
                 )
-                key_valid16 = rr.vselect(rr.vdups(1, dtypes.uint16, mask=mask16), rr.vdups(0, dtypes.uint16, mask=mask16), cond_mask=rr.vges(keys, 1, mask=mask16))
+                key_valid16 = rr.vselect(
+                    rr.vdups(1, dtypes.uint16, mask=mask16),
+                    rr.vdups(0, dtypes.uint16, mask=mask16),
+                    cond_mask=rr.vges(keys, 1, mask=mask16),
+                )
                 key_valid32 = rr.vunpack(key_valid16, dtypes.uint32, part="lower")
-                indices = rr.vselect(indices, rr.vdups(-1, dtypes.int32, mask=mask32), cond_mask=rr.veqs(key_valid32, 1, mask=mask32))
-                valid_flags32 = rr.vselect(rr.vdups(1, dtypes.int32, mask=mask32),
-                                           rr.vdups(0, dtypes.int32, mask=mask32),
-                                           cond_mask=rr.vges(indices, 0, mask=mask32))
+                indices = rr.vselect(
+                    indices, rr.vdups(-1, dtypes.int32, mask=mask32), cond_mask=rr.veqs(key_valid32, 1, mask=mask32)
+                )
+                valid_flags32 = rr.vselect(
+                    rr.vdups(1, dtypes.int32, mask=mask32),
+                    rr.vdups(0, dtypes.int32, mask=mask32),
+                    cond_mask=rr.vges(indices, 0, mask=mask32),
+                )
                 valid_flags16 = rr.vpack(rr.vreinterpret(valid_flags32, dtypes.uint32), dtypes.uint16, part="lower")
                 indices = rr.vselect(
                     indices,
@@ -413,9 +425,11 @@ class LdTopKSelector(QsliRawTopKSelector):
                     rr.vdups(0, dtypes.uint16, mask=mask16),
                     cond_mask=rr.veqs(valid_flags16, 1, mask=mask16),
                 )
-                indices = rr.vselect(rr.vadds(indices, output_offset, mask=mask32),
+                indices = rr.vselect(
+                    rr.vadds(indices, output_offset, mask=mask32),
                     rr.vdups(-1, dtypes.int32, mask=mask32),
-                    cond_mask=rr.veqs(valid_flags32, 1, mask=mask32))
+                    cond_mask=rr.veqs(valid_flags32, 1, mask=mask32),
+                )
                 rr.vstore(output_idx_stage, chunk * 64, indices, mask32)
                 rr.vstore(out_value_bits, chunk * 64, value_bits, mask16)
             rr.vmem_bar("vst_vld")
@@ -431,8 +445,20 @@ class LdMergeStage:
         self.selector = LdTopKSelector(topk, self.workspace, splits)
 
     @jit
-    def __call__(self, partial_indices: Tensor, partial_bits: Tensor,
-                 indices: Tensor, bits: Tensor, metadata: Tensor, rows, workers, cu_seqlens_q: Tensor, query_tile_rows, has_cu, output_offset_address=0):
+    def __call__(
+        self,
+        partial_indices: Tensor,
+        partial_bits: Tensor,
+        indices: Tensor,
+        bits: Tensor,
+        metadata: Tensor,
+        rows,
+        workers,
+        cu_seqlens_q: Tensor,
+        query_tile_rows,
+        has_cu,
+        output_offset_address=0,
+    ):
         fd = dtypes.int64(36 + get_block_idx() * 2 + get_subblock_id())
         if metadata[fd, 0] != 0:
             batch_idx = dtypes.int64(metadata[fd, 1])
@@ -448,8 +474,10 @@ class LdMergeStage:
                 row = row_base + m
                 output_offset = dtypes.int32(0)
                 if output_offset_address != 0:
-                    offsets = make_tensor(make_pointer(dtypes.int32, dtypes.int64(output_offset_address), MemLoc.GM),
-                        make_layout((rows, 1), stride=(1, 1)))
+                    offsets = make_tensor(
+                        make_pointer(dtypes.int32, dtypes.int64(output_offset_address), MemLoc.GM),
+                        make_layout((rows, 1), stride=(1, 1)),
+                    )
                     output_offset = offsets[row, 0]
                 for first in dsl_range(0, part_count, self.length // self.topk - 1, unroll=1):
                     count = min(part_count - first, self.length // self.topk - 1)
@@ -457,20 +485,36 @@ class LdMergeStage:
                     vec_sync_notify(PIPE.V, PIPE.MTE2, 5)
                     vec_sync_wait(PIPE.V, PIPE.MTE2, 5)
                     if first > 0:
-                        mem_copy(local_slice(self.selector.ld_indices,(1,self.topk)),tile_view(indices,(1,self.topk),(row,0)))
-                        mem_copy(local_slice(self.selector.ld_bits,(1,self.topk)),tile_view(bits,(1,self.topk),(row,0)))
+                        mem_copy(
+                            local_slice(self.selector.ld_indices, (1, self.topk)),
+                            tile_view(indices, (1, self.topk), (row, 0)),
+                        )
+                        mem_copy(
+                            local_slice(self.selector.ld_bits, (1, self.topk)),
+                            tile_view(bits, (1, self.topk), (row, 0)),
+                        )
                     for part in dsl_range(0, count, unroll=1):
                         source_row = (workspace_begin + first + part) * query_tile_rows + m
-                        mem_copy(tile_view(self.selector.ld_indices,(1,self.topk),(0,part+carry)),
-                                 tile_view(partial_indices,(1,self.topk),(source_row,0)))
-                        mem_copy(tile_view(self.selector.ld_bits,(1,self.topk),(0,part+carry)),
-                                 tile_view(partial_bits,(1,self.topk),(source_row,0)))
+                        mem_copy(
+                            tile_view(self.selector.ld_indices, (1, self.topk), (0, part + carry)),
+                            tile_view(partial_indices, (1, self.topk), (source_row, 0)),
+                        )
+                        mem_copy(
+                            tile_view(self.selector.ld_bits, (1, self.topk), (0, part + carry)),
+                            tile_view(partial_bits, (1, self.topk), (source_row, 0)),
+                        )
                     vec_sync_notify(PIPE.MTE2, PIPE.V, 5)
                     vec_sync_wait(PIPE.MTE2, PIPE.V, 5)
-                    offset = dtypes.int32(dyn_select(first+count==part_count,output_offset,0))
-                    self.selector.merge_ld(partial_indices,partial_bits,
-                        tile_view(indices,(1,self.topk),(row,0)),
-                        tile_view(bits,(1,self.topk),(row,0)),(count+carry)*self.topk,offset,True)
+                    offset = dtypes.int32(dyn_select(first + count == part_count, output_offset, 0))
+                    self.selector.merge_ld(
+                        partial_indices,
+                        partial_bits,
+                        tile_view(indices, (1, self.topk), (row, 0)),
+                        tile_view(bits, (1, self.topk), (row, 0)),
+                        (count + carry) * self.topk,
+                        offset,
+                        True,
+                    )
                     vec_sync_notify(PIPE.MTE3, PIPE.MTE2, 5)
                     vec_sync_wait(PIPE.MTE3, PIPE.MTE2, 5)
 
@@ -498,15 +542,26 @@ class QsliLocalTopKSelector(QsliRawTopKSelector):
             for chunk in dsl_range(total_tokens // 128, (self.topk + 127) // 128, unroll=1):
                 rr.vstore(keys, chunk * 128, zero, full16)
             rr.vmem_bar("vst_vld")
-        self._find_indices(keys, max(total_tokens, self.topk), self.workspace.tmp_idx,
-                           self.workspace.histogram, self.workspace.high_target_carrier)
+        self._find_indices(
+            keys,
+            max(total_tokens, self.topk),
+            self.workspace.tmp_idx,
+            self.workspace.histogram,
+            self.workspace.high_target_carrier,
+        )
         with vf(mode="raw"):
             for chunk in dsl_range(ceil_div(self.topk, 64), unroll=1):
                 mask = rr.update_mask(self.topk - chunk * 64, elem_bits=32)[0]
                 positions = rr.vunpack(rr.vload(self.workspace.tmp_idx, chunk * 64), dtypes.uint32, part="lower")
                 valid = rr.vlts(rr.varange(chunk * 64, dtypes.uint32), output_valid_count, mask=mask)
-                rr.vstore(self.output_idx_stage, chunk * 64,
-                          rr.vselect(rr.vreinterpret(positions, dtypes.int32), rr.vdups(-1, dtypes.int32, mask=mask), cond_mask=valid), mask)
+                rr.vstore(
+                    self.output_idx_stage,
+                    chunk * 64,
+                    rr.vselect(
+                        rr.vreinterpret(positions, dtypes.int32), rr.vdups(-1, dtypes.int32, mask=mask), cond_mask=valid
+                    ),
+                    mask,
+                )
             rr.vmem_bar("vst_vld")
         if need_values != 0:
             with vf(mode="raw"):
@@ -516,11 +571,18 @@ class QsliLocalTopKSelector(QsliRawTopKSelector):
                     selected = rr.vgather(keys, pos, mask=mask)
                     sign = rr.vdups(0x8000, dtypes.uint16, mask=mask)
                     positive = rr.veq(rr.vbitwise_and(selected, sign, mask=mask), sign, mask=mask)
-                    bits = rr.vselect(rr.vbitwise_xor(selected, sign, mask=mask),
-                                      rr.vbitwise_xor(selected, rr.vdups(0xFFFF, dtypes.uint16, mask=mask), mask=mask), cond_mask=positive)
+                    bits = rr.vselect(
+                        rr.vbitwise_xor(selected, sign, mask=mask),
+                        rr.vbitwise_xor(selected, rr.vdups(0xFFFF, dtypes.uint16, mask=mask), mask=mask),
+                        cond_mask=positive,
+                    )
                     valid = rr.vlts(rr.varange(chunk * 128, dtypes.uint16), output_valid_count, mask=mask)
-                    rr.vstore(self.output_value_bits_stage, chunk * 128,
-                              rr.vselect(bits, rr.vdups(0, dtypes.uint16, mask=mask), cond_mask=valid), mask)
+                    rr.vstore(
+                        self.output_value_bits_stage,
+                        chunk * 128,
+                        rr.vselect(bits, rr.vdups(0, dtypes.uint16, mask=mask), cond_mask=valid),
+                        mask,
+                    )
                 rr.vmem_bar("vst_vld")
             mem_copy(gm_bits, self.output_value_bits_stage)
 
@@ -530,50 +592,60 @@ class QsliCube:
 
     def __init__(self):
         self.q_l1 = Channel(
-            MemLoc.L1, (TILE_M, LOGICAL_D), dtypes.fp4x2_e2m1,
-            depth=2, data_format="nz",
+            MemLoc.L1,
+            (TILE_M, LOGICAL_D),
+            dtypes.fp4x2_e2m1,
+            depth=2,
+            data_format="nz",
         )
         self.k_l1 = Channel(
-            MemLoc.L1, (TILE_N, LOGICAL_D), dtypes.fp4x2_e2m1,
-            depth=2, data_format="nz",
+            MemLoc.L1,
+            (TILE_N, LOGICAL_D),
+            dtypes.fp4x2_e2m1,
+            depth=2,
+            data_format="nz",
         )
         self.q_scale_l1 = Channel(
-            MemLoc.L1, (TILE_M, 4), dtypes.float8_e8m0,
-            depth=2, data_format="zn",
+            MemLoc.L1,
+            (TILE_M, 4),
+            dtypes.float8_e8m0,
+            depth=2,
+            data_format="zn",
         )
         self.k_scale_l1 = Channel(
-            MemLoc.L1, (4, TILE_N), dtypes.float8_e8m0,
-            depth=2, data_format="nz",
+            MemLoc.L1,
+            (4, TILE_N),
+            dtypes.float8_e8m0,
+            depth=2,
+            data_format="nz",
         )
-        self.l0a = Channel(
-            MemLoc.L0A, (TILE_M, LOGICAL_D), dtypes.fp4x2_e2m1, depth=2
-        )
+        self.l0a = Channel(MemLoc.L0A, (TILE_M, LOGICAL_D), dtypes.fp4x2_e2m1, depth=2)
         self.l0b = Channel(
-            MemLoc.L0B, (TILE_N, LOGICAL_D), dtypes.fp4x2_e2m1,
-            depth=2, data_format="nz",
+            MemLoc.L0B,
+            (TILE_N, LOGICAL_D),
+            dtypes.fp4x2_e2m1,
+            depth=2,
+            data_format="nz",
         )
-        self.l0c = Channel(
-            MemLoc.L0C, (TILE_M, TILE_N), dtypes.float32, depth=2
-        )
+        self.l0c = Channel(MemLoc.L0C, (TILE_M, TILE_N), dtypes.float32, depth=2)
         self.nd2nz_fp4 = make_copy_engine(
-            format_transform="nd2nz", dtype=dtypes.fp4x2_e2m1,
+            format_transform="nd2nz",
+            dtype=dtypes.fp4x2_e2m1,
             pad_value=0.0,
         )
         self.scale_a = make_copy_engine(
-            format_transform="mx_scale_and", dtype=dtypes.float8_e8m0,
+            format_transform="mx_scale_and",
+            dtype=dtypes.float8_e8m0,
             pad_value=0.0,
         )
         self.scale_b = make_copy_engine(
-            format_transform="mx_scale_bdn", dtype=dtypes.float8_e8m0,
+            format_transform="mx_scale_bdn",
+            dtype=dtypes.float8_e8m0,
             pad_value=0.0,
         )
-        self.fixpipe_qk = make_copy_engine(
-            dtype=dtypes.bfloat16, dual_dst_ctl=0, sub_block_id=0, unit_flag_mode=3
-        )
+        self.fixpipe_qk = make_copy_engine(dtype=dtypes.bfloat16, dual_dst_ctl=0, sub_block_id=0, unit_flag_mode=3)
 
-        self.fixpipe_qk1 = make_copy_engine(
-            dtype=dtypes.bfloat16, dual_dst_ctl=0, sub_block_id=1, unit_flag_mode=3
-        )
+        self.fixpipe_qk1 = make_copy_engine(dtype=dtypes.bfloat16, dual_dst_ctl=0, sub_block_id=1, unit_flag_mode=3)
 
     def load_query(self, query, query_scale):
         mem_copy(self.q_l1, query, engine=self.nd2nz_fp4)
@@ -589,11 +661,13 @@ class QsliCube:
         cube_sync_intra_wait(PIPE.FIXPIPE, 20 + slot)
         destination = tile_view(qk_handoff, (TILE_M, TILE_N // 2), (slot, 0))
         mem_copy(
-            destination, tile_view(self.l0c, (TILE_M, TILE_N // 2), (0, 0)),
+            destination,
+            tile_view(self.l0c, (TILE_M, TILE_N // 2), (0, 0)),
             engine=self.fixpipe_qk,
         )
         mem_copy(
-            destination, tile_view(self.l0c, (TILE_M, TILE_N // 2), (0, 1)),
+            destination,
+            tile_view(self.l0c, (TILE_M, TILE_N // 2), (0, 1)),
             engine=self.fixpipe_qk1,
         )
         cube_sync_intra_arrive(PIPE.FIXPIPE, 14 + slot)
@@ -605,10 +679,15 @@ def _split_page_pow2(value, reciprocal, divisor, shift, mask):
     offset = rr.vbitwise_and(value, rr.vdups(divisor - 1, dtypes.uint32, mask=mask), mask=mask)
     return page, offset
 
+
 def _split_page_general(value, reciprocal, divisor, shift, mask):
     low, page = rr.vmull(value, reciprocal, dtypes.uint32, mask=mask)
     product = rr.vmuls(page, divisor, mask=mask)
-    page = rr.vselect(rr.vsub(page, rr.vdups(1, dtypes.uint32, mask=mask), mask=mask), page, cond_mask=rr.vgt(product, value, mask=mask))
+    page = rr.vselect(
+        rr.vsub(page, rr.vdups(1, dtypes.uint32, mask=mask), mask=mask),
+        page,
+        cond_mask=rr.vgt(product, value, mask=mask),
+    )
     return page, rr.vsub(value, rr.vmuls(page, divisor, mask=mask), mask=mask)
 
 
@@ -635,18 +714,33 @@ class QsliVector0:
             dst, dst_offset = extract_buffer(self.page_table_ub, access="write")
             src, src_offset = extract_buffer(table, access="read")
             ascvec.copy_gm2ub(
-                dst, dst_offset, src,
+                dst,
+                dst_offset,
+                src,
                 arith.addi(src_offset, _to_index(batch * table.stride[0])),
-                dtypes.int32(1), dtypes.int32(table.shape[1] * 4),
-                dtypes.int64(table.shape[1] * 4), dtypes.int32(table.shape[1] * 4),
-                dtypes.int32(0), dtypes.int32(0))
+                dtypes.int32(1),
+                dtypes.int32(table.shape[1] * 4),
+                dtypes.int64(table.shape[1] * 4),
+                dtypes.int32(table.shape[1] * 4),
+                dtypes.int32(0),
+                dtypes.int32(0),
+            )
             vec_sync_notify(PIPE.MTE2, PIPE.V, 0)
             vec_sync_wait(PIPE.MTE2, PIPE.V, 0)
 
     @jit
-    def prepare_addresses(self, candidates, row, valid_blocks, key_stride,
-                          candidate_begin, candidate_end, key_extent_bytes,
-                          table_length, has_block_table):
+    def prepare_addresses(
+        self,
+        candidates,
+        row,
+        valid_blocks,
+        key_stride,
+        candidate_begin,
+        candidate_end,
+        key_extent_bytes,
+        table_length,
+        has_block_table,
+    ):
         if has_block_table and table_length <= self.pa_table_capacity:
             if key_extent_bytes <= 2147483648:
                 self._prepare_addresses32(candidates, row, valid_blocks, key_stride, candidate_begin, candidate_end)
@@ -662,7 +756,10 @@ class QsliVector0:
 
     @jit
     def _prepare_addresses32(self, candidates, row, valid_blocks, key_stride, candidate_begin, candidate_end):
-        mem_copy(self.candidate_ub, tile_view(candidates, (1, 1, CANDIDATE_CAPACITY), (row, 0, 0)).view(1, CANDIDATE_CAPACITY))
+        mem_copy(
+            self.candidate_ub,
+            tile_view(candidates, (1, 1, CANDIDATE_CAPACITY), (row, 0, 0)).view(1, CANDIDATE_CAPACITY),
+        )
         vec_sync_notify(PIPE.MTE2, PIPE.V, 0)
         vec_sync_wait(PIPE.MTE2, PIPE.V, 0)
         with vf(mode="raw"):
@@ -680,7 +777,9 @@ class QsliVector0:
             one = rr.vdups(1, dtypes.uint32, mask=mask)
             zero = rr.vdups(0, dtypes.uint32, mask=mask)
             for chunk in dsl_range(candidate_begin // 64, candidate_end // 64, 2, unroll=1):
-                logical_position = rr.vadds(position_offsets, dtypes.uint32(chunk * 64 + self.subblock_idx * 32), mask=mask)
+                logical_position = rr.vadds(
+                    position_offsets, dtypes.uint32(chunk * 64 + self.subblock_idx * 32), mask=mask
+                )
                 safe_position = rr.vmins(logical_position, dtypes.uint32(valid_blocks - 1), mask=mask)
                 candidate = rr.vmaxs(rr.vgather(self.candidate_ub, safe_position, mask=mask), 0, mask=mask)
                 unsigned_candidate = rr.vreinterpret(candidate, dtypes.uint32)
@@ -690,22 +789,34 @@ class QsliVector0:
                 low = rr.vmul(physical, stride_low, mask=mask)
                 offset_bytes = rr.vreinterpret(rr.vmuls(offset, 544, mask=mask), dtypes.uint32)
                 low = rr.vadd(low, offset_bytes, mask=mask)
-                high = zero
+                high = zero  # noqa: F841
                 even_low = rr.vgather_reg(low, even_lane)
                 odd_low = rr.vgather_reg(low, odd_lane)
                 low_gt = rr.vselect(one, zero, cond_mask=rr.vgt(even_low, odd_low, mask=all_lanes))
                 swap = low_gt
                 permutation = rr.vbitwise_xor(lane, swap, mask=all_lanes)
                 low = rr.vgather_reg(low, permutation)
-                rr.vstore(self.pair_swaps, chunk * 32, rr.vmuls(swap, 4, mask=all_lanes), rr.update_mask((candidate_end // 64 - chunk) * 32, elem_bits=32)[0])
-                rr.vstore(self.physical_blocks, chunk * 32, low, rr.update_mask((candidate_end // 64 - chunk) * 32, elem_bits=32)[0])
+                rr.vstore(
+                    self.pair_swaps,
+                    chunk * 32,
+                    rr.vmuls(swap, 4, mask=all_lanes),
+                    rr.update_mask((candidate_end // 64 - chunk) * 32, elem_bits=32)[0],
+                )
+                rr.vstore(
+                    self.physical_blocks,
+                    chunk * 32,
+                    low,
+                    rr.update_mask((candidate_end // 64 - chunk) * 32, elem_bits=32)[0],
+                )
         vec_sync_notify(PIPE.V, PIPE.S, 6)
         vec_sync_wait(PIPE.V, PIPE.S, 6)
 
-
     @jit
     def _prepare_addresses64(self, candidates, row, valid_blocks, key_stride, candidate_begin, candidate_end):
-        mem_copy(self.candidate_ub, tile_view(candidates, (1, 1, CANDIDATE_CAPACITY), (row, 0, 0)).view(1, CANDIDATE_CAPACITY))
+        mem_copy(
+            self.candidate_ub,
+            tile_view(candidates, (1, 1, CANDIDATE_CAPACITY), (row, 0, 0)).view(1, CANDIDATE_CAPACITY),
+        )
         vec_sync_notify(PIPE.MTE2, PIPE.V, 0)
         vec_sync_wait(PIPE.MTE2, PIPE.V, 0)
         with vf(mode="raw"):
@@ -724,7 +835,9 @@ class QsliVector0:
             one = rr.vdups(1, dtypes.uint32, mask=mask)
             zero = rr.vdups(0, dtypes.uint32, mask=mask)
             for chunk in dsl_range(candidate_begin // 64, candidate_end // 64, 2, unroll=1):
-                logical_position = rr.vadds(position_offsets, dtypes.uint32(chunk * 64 + self.subblock_idx * 32), mask=mask)
+                logical_position = rr.vadds(
+                    position_offsets, dtypes.uint32(chunk * 64 + self.subblock_idx * 32), mask=mask
+                )
                 safe_position = rr.vmins(logical_position, dtypes.uint32(valid_blocks - 1), mask=mask)
                 candidate = rr.vmaxs(rr.vgather(self.candidate_ub, safe_position, mask=mask), 0, mask=mask)
                 unsigned_candidate = rr.vreinterpret(candidate, dtypes.uint32)
@@ -745,42 +858,118 @@ class QsliVector0:
                 permutation = rr.vbitwise_xor(lane, swap, mask=all_lanes)
                 low = rr.vgather_reg(low, permutation)
                 high = rr.vgather_reg(high, permutation)
-                rr.vstore(self.pair_swaps, chunk * 32, rr.vmuls(swap, 4, mask=all_lanes), rr.update_mask((candidate_end // 64 - chunk) * 32, elem_bits=32)[0])
+                rr.vstore(
+                    self.pair_swaps,
+                    chunk * 32,
+                    rr.vmuls(swap, 4, mask=all_lanes),
+                    rr.update_mask((candidate_end // 64 - chunk) * 32, elem_bits=32)[0],
+                )
                 interleaved0, interleaved1 = rr.vinterleave(low, high)
                 store_mask = rr.full_mask()
                 rr.vstore(self.physical_blocks, chunk * 64, interleaved0, store_mask)
-                rr.vstore(self.physical_blocks, chunk * 64 + 64, interleaved1, rr.update_mask((candidate_end // 64 - chunk - 1) * 64, elem_bits=32)[0])
+                rr.vstore(
+                    self.physical_blocks,
+                    chunk * 64 + 64,
+                    interleaved1,
+                    rr.update_mask((candidate_end // 64 - chunk - 1) * 64, elem_bits=32)[0],
+                )
         vec_sync_notify(PIPE.V, PIPE.S, 6)
         vec_sync_wait(PIPE.V, PIPE.S, 6)
 
     @jit
     def _gather_half(
-        self, half, key, candidate_block_indices, candidate_block_length,
-        block_table, task_query_row, batch_idx, candidate_tile,
-        staging_key, staging_scale, task_idx, has_block_table, packed_ub, slot,
+        self,
+        half,
+        key,
+        candidate_block_indices,
+        candidate_block_length,
+        block_table,
+        task_query_row,
+        batch_idx,
+        candidate_tile,
+        staging_key,
+        staging_scale,
+        task_idx,
+        has_block_table,
+        packed_ub,
+        slot,
     ):
         if not has_block_table or block_table.shape[1] > self.pa_table_capacity:
-            self._gather_half_scalar(half, key, candidate_block_indices, candidate_block_length,
-                block_table, task_query_row, batch_idx, candidate_tile,
-                staging_key, staging_scale, task_idx, has_block_table, packed_ub, slot)
+            self._gather_half_scalar(
+                half,
+                key,
+                candidate_block_indices,
+                candidate_block_length,
+                block_table,
+                task_query_row,
+                batch_idx,
+                candidate_tile,
+                staging_key,
+                staging_scale,
+                task_idx,
+                has_block_table,
+                packed_ub,
+                slot,
+            )
         elif key.shape[0] * key.stride[0] <= 2147483648:
-            self._gather_half32(half, key, candidate_block_indices, candidate_block_length,
-                block_table, task_query_row, batch_idx, candidate_tile,
-                staging_key, staging_scale, task_idx, has_block_table, packed_ub, slot)
+            self._gather_half32(
+                half,
+                key,
+                candidate_block_indices,
+                candidate_block_length,
+                block_table,
+                task_query_row,
+                batch_idx,
+                candidate_tile,
+                staging_key,
+                staging_scale,
+                task_idx,
+                has_block_table,
+                packed_ub,
+                slot,
+            )
         else:
-            self._gather_half64(half, key, candidate_block_indices, candidate_block_length,
-                block_table, task_query_row, batch_idx, candidate_tile,
-                staging_key, staging_scale, task_idx, has_block_table, packed_ub, slot)
+            self._gather_half64(
+                half,
+                key,
+                candidate_block_indices,
+                candidate_block_length,
+                block_table,
+                task_query_row,
+                batch_idx,
+                candidate_tile,
+                staging_key,
+                staging_scale,
+                task_idx,
+                has_block_table,
+                packed_ub,
+                slot,
+            )
 
     @jit
     def _gather_half_scalar(
-        self, half, key, candidate_block_indices, candidate_block_length,
-        block_table, task_query_row, batch_idx, candidate_tile,
-        staging_key, staging_scale, task_idx, has_block_table, packed_ub, slot,
+        self,
+        half,
+        key,
+        candidate_block_indices,
+        candidate_block_length,
+        block_table,
+        task_query_row,
+        batch_idx,
+        candidate_tile,
+        staging_key,
+        staging_scale,
+        task_idx,
+        has_block_table,
+        packed_ub,
+        slot,
     ):
-        staging_row = (dtypes.int64(task_idx) * STAGING_DEPTH
-                       + dtypes.int64(candidate_tile) % STAGING_DEPTH) * TILE_N + dtypes.int64(half) * (TILE_N // 2)
-        first_candidate = dtypes.int64(candidate_tile) * CANDIDATE_BLOCKS_PER_TILE + dtypes.int64(half) * CANDIDATE_BLOCKS_PER_AIV
+        staging_row = (
+            dtypes.int64(task_idx) * STAGING_DEPTH + dtypes.int64(candidate_tile) % STAGING_DEPTH
+        ) * TILE_N + dtypes.int64(half) * (TILE_N // 2)
+        first_candidate = (
+            dtypes.int64(candidate_tile) * CANDIDATE_BLOCKS_PER_TILE + dtypes.int64(half) * CANDIDATE_BLOCKS_PER_AIV
+        )
         valid_blocks = dtypes.int64(candidate_block_length)
         if slot == 0:
             vec_sync_wait(PIPE.MTE3, PIPE.MTE2, 2)
@@ -824,17 +1013,31 @@ class QsliVector0:
                 pair_ok = dyn_select(gap >= 544, dyn_select(gap - 544 <= 549755813887, 1, 0), 0)
                 if pair_ok != 0:
                     ascvec.copy_gm2ub(
-                        packed_dst, arith.addi(packed_offset, _to_index(pair * 2 * 544)),
-                        key_src, arith.addi(key_offset, _to_index(first)),
-                        dtypes.int32(2), dtypes.int32(544), dtypes.int64(gap),
-                        dtypes.int32(544), dtypes.int32(0), dtypes.int32(0))
+                        packed_dst,
+                        arith.addi(packed_offset, _to_index(pair * 2 * 544)),
+                        key_src,
+                        arith.addi(key_offset, _to_index(first)),
+                        dtypes.int32(2),
+                        dtypes.int32(544),
+                        dtypes.int64(gap),
+                        dtypes.int32(544),
+                        dtypes.int32(0),
+                        dtypes.int32(0),
+                    )
                 else:
                     for item in range_constexpr(2):
                         ascvec.copy_gm2ub(
-                            packed_dst, arith.addi(packed_offset, _to_index((pair * 2 + item) * 544)),
-                            key_src, arith.addi(key_offset, _to_index(addresses[item])),
-                            dtypes.int32(1), dtypes.int32(544), dtypes.int64(544),
-                            dtypes.int32(544), dtypes.int32(0), dtypes.int32(0))
+                            packed_dst,
+                            arith.addi(packed_offset, _to_index((pair * 2 + item) * 544)),
+                            key_src,
+                            arith.addi(key_offset, _to_index(addresses[item])),
+                            dtypes.int32(1),
+                            dtypes.int32(544),
+                            dtypes.int64(544),
+                            dtypes.int32(544),
+                            dtypes.int32(0),
+                            dtypes.int32(0),
+                        )
         vec_sync_notify(PIPE.MTE2, PIPE.MTE3, 2)
         vec_sync_wait(PIPE.MTE2, PIPE.MTE3, 2)
         packed_src, packed_src_offset = extract_buffer(packed_ub, access="read")
@@ -842,15 +1045,25 @@ class QsliVector0:
         scale_dst, scale_offset = extract_buffer(staging_scale, access="write")
         # Gather all K rows and all scale rows into separate contiguous ND staging.
         ascvec.copy_ub2gm(
-            k_dst, arith.addi(k_offset, _to_index(staging_row * PACKED_D)),
-            packed_src, packed_src_offset,
-            dtypes.int32(CANDIDATE_BLOCKS_PER_AIV), dtypes.int32(512),
-            dtypes.int64(512), dtypes.int32(544))
+            k_dst,
+            arith.addi(k_offset, _to_index(staging_row * PACKED_D)),
+            packed_src,
+            packed_src_offset,
+            dtypes.int32(CANDIDATE_BLOCKS_PER_AIV),
+            dtypes.int32(512),
+            dtypes.int64(512),
+            dtypes.int32(544),
+        )
         ascvec.copy_ub2gm(
-            scale_dst, arith.addi(scale_offset, _to_index(staging_row * 4)),
-            packed_src, arith.addi(packed_src_offset, _to_index(512)),
-            dtypes.int32(CANDIDATE_BLOCKS_PER_AIV), dtypes.int32(32),
-            dtypes.int64(32), dtypes.int32(544))
+            scale_dst,
+            arith.addi(scale_offset, _to_index(staging_row * 4)),
+            packed_src,
+            arith.addi(packed_src_offset, _to_index(512)),
+            dtypes.int32(CANDIDATE_BLOCKS_PER_AIV),
+            dtypes.int32(32),
+            dtypes.int64(32),
+            dtypes.int32(544),
+        )
         if slot == 0:
             vec_sync_notify(PIPE.MTE3, PIPE.MTE2, 2)
         else:
@@ -858,14 +1071,27 @@ class QsliVector0:
 
     @jit
     def _gather_half32(
-        self, half, key, candidate_block_indices, candidate_block_length,
-        block_table, task_query_row, batch_idx, candidate_tile,
-        staging_key, staging_scale, task_idx, has_block_table, packed_ub, slot,
+        self,
+        half,
+        key,
+        candidate_block_indices,
+        candidate_block_length,
+        block_table,
+        task_query_row,
+        batch_idx,
+        candidate_tile,
+        staging_key,
+        staging_scale,
+        task_idx,
+        has_block_table,
+        packed_ub,
+        slot,
     ):
-        staging_row = (dtypes.int64(task_idx) * STAGING_DEPTH
-                       + dtypes.int64(candidate_tile) % STAGING_DEPTH) * TILE_N + dtypes.int64(half) * (TILE_N // 2)
+        staging_row = (
+            dtypes.int64(task_idx) * STAGING_DEPTH + dtypes.int64(candidate_tile) % STAGING_DEPTH
+        ) * TILE_N + dtypes.int64(half) * (TILE_N // 2)
         first_candidate = dtypes.int64(candidate_tile) * CANDIDATE_BLOCKS_PER_AIV
-        valid_blocks = dtypes.int64(candidate_block_length)
+        valid_blocks = dtypes.int64(candidate_block_length)  # noqa: F841
         if slot == 0:
             vec_sync_wait(PIPE.MTE3, PIPE.MTE2, 2)
         else:
@@ -885,27 +1111,50 @@ class QsliVector0:
                 )
         else:
             for pair in range(CANDIDATE_BLOCKS_PER_AIV // 2):
-                packed_pair = self.physical_blocks.reinterpret(dtypes.uint64, (1, CANDIDATE_CAPACITY // 2))[0, first_candidate // 2 + pair]
+                packed_pair = self.physical_blocks.reinterpret(dtypes.uint64, (1, CANDIDATE_CAPACITY // 2))[
+                    0, first_candidate // 2 + pair
+                ]
                 first = dtypes.int64(dtypes.uint32(packed_pair))
                 second = dtypes.int64(packed_pair // 4294967296)
                 gap = second - first
                 if gap >= 544:
                     ascvec.copy_gm2ub(
-                        packed_dst, arith.addi(packed_offset, _to_index(pair * 2 * 544)),
-                        key_src, arith.addi(key_offset, _to_index(first)),
-                        dtypes.int32(2), dtypes.int32(544), dtypes.int64(gap),
-                        dtypes.int32(544), dtypes.int32(0), dtypes.int32(0))
+                        packed_dst,
+                        arith.addi(packed_offset, _to_index(pair * 2 * 544)),
+                        key_src,
+                        arith.addi(key_offset, _to_index(first)),
+                        dtypes.int32(2),
+                        dtypes.int32(544),
+                        dtypes.int64(gap),
+                        dtypes.int32(544),
+                        dtypes.int32(0),
+                        dtypes.int32(0),
+                    )
                 else:
                     ascvec.copy_gm2ub(
-                        packed_dst, arith.addi(packed_offset, _to_index(pair * 2 * 544)),
-                        key_src, arith.addi(key_offset, _to_index(first)),
-                        dtypes.int32(1), dtypes.int32(544), dtypes.int64(544),
-                        dtypes.int32(544), dtypes.int32(0), dtypes.int32(0))
+                        packed_dst,
+                        arith.addi(packed_offset, _to_index(pair * 2 * 544)),
+                        key_src,
+                        arith.addi(key_offset, _to_index(first)),
+                        dtypes.int32(1),
+                        dtypes.int32(544),
+                        dtypes.int64(544),
+                        dtypes.int32(544),
+                        dtypes.int32(0),
+                        dtypes.int32(0),
+                    )
                     ascvec.copy_gm2ub(
-                        packed_dst, arith.addi(packed_offset, _to_index((pair * 2 + 1) * 544)),
-                        key_src, arith.addi(key_offset, _to_index(second)),
-                        dtypes.int32(1), dtypes.int32(544), dtypes.int64(544),
-                        dtypes.int32(544), dtypes.int32(0), dtypes.int32(0))
+                        packed_dst,
+                        arith.addi(packed_offset, _to_index((pair * 2 + 1) * 544)),
+                        key_src,
+                        arith.addi(key_offset, _to_index(second)),
+                        dtypes.int32(1),
+                        dtypes.int32(544),
+                        dtypes.int64(544),
+                        dtypes.int32(544),
+                        dtypes.int32(0),
+                        dtypes.int32(0),
+                    )
         vec_sync_notify(PIPE.MTE2, PIPE.MTE3, 2)
         vec_sync_wait(PIPE.MTE2, PIPE.MTE3, 2)
         packed_src, packed_src_offset = extract_buffer(packed_ub, access="read")
@@ -913,15 +1162,25 @@ class QsliVector0:
         scale_dst, scale_offset = extract_buffer(staging_scale, access="write")
         # Gather all K rows and all scale rows into separate contiguous ND staging.
         ascvec.copy_ub2gm(
-            k_dst, arith.addi(k_offset, _to_index(staging_row * PACKED_D)),
-            packed_src, packed_src_offset,
-            dtypes.int32(CANDIDATE_BLOCKS_PER_AIV), dtypes.int32(512),
-            dtypes.int64(512), dtypes.int32(544))
+            k_dst,
+            arith.addi(k_offset, _to_index(staging_row * PACKED_D)),
+            packed_src,
+            packed_src_offset,
+            dtypes.int32(CANDIDATE_BLOCKS_PER_AIV),
+            dtypes.int32(512),
+            dtypes.int64(512),
+            dtypes.int32(544),
+        )
         ascvec.copy_ub2gm(
-            scale_dst, arith.addi(scale_offset, _to_index(staging_row * 4)),
-            packed_src, arith.addi(packed_src_offset, _to_index(512)),
-            dtypes.int32(CANDIDATE_BLOCKS_PER_AIV), dtypes.int32(32),
-            dtypes.int64(32), dtypes.int32(544))
+            scale_dst,
+            arith.addi(scale_offset, _to_index(staging_row * 4)),
+            packed_src,
+            arith.addi(packed_src_offset, _to_index(512)),
+            dtypes.int32(CANDIDATE_BLOCKS_PER_AIV),
+            dtypes.int32(32),
+            dtypes.int64(32),
+            dtypes.int32(544),
+        )
         if slot == 0:
             vec_sync_notify(PIPE.MTE3, PIPE.MTE2, 2)
         else:
@@ -929,14 +1188,27 @@ class QsliVector0:
 
     @jit
     def _gather_half64(
-        self, half, key, candidate_block_indices, candidate_block_length,
-        block_table, task_query_row, batch_idx, candidate_tile,
-        staging_key, staging_scale, task_idx, has_block_table, packed_ub, slot,
+        self,
+        half,
+        key,
+        candidate_block_indices,
+        candidate_block_length,
+        block_table,
+        task_query_row,
+        batch_idx,
+        candidate_tile,
+        staging_key,
+        staging_scale,
+        task_idx,
+        has_block_table,
+        packed_ub,
+        slot,
     ):
-        staging_row = (dtypes.int64(task_idx) * STAGING_DEPTH
-                       + dtypes.int64(candidate_tile) % STAGING_DEPTH) * TILE_N + dtypes.int64(half) * (TILE_N // 2)
+        staging_row = (
+            dtypes.int64(task_idx) * STAGING_DEPTH + dtypes.int64(candidate_tile) % STAGING_DEPTH
+        ) * TILE_N + dtypes.int64(half) * (TILE_N // 2)
         first_candidate = dtypes.int64(candidate_tile) * CANDIDATE_BLOCKS_PER_AIV
-        valid_blocks = dtypes.int64(candidate_block_length)
+        valid_blocks = dtypes.int64(candidate_block_length)  # noqa: F841
         if slot == 0:
             vec_sync_wait(PIPE.MTE3, PIPE.MTE2, 2)
         else:
@@ -969,17 +1241,31 @@ class QsliVector0:
                 pair_ok = dyn_select(gap >= 544, dyn_select(gap - 544 <= 549755813887, 1, 0), 0)
                 if pair_ok != 0:
                     ascvec.copy_gm2ub(
-                        packed_dst, arith.addi(packed_offset, _to_index(pair * 2 * 544)),
-                        key_src, arith.addi(key_offset, _to_index(first)),
-                        dtypes.int32(2), dtypes.int32(544), dtypes.int64(gap),
-                        dtypes.int32(544), dtypes.int32(0), dtypes.int32(0))
+                        packed_dst,
+                        arith.addi(packed_offset, _to_index(pair * 2 * 544)),
+                        key_src,
+                        arith.addi(key_offset, _to_index(first)),
+                        dtypes.int32(2),
+                        dtypes.int32(544),
+                        dtypes.int64(gap),
+                        dtypes.int32(544),
+                        dtypes.int32(0),
+                        dtypes.int32(0),
+                    )
                 else:
                     for item in range_constexpr(2):
                         ascvec.copy_gm2ub(
-                            packed_dst, arith.addi(packed_offset, _to_index((pair * 2 + item) * 544)),
-                            key_src, arith.addi(key_offset, _to_index(addresses[item])),
-                            dtypes.int32(1), dtypes.int32(544), dtypes.int64(544),
-                            dtypes.int32(544), dtypes.int32(0), dtypes.int32(0))
+                            packed_dst,
+                            arith.addi(packed_offset, _to_index((pair * 2 + item) * 544)),
+                            key_src,
+                            arith.addi(key_offset, _to_index(addresses[item])),
+                            dtypes.int32(1),
+                            dtypes.int32(544),
+                            dtypes.int64(544),
+                            dtypes.int32(544),
+                            dtypes.int32(0),
+                            dtypes.int32(0),
+                        )
         vec_sync_notify(PIPE.MTE2, PIPE.MTE3, 2)
         vec_sync_wait(PIPE.MTE2, PIPE.MTE3, 2)
         packed_src, packed_src_offset = extract_buffer(packed_ub, access="read")
@@ -987,15 +1273,25 @@ class QsliVector0:
         scale_dst, scale_offset = extract_buffer(staging_scale, access="write")
         # Gather all K rows and all scale rows into separate contiguous ND staging.
         ascvec.copy_ub2gm(
-            k_dst, arith.addi(k_offset, _to_index(staging_row * PACKED_D)),
-            packed_src, packed_src_offset,
-            dtypes.int32(CANDIDATE_BLOCKS_PER_AIV), dtypes.int32(512),
-            dtypes.int64(512), dtypes.int32(544))
+            k_dst,
+            arith.addi(k_offset, _to_index(staging_row * PACKED_D)),
+            packed_src,
+            packed_src_offset,
+            dtypes.int32(CANDIDATE_BLOCKS_PER_AIV),
+            dtypes.int32(512),
+            dtypes.int64(512),
+            dtypes.int32(544),
+        )
         ascvec.copy_ub2gm(
-            scale_dst, arith.addi(scale_offset, _to_index(staging_row * 4)),
-            packed_src, arith.addi(packed_src_offset, _to_index(512)),
-            dtypes.int32(CANDIDATE_BLOCKS_PER_AIV), dtypes.int32(32),
-            dtypes.int64(32), dtypes.int32(544))
+            scale_dst,
+            arith.addi(scale_offset, _to_index(staging_row * 4)),
+            packed_src,
+            arith.addi(packed_src_offset, _to_index(512)),
+            dtypes.int32(CANDIDATE_BLOCKS_PER_AIV),
+            dtypes.int32(32),
+            dtypes.int64(32),
+            dtypes.int32(544),
+        )
         if slot == 0:
             vec_sync_notify(PIPE.MTE3, PIPE.MTE2, 2)
         else:
@@ -1017,22 +1313,36 @@ class QsliVector0:
         has_block_table,
     ):
         slot = candidate_tile % 2
-        packed = tile_view(self.packed_buffer, (1, CANDIDATE_BLOCKS_PER_AIV, 544), (slot, 0, 0)).view(CANDIDATE_BLOCKS_PER_AIV, 544)
+        packed = tile_view(self.packed_buffer, (1, CANDIDATE_BLOCKS_PER_AIV, 544), (slot, 0, 0)).view(
+            CANDIDATE_BLOCKS_PER_AIV, 544
+        )
         self._gather_half(
-            self.subblock_idx,key,candidate_block_indices,candidate_block_length,
-            block_table,task_query_row,batch_idx,candidate_tile,
-            staging_key,staging_scale,task_idx,has_block_table,packed,slot)
+            self.subblock_idx,
+            key,
+            candidate_block_indices,
+            candidate_block_length,
+            block_table,
+            task_query_row,
+            batch_idx,
+            candidate_tile,
+            staging_key,
+            staging_scale,
+            task_idx,
+            has_block_table,
+            packed,
+            slot,
+        )
         vec_sync_intra_arrive(PIPE.MTE3, VECTOR0_READY_ID + candidate_tile % STAGING_DEPTH)
 
     @jit
     def begin_buffers(self):
         for slot in range_constexpr(2):
-            vec_sync_notify(PIPE.MTE3,PIPE.MTE2,2+slot)
+            vec_sync_notify(PIPE.MTE3, PIPE.MTE2, 2 + slot)
 
     @jit
     def drain_buffers(self):
         for slot in range_constexpr(2):
-            vec_sync_wait(PIPE.MTE3,PIPE.MTE2,2+slot)
+            vec_sync_wait(PIPE.MTE3, PIPE.MTE2, 2 + slot)
 
     @jit
     def wait_ready(self, tile):
@@ -1057,7 +1367,7 @@ class QsliVector1:
     def __init__(self, tokens):
         self.tokens = int(tokens)
         self.weight_ub = Channel(MemLoc.UB, (1, N1), dtypes.float32, depth=1)
-        self.weight_bf16 = Buffer(MemLoc.UB,(N1,),dtypes.bfloat16)
+        self.weight_bf16 = Buffer(MemLoc.UB, (N1,), dtypes.bfloat16)
         self.key_ub = Buffer(MemLoc.UB, (1, TOPK_TRUNK_LEN), dtypes.uint16)
         self.valid_counts = Buffer(MemLoc.UB, (CANDIDATE_CAPACITY,), dtypes.int32)
         self.valid_ub = Buffer(MemLoc.UB, (TILE_N,), dtypes.uint16)
@@ -1066,14 +1376,13 @@ class QsliVector1:
     def load_weights(self, weights, task_query_row):
         mem_copy(self.weight_ub, tile_view(weights, (1, N1), (task_query_row, 0)))
         with vf(mode="raw"):
-            mask = rr.update_mask(N1,elem_bits=32)[0]
-            value = rr.vcast(rr.vload(self.weight_ub,0),dtypes.bfloat16,
-                            mask=mask,reg_layout=rr.RegLayout.ZERO)
-            packed = rr.vpack(rr.vreinterpret_lanes(value,dtypes.uint32),dtypes.uint16,part="lower")
-            rr.vstore(self.weight_bf16,0,rr.vreinterpret(packed,dtypes.bfloat16),
-                      rr.update_mask(N1,elem_bits=16)[0])
+            mask = rr.update_mask(N1, elem_bits=32)[0]
+            value = rr.vcast(rr.vload(self.weight_ub, 0), dtypes.bfloat16, mask=mask, reg_layout=rr.RegLayout.ZERO)
+            packed = rr.vpack(rr.vreinterpret_lanes(value, dtypes.uint32), dtypes.uint16, part="lower")
+            rr.vstore(
+                self.weight_bf16, 0, rr.vreinterpret(packed, dtypes.bfloat16), rr.update_mask(N1, elem_bits=16)[0]
+            )
             rr.vmem_bar("vst_vld")
-
 
     @jit
     def compute(self, qk_handoff, candidate_tile, subblock_idx, workspace_tile, pair_swaps):
@@ -1088,8 +1397,13 @@ class QsliVector1:
             for half in dsl_range(half_count, unroll=1):
                 lane = rr.varange(half * 64, dtypes.uint32)
                 offset = rr.vbitwise_and(lane, rr.vdups(7, dtypes.uint32, mask=full32), mask=full32)
-                counts = rr.vload_broadcast(self.valid_counts,
-                    candidate_tile * CANDIDATE_BLOCKS_PER_TILE + subblock_idx*CANDIDATE_BLOCKS_PER_AIV + dtypes.int64(half) * 8, mode="datablock")
+                counts = rr.vload_broadcast(
+                    self.valid_counts,
+                    candidate_tile * CANDIDATE_BLOCKS_PER_TILE
+                    + subblock_idx * CANDIDATE_BLOCKS_PER_AIV
+                    + dtypes.int64(half) * 8,
+                    mode="datablock",
+                )
                 valid = rr.vselect(one32, zero32, cond_mask=rr.vlt(offset, counts, mask=full32))
                 rr.vstore(self.valid_ub, half * 64, rr.vpack(valid, dtypes.uint16, part="lower"), half16)
             rr.vmem_bar("vst_vld")
@@ -1097,17 +1411,17 @@ class QsliVector1:
             acc1 = rr.vdups(0.0, dtypes.bfloat16, mask=mask16)
             for group_block in dsl_range(group_count // 4, unroll=1):
                 w0 = rr.vload_broadcast(self.weight_bf16, group_block * 4 + 0)
-                q0_0 = rr.vmaxs(rr.vload(qk_handoff, (group_block * 4 + 0) * (TILE_N//2) + 0), 0.0, mask=mask16)
-                q0_1 = rr.vmaxs(rr.vload(qk_handoff, (group_block * 4 + 0) * (TILE_N//2) + 128), 0.0, mask=mask16)
+                q0_0 = rr.vmaxs(rr.vload(qk_handoff, (group_block * 4 + 0) * (TILE_N // 2) + 0), 0.0, mask=mask16)
+                q0_1 = rr.vmaxs(rr.vload(qk_handoff, (group_block * 4 + 0) * (TILE_N // 2) + 128), 0.0, mask=mask16)
                 w1 = rr.vload_broadcast(self.weight_bf16, group_block * 4 + 1)
-                q1_0 = rr.vmaxs(rr.vload(qk_handoff, (group_block * 4 + 1) * (TILE_N//2) + 0), 0.0, mask=mask16)
-                q1_1 = rr.vmaxs(rr.vload(qk_handoff, (group_block * 4 + 1) * (TILE_N//2) + 128), 0.0, mask=mask16)
+                q1_0 = rr.vmaxs(rr.vload(qk_handoff, (group_block * 4 + 1) * (TILE_N // 2) + 0), 0.0, mask=mask16)
+                q1_1 = rr.vmaxs(rr.vload(qk_handoff, (group_block * 4 + 1) * (TILE_N // 2) + 128), 0.0, mask=mask16)
                 w2 = rr.vload_broadcast(self.weight_bf16, group_block * 4 + 2)
-                q2_0 = rr.vmaxs(rr.vload(qk_handoff, (group_block * 4 + 2) * (TILE_N//2) + 0), 0.0, mask=mask16)
-                q2_1 = rr.vmaxs(rr.vload(qk_handoff, (group_block * 4 + 2) * (TILE_N//2) + 128), 0.0, mask=mask16)
+                q2_0 = rr.vmaxs(rr.vload(qk_handoff, (group_block * 4 + 2) * (TILE_N // 2) + 0), 0.0, mask=mask16)
+                q2_1 = rr.vmaxs(rr.vload(qk_handoff, (group_block * 4 + 2) * (TILE_N // 2) + 128), 0.0, mask=mask16)
                 w3 = rr.vload_broadcast(self.weight_bf16, group_block * 4 + 3)
-                q3_0 = rr.vmaxs(rr.vload(qk_handoff, (group_block * 4 + 3) * (TILE_N//2) + 0), 0.0, mask=mask16)
-                q3_1 = rr.vmaxs(rr.vload(qk_handoff, (group_block * 4 + 3) * (TILE_N//2) + 128), 0.0, mask=mask16)
+                q3_0 = rr.vmaxs(rr.vload(qk_handoff, (group_block * 4 + 3) * (TILE_N // 2) + 0), 0.0, mask=mask16)
+                q3_1 = rr.vmaxs(rr.vload(qk_handoff, (group_block * 4 + 3) * (TILE_N // 2) + 128), 0.0, mask=mask16)
                 acc0 = rr.vmadd(q0_0, w0, acc0, mask=mask16)
                 acc1 = rr.vmadd(q0_1, w0, acc1, mask=mask16)
                 acc0 = rr.vmadd(q1_0, w1, acc0, mask=mask16)
@@ -1122,8 +1436,12 @@ class QsliVector1:
             block1 = rr.vadds(block0, 16, mask=full32)
             perm0 = rr.vbitwise_xor(word_lane, rr.vgather(pair_swaps, block0, mask=full32), mask=full32)
             perm1 = rr.vbitwise_xor(word_lane, rr.vgather(pair_swaps, block1, mask=full32), mask=full32)
-            acc0 = rr.vreinterpret_lanes(rr.vgather_reg(rr.vreinterpret_lanes(acc0, dtypes.uint32), perm0), dtypes.bfloat16)
-            acc1 = rr.vreinterpret_lanes(rr.vgather_reg(rr.vreinterpret_lanes(acc1, dtypes.uint32), perm1), dtypes.bfloat16)
+            acc0 = rr.vreinterpret_lanes(
+                rr.vgather_reg(rr.vreinterpret_lanes(acc0, dtypes.uint32), perm0), dtypes.bfloat16
+            )
+            acc1 = rr.vreinterpret_lanes(
+                rr.vgather_reg(rr.vreinterpret_lanes(acc1, dtypes.uint32), perm1), dtypes.bfloat16
+            )
             value0 = rr.vadd(acc0, rr.vdups(0.0, dtypes.bfloat16, mask=mask16), mask=mask16)
             bits0 = rr.vreinterpret(value0, dtypes.uint16)
             sign0 = rr.vbitwise_and(bits0, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
@@ -1131,9 +1449,12 @@ class QsliVector1:
             positive_key0 = rr.vbitwise_xor(bits0, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key0 = rr.vbitwise_xor(bits0, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
             keys0 = rr.vselect(negative_key0, positive_key0, cond_mask=negative0)
-            keys0 = rr.vselect(keys0, rr.vdups(0, dtypes.uint16, mask=mask16),
-                cond_mask=rr.veqs(rr.vload(self.valid_ub, 0), 1, mask=mask16))
-            rr.vstore(self.key_ub, workspace_tile * (TILE_N//2) + 0, keys0, mask16)
+            keys0 = rr.vselect(
+                keys0,
+                rr.vdups(0, dtypes.uint16, mask=mask16),
+                cond_mask=rr.veqs(rr.vload(self.valid_ub, 0), 1, mask=mask16),
+            )
+            rr.vstore(self.key_ub, workspace_tile * (TILE_N // 2) + 0, keys0, mask16)
             value1 = rr.vadd(acc1, rr.vdups(0.0, dtypes.bfloat16, mask=mask16), mask=mask16)
             bits1 = rr.vreinterpret(value1, dtypes.uint16)
             sign1 = rr.vbitwise_and(bits1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
@@ -1141,11 +1462,13 @@ class QsliVector1:
             positive_key1 = rr.vbitwise_xor(bits1, rr.vdups(0x8000, dtypes.uint16, mask=mask16), mask=mask16)
             negative_key1 = rr.vbitwise_xor(bits1, rr.vdups(0xFFFF, dtypes.uint16, mask=mask16), mask=mask16)
             keys1 = rr.vselect(negative_key1, positive_key1, cond_mask=negative1)
-            keys1 = rr.vselect(keys1, rr.vdups(0, dtypes.uint16, mask=mask16),
-                cond_mask=rr.veqs(rr.vload(self.valid_ub, 128), 1, mask=mask16))
-            rr.vstore(self.key_ub, workspace_tile * (TILE_N//2) + 128, keys1, mask16)
+            keys1 = rr.vselect(
+                keys1,
+                rr.vdups(0, dtypes.uint16, mask=mask16),
+                cond_mask=rr.veqs(rr.vload(self.valid_ub, 128), 1, mask=mask16),
+            )
+            rr.vstore(self.key_ub, workspace_tile * (TILE_N // 2) + 128, keys1, mask16)
             rr.vmem_bar("vst_vld")
-
 
     @jit
     def join_scores(self, key_workspace, worker_idx, tiles, subblock_idx):
@@ -1153,8 +1476,16 @@ class QsliVector1:
         vec_sync_wait(PIPE.V, PIPE.MTE3, 0)
         src, src_offset = extract_buffer(self.key_ub, access="read")
         dst, dst_offset = extract_buffer(key_workspace, access="write")
-        ascvec.copy_ub2gm(dst, arith.addi(dst_offset, _to_index(worker_idx * self.tokens + subblock_idx * (TILE_N//2))),
-                         src, src_offset, dtypes.int32(tiles), dtypes.int32(TILE_N), dtypes.int64(TILE_N*2), dtypes.int32(TILE_N))
+        ascvec.copy_ub2gm(
+            dst,
+            arith.addi(dst_offset, _to_index(worker_idx * self.tokens + subblock_idx * (TILE_N // 2))),
+            src,
+            src_offset,
+            dtypes.int32(tiles),
+            dtypes.int32(TILE_N),
+            dtypes.int64(TILE_N * 2),
+            dtypes.int32(TILE_N),
+        )
         vec_sync_intra_arrive(PIPE.MTE3, 6)
         cube_sync_intra_wait(PIPE.MTE2, 6)
         cube_sync_intra_wait(PIPE.MTE2, 22)
@@ -1162,7 +1493,9 @@ class QsliVector1:
         cube_sync_intra_arrive(PIPE.MTE2, 23)
         vec_sync_intra_wait(PIPE.MTE2, 7)
         if subblock_idx == dtypes.int64(0):
-            mem_copy(local_slice(self.key_ub,(1,self.tokens)), tile_view(key_workspace,(1,self.tokens),(worker_idx,0)))
+            mem_copy(
+                local_slice(self.key_ub, (1, self.tokens)), tile_view(key_workspace, (1, self.tokens), (worker_idx, 0))
+            )
             vec_sync_notify(PIPE.MTE2, PIPE.V, 0)
             vec_sync_wait(PIPE.MTE2, PIPE.V, 0)
 
@@ -1177,37 +1510,61 @@ class QsliPositionMapper:
         # Half-vector loads may fetch a full register. Reserve private padding
         # so the final AIV1 load does not read an adjacent UB allocation.
         self.candidate_ub = Channel(
-            MemLoc.UB, (self.candidate_capacity,), dtypes.int32, depth=1,
+            MemLoc.UB,
+            (self.candidate_capacity,),
+            dtypes.int32,
+            depth=1,
             capacity=(ceil_div(self.candidate_capacity, 64) * 64 + 64,),
         )
         self.output_ub = Channel(
-            MemLoc.UB, (1, self.topk), dtypes.int32, depth=1,
+            MemLoc.UB,
+            (1, self.topk),
+            dtypes.int32,
+            depth=1,
         )
 
     @jit
-    def count_visible(self, candidate_block_indices, query_row, candidate_length, valid_s2, candidate_begin, candidate_end, valid_counts):
+    def count_visible(
+        self,
+        candidate_block_indices,
+        query_row,
+        candidate_length,
+        valid_s2,
+        candidate_begin,
+        candidate_end,
+        valid_counts,
+    ):
         mem_copy(
             self.candidate_ub,
-            tile_view(_offset_view(candidate_block_indices, (query_row, 0, 0)),
-                      (self.candidate_capacity,), (0,)),
+            tile_view(_offset_view(candidate_block_indices, (query_row, 0, 0)), (self.candidate_capacity,), (0,)),
         )
         with vf(mode="raw"):
             mask = rr.update_mask(64, elem_bits=32)[0]
             total = rr.vdups(0, dtypes.int32, mask=mask)
             for chunk in dsl_range(candidate_begin // 64, (candidate_end + 63) // 64, unroll=1):
                 ids = rr.vload(self.candidate_ub, chunk * 64)
-                count = rr.vsub(rr.vdups(valid_s2, dtypes.int32, mask=mask),
-                                rr.vmuls(ids, CANDIDATE_BLOCK_SIZE, mask=mask), mask=mask)
+                count = rr.vsub(
+                    rr.vdups(valid_s2, dtypes.int32, mask=mask),
+                    rr.vmuls(ids, CANDIDATE_BLOCK_SIZE, mask=mask),
+                    mask=mask,
+                )
                 count = rr.vmins(rr.vmaxs(count, 0, mask=mask), CANDIDATE_BLOCK_SIZE, mask=mask)
-                count = rr.vselect(count, rr.vdups(0, dtypes.int32, mask=mask),
-                                   cond_mask=rr.mask_and(
-                                       rr.vlts(rr.varange(chunk * 64, dtypes.int32), candidate_length, mask=mask),
-                                       rr.mask_and(rr.vges(rr.varange(chunk * 64, dtypes.int32), candidate_begin, mask=mask),
-                                                   rr.vlts(rr.varange(chunk * 64, dtypes.int32), candidate_end, mask=mask), exec_mask=mask), exec_mask=mask))
+                count = rr.vselect(
+                    count,
+                    rr.vdups(0, dtypes.int32, mask=mask),
+                    cond_mask=rr.mask_and(
+                        rr.vlts(rr.varange(chunk * 64, dtypes.int32), candidate_length, mask=mask),
+                        rr.mask_and(
+                            rr.vges(rr.varange(chunk * 64, dtypes.int32), candidate_begin, mask=mask),
+                            rr.vlts(rr.varange(chunk * 64, dtypes.int32), candidate_end, mask=mask),
+                            exec_mask=mask,
+                        ),
+                        exec_mask=mask,
+                    ),
+                )
                 rr.vstore(valid_counts, chunk * 64, count, mask)
                 total = rr.vadd(total, count, mask=mask)
-            rr.vstore(self.count_ub, 0, rr.vreduce_sum(total, mask=mask),
-                      rr.update_mask(1, elem_bits=32)[0])
+            rr.vstore(self.count_ub, 0, rr.vreduce_sum(total, mask=mask), rr.update_mask(1, elem_bits=32)[0])
             rr.vmem_bar("vst_vld")
         # Publish now; consume only when local TopK needs the scalar count.
         vec_sync_notify(PIPE.V, PIPE.S, 0)
@@ -1218,24 +1575,43 @@ class QsliPositionMapper:
         return dtypes.int32(self.count_ub[0])
 
     @jit
-    def load_own_counts(self, candidate_block_indices, query_row, candidate_length, valid_s2, candidate_begin, candidate_end, valid_counts):
+    def load_own_counts(
+        self,
+        candidate_block_indices,
+        query_row,
+        candidate_length,
+        valid_s2,
+        candidate_begin,
+        candidate_end,
+        valid_counts,
+    ):
         mem_copy(
             self.candidate_ub,
-            tile_view(_offset_view(candidate_block_indices, (query_row, 0, 0)),
-                      (self.candidate_capacity,), (0,)),
+            tile_view(_offset_view(candidate_block_indices, (query_row, 0, 0)), (self.candidate_capacity,), (0,)),
         )
         with vf(mode="raw"):
             mask = rr.update_mask(32, elem_bits=32)[0]
             for chunk in dsl_range(candidate_begin // 64, (candidate_end + 63) // 64, unroll=1):
                 ids = rr.vload(self.candidate_ub, chunk * 64 + 32)
-                count = rr.vsub(rr.vdups(valid_s2, dtypes.int32, mask=mask),
-                                rr.vmuls(ids, CANDIDATE_BLOCK_SIZE, mask=mask), mask=mask)
+                count = rr.vsub(
+                    rr.vdups(valid_s2, dtypes.int32, mask=mask),
+                    rr.vmuls(ids, CANDIDATE_BLOCK_SIZE, mask=mask),
+                    mask=mask,
+                )
                 count = rr.vmins(rr.vmaxs(count, 0, mask=mask), CANDIDATE_BLOCK_SIZE, mask=mask)
-                count = rr.vselect(count, rr.vdups(0, dtypes.int32, mask=mask),
-                                   cond_mask=rr.mask_and(
-                                       rr.vlts(rr.varange(chunk * 64 + 32, dtypes.int32), candidate_length, mask=mask),
-                                       rr.mask_and(rr.vges(rr.varange(chunk * 64 + 32, dtypes.int32), candidate_begin, mask=mask),
-                                                   rr.vlts(rr.varange(chunk * 64 + 32, dtypes.int32), candidate_end, mask=mask), exec_mask=mask), exec_mask=mask))
+                count = rr.vselect(
+                    count,
+                    rr.vdups(0, dtypes.int32, mask=mask),
+                    cond_mask=rr.mask_and(
+                        rr.vlts(rr.varange(chunk * 64 + 32, dtypes.int32), candidate_length, mask=mask),
+                        rr.mask_and(
+                            rr.vges(rr.varange(chunk * 64 + 32, dtypes.int32), candidate_begin, mask=mask),
+                            rr.vlts(rr.varange(chunk * 64 + 32, dtypes.int32), candidate_end, mask=mask),
+                            exec_mask=mask,
+                        ),
+                        exec_mask=mask,
+                    ),
+                )
                 rr.vstore(valid_counts, chunk * 64 + 32, count, mask)
             rr.vmem_bar("vst_vld")
 
@@ -1262,9 +1638,7 @@ class QsliPositionMapper:
             for chunk in dsl_range(ceil_div(self.topk, 64), unroll=1):
                 count = self.topk - chunk * 64
                 mask = rr.update_mask(count, elem_bits=32)[0]
-                position = rr.vreinterpret(
-                    rr.vload(selected_positions, chunk * 64), dtypes.uint32
-                )
+                position = rr.vreinterpret(rr.vload(selected_positions, chunk * 64), dtypes.uint32)
                 valid = rr.vlts(
                     rr.varange(chunk * 64, dtypes.uint32),
                     valid_count,
@@ -1279,9 +1653,7 @@ class QsliPositionMapper:
                     cond_mask=valid,
                 )
                 block_position = rr.vshr(position, 3, mask=mask)
-                block_id = rr.vgather(
-                    self.candidate_ub, block_position, mask=mask
-                )
+                block_id = rr.vgather(self.candidate_ub, block_position, mask=mask)
                 logical_index = rr.vadd(
                     rr.vmuls(block_id, CANDIDATE_BLOCK_SIZE, mask=mask),
                     rr.vreinterpret(
@@ -1298,9 +1670,7 @@ class QsliPositionMapper:
                     ),
                     mask=mask,
                 )
-                logical_index = rr.vadds(
-                    logical_index, output_idx_offset, mask=mask
-                )
+                logical_index = rr.vadds(logical_index, output_idx_offset, mask=mask)
                 rr.vstore(
                     self.output_ub,
                     chunk * 64,
@@ -1322,10 +1692,16 @@ class QsliOutputWriter:
     def __init__(self, public_topk):
         self.public_topk = int(public_topk)
         self.index_ub = Channel(
-            MemLoc.UB, (1, self.public_topk), dtypes.int32, depth=1,
+            MemLoc.UB,
+            (1, self.public_topk),
+            dtypes.int32,
+            depth=1,
         )
         self.value_ub = Channel(
-            MemLoc.UB, (1, self.public_topk), dtypes.uint16, depth=1,
+            MemLoc.UB,
+            (1, self.public_topk),
+            dtypes.uint16,
+            depth=1,
         )
 
     @jit
@@ -1334,7 +1710,11 @@ class QsliOutputWriter:
             for chunk in dsl_range(ceil_div(self.public_topk, 64), unroll=1):
                 count = self.public_topk - chunk * 64
                 mask32 = rr.update_mask(count, elem_bits=32)[0]
-                mask16 = rr.mask_and(rr.update_mask(count, elem_bits=16)[0], rr.update_mask(64, elem_bits=16)[0], exec_mask=rr.update_mask(64, elem_bits=16)[0])
+                mask16 = rr.mask_and(
+                    rr.update_mask(count, elem_bits=16)[0],
+                    rr.update_mask(64, elem_bits=16)[0],
+                    exec_mask=rr.update_mask(64, elem_bits=16)[0],
+                )
                 rr.vstore(
                     self.index_ub,
                     chunk * 64,
@@ -1389,22 +1769,14 @@ class QsliFusedKernel:
         self.has_output_offset = bool(has_output_offset)
         # Explicit per-slot credits protect both BF16 destinations. The current
         # Channel split-N path does not support FP32-to-BF16 narrowing.
-        self.qk_handoff = Buffer(
-            MemLoc.UB, (TILE_M * 2, TILE_N // 2), dtypes.bfloat16
-        )
+        self.qk_handoff = Buffer(MemLoc.UB, (TILE_M * 2, TILE_N // 2), dtypes.bfloat16)
         self.cube = QsliCube()
         self.vector0 = QsliVector0(get_subblock_id(), pa_block_size)
         self.vector1 = QsliVector1(tokens)
         self.output_writer = QsliOutputWriter(self.topk_count)
-        self.topk_workspace = QsliLocalTopKWorkspace(
-            TOPK_TRUNK_LEN, self.topk_count
-        )
-        self.topk = QsliLocalTopKSelector(
-            self.topk_count, self.topk_workspace
-        )
-        self.position_mapper = QsliPositionMapper(
-            self.topk_count, candidate_capacity
-        )
+        self.topk_workspace = QsliLocalTopKWorkspace(TOPK_TRUNK_LEN, self.topk_count)
+        self.topk = QsliLocalTopKSelector(self.topk_count, self.topk_workspace)
+        self.position_mapper = QsliPositionMapper(self.topk_count, candidate_capacity)
 
     @jit
     def __call__(
@@ -1413,7 +1785,6 @@ class QsliFusedKernel:
         key: Tensor,
         weights: Tensor,
         query_scale: Tensor,
-
         candidate_block_indices: Tensor,
         candidate_block_length: Tensor,
         cu_seqlens_q: Tensor,
@@ -1436,7 +1807,10 @@ class QsliFusedKernel:
         logical_k_capacity,
         metadata: Tensor,
         return_values,
-        partial_idx_address, partial_bits_address, final_idx_address, final_bits_address,
+        partial_idx_address,
+        partial_bits_address,
+        final_idx_address,
+        final_bits_address,
         batch_consistency,
     ):
         self.vector0.batch_consistency = batch_consistency
@@ -1466,32 +1840,51 @@ class QsliFusedKernel:
                 if batch_idx == first_b:
                     first_m = dtypes.int64(metadata[worker_idx, 2])
                 if batch_idx == last_b:
-                    last_m = dtypes.int64(metadata[worker_idx, 5]) + dtypes.int64(dyn_select(metadata[worker_idx, 6] > 0, 1, 0))
+                    last_m = dtypes.int64(metadata[worker_idx, 5]) + dtypes.int64(
+                        dyn_select(metadata[worker_idx, 6] > 0, 1, 0)
+                    )
                 self.vector0.preload_table(block_table, batch_idx, self.has_block_table)
                 prefetched_tiles = dtypes.int64(0)
                 for m_idx in dsl_range(first_m, last_m, unroll=1):
                     query_row = begin + m_idx
                     candidate_length = dtypes.int32(candidate_block_length[query_row, 0])
                     tile_begin = dtypes.int64(0)
-                    tile_end = (dtypes.int64(candidate_length) + TILE_N // CANDIDATE_BLOCK_SIZE - 1) // (TILE_N // CANDIDATE_BLOCK_SIZE)
+                    tile_end = (dtypes.int64(candidate_length) + TILE_N // CANDIDATE_BLOCK_SIZE - 1) // (
+                        TILE_N // CANDIDATE_BLOCK_SIZE
+                    )
                     if batch_idx == first_b and m_idx == first_m:
                         tile_begin = dtypes.int64(metadata[worker_idx, 3])
                     if batch_idx == last_b and m_idx == dtypes.int64(metadata[worker_idx, 5]):
                         tile_end = min(tile_end, dtypes.int64(metadata[worker_idx, 6]))
                     valid_s2 = actual
                     if self.mask_mode == 3:
-                        valid_s2 = min(actual, max(dtypes.int32(0), (actual * self.cmp_ratio + residual - used_q + dtypes.int32(m_idx) + 1) // self.cmp_ratio))
+                        valid_s2 = min(
+                            actual,
+                            max(
+                                dtypes.int32(0),
+                                (actual * self.cmp_ratio + residual - used_q + dtypes.int32(m_idx) + 1)
+                                // self.cmp_ratio,
+                            ),
+                        )
                     if m_idx >= dtypes.int64(used_q):
                         valid_s2 = dtypes.int32(0)
-                    full_tiles = (dtypes.int64(candidate_length) + TILE_N // CANDIDATE_BLOCK_SIZE - 1) // (TILE_N // CANDIDATE_BLOCK_SIZE)
+                    full_tiles = (dtypes.int64(candidate_length) + TILE_N // CANDIDATE_BLOCK_SIZE - 1) // (
+                        TILE_N // CANDIDATE_BLOCK_SIZE
+                    )
                     row_ld = valid_s2 > 0 and (tile_begin > 0 or tile_end < full_tiles)
-                    output_row = dtypes.int64(dyn_select(row_ld,workspace_cursor,query_row))
-                    idx_address = dtypes.int64(dyn_select(row_ld,partial_idx_address,final_idx_address))
-                    bits_address = dtypes.int64(dyn_select(row_ld,partial_bits_address,final_bits_address))
-                    sparse_indices = make_tensor(make_pointer(dtypes.int32,idx_address,MemLoc.GM),make_layout((max(query_rows,64),self.topk_count),stride=(self.topk_count,1)))
-                    sparse_value_bits = make_tensor(make_pointer(dtypes.uint16,bits_address,MemLoc.GM),make_layout((max(query_rows,64),self.topk_count),stride=(self.topk_count,1)))
+                    output_row = dtypes.int64(dyn_select(row_ld, workspace_cursor, query_row))
+                    idx_address = dtypes.int64(dyn_select(row_ld, partial_idx_address, final_idx_address))
+                    bits_address = dtypes.int64(dyn_select(row_ld, partial_bits_address, final_bits_address))
+                    sparse_indices = make_tensor(
+                        make_pointer(dtypes.int32, idx_address, MemLoc.GM),
+                        make_layout((max(query_rows, 64), self.topk_count), stride=(self.topk_count, 1)),
+                    )
+                    sparse_value_bits = make_tensor(
+                        make_pointer(dtypes.uint16, bits_address, MemLoc.GM),
+                        make_layout((max(query_rows, 64), self.topk_count), stride=(self.topk_count, 1)),
+                    )
                     if subblock_idx == dtypes.int64(0):
-                        self.output_writer.initialize(sparse_indices,sparse_value_bits,output_row)
+                        self.output_writer.initialize(sparse_indices, sparse_value_bits, output_row)
                     if row_ld:
                         workspace_cursor += 1
                     # Metadata boundaries directly index complete compute tiles.
@@ -1502,15 +1895,23 @@ class QsliFusedKernel:
                         if valid_s2 > dtypes.int32(0):
                             if subblock_idx == dtypes.int64(0):
                                 self.position_mapper.count_visible(
-                                    candidate_block_indices, query_row, candidate_length, valid_s2,
-                                    dtypes.int32(candidate_begin), dtypes.int32(candidate_end),
-                                    self.vector1.valid_counts
+                                    candidate_block_indices,
+                                    query_row,
+                                    candidate_length,
+                                    valid_s2,
+                                    dtypes.int32(candidate_begin),
+                                    dtypes.int32(candidate_end),
+                                    self.vector1.valid_counts,
                                 )
                             else:
                                 self.position_mapper.load_own_counts(
-                                    candidate_block_indices, query_row, candidate_length, valid_s2,
-                                    dtypes.int32(candidate_begin), dtypes.int32(candidate_end),
-                                    self.vector1.valid_counts
+                                    candidate_block_indices,
+                                    query_row,
+                                    candidate_length,
+                                    valid_s2,
+                                    dtypes.int32(candidate_begin),
+                                    dtypes.int32(candidate_end),
+                                    self.vector1.valid_counts,
                                 )
 
                         # Keep the Cube/AIV control flow keyed only by sequence
@@ -1523,7 +1924,17 @@ class QsliFusedKernel:
                             )
                             self.vector1.load_weights(weights, query_row)
                             if prefetched_tiles == 0:
-                                self.vector0.prepare_addresses(candidate_block_indices, query_row, candidate_length, key.stride[0], candidate_begin, candidate_end, key.shape[0] * key.stride[0], block_table.shape[1], self.has_block_table)
+                                self.vector0.prepare_addresses(
+                                    candidate_block_indices,
+                                    query_row,
+                                    candidate_length,
+                                    key.stride[0],
+                                    candidate_begin,
+                                    candidate_end,
+                                    key.shape[0] * key.stride[0],
+                                    block_table.shape[1],
+                                    self.has_block_table,
+                                )
                                 self.vector0.begin_buffers()
                             for qk_slot in range_constexpr(2):
                                 vec_sync_intra_arrive(PIPE.V, 4 + qk_slot)
@@ -1533,7 +1944,6 @@ class QsliFusedKernel:
                                         self.vector0.await_slot(tick)
                                     self.vector0.gather(
                                         key,
-
                                         candidate_block_indices,
                                         candidate_length,
                                         block_table,
@@ -1549,14 +1959,11 @@ class QsliFusedKernel:
                                     candidate_tile = tick - 1
                                     self.vector0.wait_ready(candidate_tile)
                                     staging_row = (
-                                        worker_idx * STAGING_DEPTH
-                                        + dtypes.int64(candidate_tile) % STAGING_DEPTH
+                                        worker_idx * STAGING_DEPTH + dtypes.int64(candidate_tile) % STAGING_DEPTH
                                     ) * TILE_N
                                     self.cube.compute_qk(
                                         tile_view(
-                                            _offset_view(
-                                                staging_key_fp4, (staging_row, 0)
-                                            ),
+                                            _offset_view(staging_key_fp4, (staging_row, 0)),
                                             (TILE_N, LOGICAL_D),
                                             (0, 0),
                                         ),
@@ -1568,12 +1975,13 @@ class QsliFusedKernel:
                                             (TILE_N, 2, 2),
                                             (0, 0, 0),
                                         ),
-                                        self.qk_handoff, candidate_tile % 2,
+                                        self.qk_handoff,
+                                        candidate_tile % 2,
                                     )
                                     self.vector0.signal_consumed(candidate_tile)
                                     vec_sync_intra_wait(PIPE.V, 14 + candidate_tile % 2)
                                     self.vector1.compute(
-                                        tile_view(self.qk_handoff,(TILE_M,TILE_N//2),(candidate_tile % 2,0)),
+                                        tile_view(self.qk_handoff, (TILE_M, TILE_N // 2), (candidate_tile % 2, 0)),
                                         candidate_tile,
                                         subblock_idx,
                                         candidate_tile - tile_begin,
@@ -1581,33 +1989,59 @@ class QsliFusedKernel:
                                     )
                                     vec_sync_intra_arrive(PIPE.V, 4 + candidate_tile % 2)
 
-                            for final_tick in dsl_range(max(tile_begin, tile_end-STAGING_DEPTH), tile_end, unroll=1):
+                            for final_tick in dsl_range(max(tile_begin, tile_end - STAGING_DEPTH), tile_end, unroll=1):
                                 self.vector0.await_slot(final_tick)
                             self.vector0.drain_buffers()
                             for qk_slot in range_constexpr(2):
-                                cube_sync_intra_wait(PIPE.FIXPIPE,4+qk_slot)
-                                cube_sync_intra_wait(PIPE.FIXPIPE,20+qk_slot)
-                            self.vector1.join_scores(key_workspace,worker_idx,tile_end-tile_begin,subblock_idx)
+                                cube_sync_intra_wait(PIPE.FIXPIPE, 4 + qk_slot)
+                                cube_sync_intra_wait(PIPE.FIXPIPE, 20 + qk_slot)
+                            self.vector1.join_scores(key_workspace, worker_idx, tile_end - tile_begin, subblock_idx)
                             prefetched_tiles = dtypes.int64(0)
                             next_m = m_idx + 1
                             if next_m < last_m and next_m < dtypes.int64(used_q):
                                 next_row = query_row + 1
                                 next_length = dtypes.int32(candidate_block_length[next_row, 0])
-                                next_end = (dtypes.int64(next_length) + CANDIDATE_BLOCKS_PER_TILE - 1) // CANDIDATE_BLOCKS_PER_TILE
+                                next_end = (
+                                    dtypes.int64(next_length) + CANDIDATE_BLOCKS_PER_TILE - 1
+                                ) // CANDIDATE_BLOCKS_PER_TILE
                                 if batch_idx == last_b and next_m == dtypes.int64(metadata[worker_idx, 5]):
                                     next_end = min(next_end, dtypes.int64(metadata[worker_idx, 6]))
                                 next_visible = actual
                                 if self.mask_mode == 3:
-                                    next_visible = min(actual, max(dtypes.int32(0), (actual * self.cmp_ratio + residual - used_q + dtypes.int32(next_m) + 1) // self.cmp_ratio))
+                                    next_visible = min(
+                                        actual,
+                                        max(
+                                            dtypes.int32(0),
+                                            (actual * self.cmp_ratio + residual - used_q + dtypes.int32(next_m) + 1)
+                                            // self.cmp_ratio,
+                                        ),
+                                    )
                                 if next_length > 0 and next_end > 0 and next_visible > 0:
-                                    self.vector0.prepare_addresses(candidate_block_indices, next_row, next_length, key.stride[0], dtypes.int64(0), next_end * CANDIDATE_BLOCKS_PER_TILE, key.shape[0] * key.stride[0], block_table.shape[1], self.has_block_table)
+                                    self.vector0.prepare_addresses(
+                                        candidate_block_indices,
+                                        next_row,
+                                        next_length,
+                                        key.stride[0],
+                                        dtypes.int64(0),
+                                        next_end * CANDIDATE_BLOCKS_PER_TILE,
+                                        key.shape[0] * key.stride[0],
+                                        block_table.shape[1],
+                                        self.has_block_table,
+                                    )
                                     self.vector0.begin_buffers()
                                     prefetched_tiles = min(dtypes.int64(STAGING_DEPTH), next_end)
                                     for future_tile in dsl_range(prefetched_tiles, unroll=1):
                                         self.vector0.gather(
-                                            key, candidate_block_indices, next_length,
-                                            block_table, next_row, batch_idx, future_tile,
-                                            staging_key, staging_scale, worker_idx,
+                                            key,
+                                            candidate_block_indices,
+                                            next_length,
+                                            block_table,
+                                            next_row,
+                                            batch_idx,
+                                            future_tile,
+                                            staging_key,
+                                            staging_scale,
+                                            worker_idx,
                                             self.has_block_table,
                                         )
                             if subblock_idx == dtypes.int64(0):
@@ -1631,9 +2065,7 @@ class QsliFusedKernel:
                                     )
                                     output_offset = dtypes.int32(0)
                                     if self.has_output_offset and not row_ld:
-                                        output_offset = dtypes.int32(
-                                            output_idx_offset[query_row, 0]
-                                        )
+                                        output_offset = dtypes.int32(output_idx_offset[query_row, 0])
                                     self.position_mapper.apply(
                                         self.topk.output_idx_stage,
                                         candidate_block_indices,
@@ -1670,13 +2102,13 @@ def _build_compiled_fused_runner(
 ):
     """Compile the dynamic TensorSpec contract using the standard DSL entry."""
     has_residual = int(mask_mode) == 3 and int(cmp_ratio) != 1
+
     @kernel
     def fused_body(
         query_address,
         key,
         weights: Tensor,
         query_scale: Tensor,
-
         candidate_block_indices,
         candidate_block_length: Tensor,
         cu_seqlens_q: Tensor,
@@ -1706,24 +2138,24 @@ def _build_compiled_fused_runner(
         batch_consistency,
     ):
         ld_enabled = metadata[36, 0] != 0
-        final_sparse_indices = make_tensor(make_pointer(dtypes.int32, dtypes.int64(final_sparse_indices_address), MemLoc.GM),
-            make_layout((query_rows, topk), stride=(topk, 1)))
-        final_sparse_bits = make_tensor(make_pointer(dtypes.uint16, dtypes.int64(final_sparse_bits_address), MemLoc.GM),
-            make_layout((query_rows, topk), stride=(topk, 1)))
+        final_sparse_indices = make_tensor(
+            make_pointer(dtypes.int32, dtypes.int64(final_sparse_indices_address), MemLoc.GM),
+            make_layout((query_rows, topk), stride=(topk, 1)),
+        )
+        final_sparse_bits = make_tensor(
+            make_pointer(dtypes.uint16, dtypes.int64(final_sparse_bits_address), MemLoc.GM),
+            make_layout((query_rows, topk), stride=(topk, 1)),
+        )
         query = make_tensor(
             make_pointer(dtypes.fp4x2_e2m1, dtypes.int64(query_address), MemLoc.GM),
             make_layout((query_rows * N1, LOGICAL_D), stride=(LOGICAL_D, 1)),
         )
         index_pointer = make_pointer(dtypes.int32, dtypes.int64(sparse_indices_address), MemLoc.GM)
         value_pointer = make_pointer(dtypes.uint16, dtypes.int64(sparse_value_address), MemLoc.GM)
-        sparse_indices = make_tensor(index_pointer,
-            make_layout((64, topk), stride=(topk, 1)))
-        sparse_value_bits = make_tensor(value_pointer,
-            make_layout((64, topk), stride=(topk, 1)))
-        merge_indices = make_tensor(index_pointer,
-            make_layout((64, topk), stride=(topk, 1)))
-        merge_bits = make_tensor(value_pointer,
-            make_layout((64, topk), stride=(topk, 1)))
+        sparse_indices = make_tensor(index_pointer, make_layout((64, topk), stride=(topk, 1)))
+        sparse_value_bits = make_tensor(value_pointer, make_layout((64, topk), stride=(topk, 1)))
+        merge_indices = make_tensor(index_pointer, make_layout((64, topk), stride=(topk, 1)))
+        merge_bits = make_tensor(value_pointer, make_layout((64, topk), stride=(topk, 1)))
         QsliFusedKernel(
             tokens,
             topk,
@@ -1742,7 +2174,6 @@ def _build_compiled_fused_runner(
             key,
             weights,
             query_scale,
-
             candidate_block_indices,
             candidate_block_length,
             cu_seqlens_q,
@@ -1765,22 +2196,34 @@ def _build_compiled_fused_runner(
             logical_k_capacity,
             metadata,
             return_values,
-            sparse_indices_address, sparse_value_address, final_sparse_indices_address, final_sparse_bits_address,
+            sparse_indices_address,
+            sparse_value_address,
+            final_sparse_indices_address,
+            final_sparse_bits_address,
             batch_consistency,
         )
         if ld_enabled:
             global_sync_all()
             channel_rewind(reset_sync_id=True)
             LdMergeStage(topk, splits)(
-                merge_indices, merge_bits, final_sparse_indices,
-                final_sparse_bits, metadata, query_rows, worker_count * 2, cu_seqlens_q, 1, has_cu, output_offset_address)
+                merge_indices,
+                merge_bits,
+                final_sparse_indices,
+                final_sparse_bits,
+                metadata,
+                query_rows,
+                worker_count * 2,
+                cu_seqlens_q,
+                1,
+                has_cu,
+                output_offset_address,
+            )
 
     def run_fused(
         query_address,
         key,
         weights: Tensor,
         query_scale: Tensor,
-
         candidate_block_indices,
         candidate_block_length: Tensor,
         cu_seqlens_q: Tensor,
@@ -1809,8 +2252,39 @@ def _build_compiled_fused_runner(
         output_offset_address,
         batch_consistency,
     ):
-
-        fused_body[worker_count](query_address, key, weights, query_scale, candidate_block_indices, candidate_block_length, cu_seqlens_q, seqused_q, block_table, seqused_k, cmp_residual_k, output_idx_offset, staging_key, staging_key_fp4, staging_scale, staging_scale_e8m0, key_workspace, selected_position_workspace, sparse_indices_address, sparse_value_address, worker_count, query_rows, batch_count, logical_k_capacity, metadata, final_sparse_indices_address, final_sparse_bits_address, return_values, merge_workers, output_offset_address, batch_consistency)
+        fused_body[worker_count](
+            query_address,
+            key,
+            weights,
+            query_scale,
+            candidate_block_indices,
+            candidate_block_length,
+            cu_seqlens_q,
+            seqused_q,
+            block_table,
+            seqused_k,
+            cmp_residual_k,
+            output_idx_offset,
+            staging_key,
+            staging_key_fp4,
+            staging_scale,
+            staging_scale_e8m0,
+            key_workspace,
+            selected_position_workspace,
+            sparse_indices_address,
+            sparse_value_address,
+            worker_count,
+            query_rows,
+            batch_count,
+            logical_k_capacity,
+            metadata,
+            final_sparse_indices_address,
+            final_sparse_bits_address,
+            return_values,
+            merge_workers,
+            output_offset_address,
+            batch_consistency,
+        )
 
     query_rows_dim = cannbotdsl.Dim("T1")
     physical_blocks_dim = cannbotdsl.Dim("PA")
@@ -1823,22 +2297,11 @@ def _build_compiled_fused_runner(
     key_stride_dim = cannbotdsl.Dim("K_S0")
     fake = cannbotdsl.TensorSpec
     dummy_spec = fake((query_rows_dim, N2), dtypes.int32)
-    cu_spec = (
-        fake((batch_dim + 1,), dtypes.int32) if has_cu else dummy_spec
-    )
-    seqused_q_spec = (
-        fake((batch_dim,), dtypes.int32) if has_seqused_q else dummy_spec
-    )
-    block_table_spec = (
-        fake((batch_dim, block_table_width_dim), dtypes.int32)
-        if has_block_table else dummy_spec
-    )
-    seqused_k_spec = (
-        fake((batch_dim,), dtypes.int32) if has_seqused_k else dummy_spec
-    )
-    residual_spec = (
-        fake((batch_dim,), dtypes.int32) if has_residual else dummy_spec
-    )
+    cu_spec = fake((batch_dim + 1,), dtypes.int32) if has_cu else dummy_spec
+    seqused_q_spec = fake((batch_dim,), dtypes.int32) if has_seqused_q else dummy_spec
+    block_table_spec = fake((batch_dim, block_table_width_dim), dtypes.int32) if has_block_table else dummy_spec
+    seqused_k_spec = fake((batch_dim,), dtypes.int32) if has_seqused_k else dummy_spec
+    residual_spec = fake((batch_dim,), dtypes.int32) if has_residual else dummy_spec
     offset_spec = fake((query_rows_dim, N2), dtypes.int32)
     compiled = jit(run_fused).compile(
         dtypes.int64,
@@ -1849,9 +2312,7 @@ def _build_compiled_fused_runner(
         ),
         fake((query_rows_dim, N1), dtypes.float32),
         fake((query_rows_dim * N1, 2, 2), dtypes.float8_e8m0),
-        fake(
-            (query_rows_dim, N2, candidate_capacity), dtypes.int32
-        ),
+        fake((query_rows_dim, N2, candidate_capacity), dtypes.int32),
         fake((query_rows_dim, N2), dtypes.int32),
         cu_spec,
         seqused_q_spec,
@@ -1867,9 +2328,7 @@ def _build_compiled_fused_runner(
             (staging_workers * STAGING_DEPTH * TILE_N, LOGICAL_D),
             dtypes.fp4x2_e2m1,
         ),
-        fake(
-            (staging_workers * STAGING_DEPTH * TILE_N, 4), dtypes.uint8
-        ),
+        fake((staging_workers * STAGING_DEPTH * TILE_N, 4), dtypes.uint8),
         fake(
             (staging_workers * STAGING_DEPTH * TILE_N, 2, 2),
             dtypes.float8_e8m0,
@@ -1894,7 +2353,7 @@ def _build_compiled_fused_runner(
 
 
 def clear_caches():
-    """Close cached dynamic executables before and after native export."""
+    """Close cached dynamic executables."""
     with _COMPILED_KERNEL_LOCK:
         for compiled in _COMPILED_KERNEL.values():
             compiled.close()
@@ -1903,7 +2362,6 @@ def clear_caches():
 
 def _get_compiled_fused_runner(*config):
     """Cache the dynamic QSLI executable; shape axes remain dynamic."""
-    # DSL native policy is process-wide; never compile a missing runtime binary.
     cache_key = tuple(config)
     with _COMPILED_KERNEL_LOCK:
         compiled = _COMPILED_KERNEL.get(cache_key)
@@ -1917,6 +2375,7 @@ def _batch_consistency_enabled():
     """Use the framework's batch-consistency level without changing global settings."""
     try:
         import torch_npu
+
         return int(torch_npu.npu._get_deterministic_level()) == 3
     except (AttributeError, ImportError):
         return False
@@ -1929,16 +2388,16 @@ def quant_sparse_lightning_indexer(
     descale_q: torch.Tensor,
     candidate_block_indices: torch.Tensor,
     candidate_block_length: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_k: Optional[torch.Tensor] = None,
-    seqused_q: Optional[torch.Tensor] = None,
-    seqused_k: Optional[torch.Tensor] = None,
-    cmp_residual_k: Optional[torch.Tensor] = None,
-    block_table: Optional[torch.Tensor] = None,
-    output_idx_offset: Optional[torch.Tensor] = None,
-    metadata: Optional[torch.Tensor] = None,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
+    cmp_residual_k: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+    output_idx_offset: torch.Tensor | None = None,
+    metadata: torch.Tensor | None = None,
     *,
-    descale_k: Optional[torch.Tensor] = None,
+    descale_k: torch.Tensor | None = None,
     topk: int,
     candidate_block_size: int,
     quant_mode: int,
@@ -1960,28 +2419,41 @@ def quant_sparse_lightning_indexer(
     """
     if layout_k == "TND":
         return _run_tnd(
-            q, k, w, descale_q, candidate_block_indices, candidate_block_length,
-            cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, cmp_residual_k,
-            block_table, output_idx_offset, metadata, descale_k=descale_k,
-            topk=topk, candidate_block_size=candidate_block_size,
-            quant_mode=quant_mode, max_seqlen_q=max_seqlen_q,
-            mask_mode=mask_mode, cmp_ratio=cmp_ratio, layout_q=layout_q,
-            layout_k=layout_k, return_value=return_value,
+            q,
+            k,
+            w,
+            descale_q,
+            candidate_block_indices,
+            candidate_block_length,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            cmp_residual_k,
+            block_table,
+            output_idx_offset,
+            metadata,
+            descale_k=descale_k,
+            topk=topk,
+            candidate_block_size=candidate_block_size,
+            quant_mode=quant_mode,
+            max_seqlen_q=max_seqlen_q,
+            mask_mode=mask_mode,
+            cmp_ratio=cmp_ratio,
+            layout_q=layout_q,
+            layout_k=layout_k,
+            return_value=return_value,
         )
     if metadata is None:
         raise ValueError("metadata is required; call quant_sparse_lightning_indexer_metadata before this operator")
     if int(quant_mode) != 1:
-        raise ValueError(
-            "quant_sparse_lightning_indexer supports quant_mode=1 only"
-        )
+        raise ValueError("quant_sparse_lightning_indexer supports quant_mode=1 only")
     if layout_q != "TND" or layout_k != "PA_BBND":
         raise ValueError("current QSLI layouts must be TND and PA_BBND")
     if descale_k is not None:
         raise ValueError("descale_k is only supported with TND K; PA_BBND stores scales in packed k")
     if q.device.type != "npu" or k.device.type != "npu":
-        raise ValueError(
-            "quant_sparse_lightning_indexer requires NPU q/k tensors"
-        )
+        raise ValueError("quant_sparse_lightning_indexer requires NPU q/k tensors")
     if q.dtype != torch.uint8 or k.dtype != torch.uint8:
         raise TypeError("q/k storage must be uint8 packed MXFP4")
     if q.ndim != 3 or tuple(q.shape[1:]) != (N1, PACKED_D):
@@ -2003,9 +2475,7 @@ def quant_sparse_lightning_indexer(
         raise ValueError("w must be an NPU tensor")
     expected_q_scale = (query_rows, N1, LOGICAL_D // 64, 2)
     if descale_q is None or tuple(descale_q.shape) != expected_q_scale:
-        raise ValueError(
-            "descale_q is required with shape (T1,32,D/64,2)"
-        )
+        raise ValueError("descale_q is required with shape (T1,32,D/64,2)")
     scale_dtypes = (torch.uint8, torch.float8_e8m0fnu)
     if descale_q.dtype not in scale_dtypes or descale_q.device.type != "npu":
         raise TypeError("descale_q must be an NPU E8M0/uint8 tensor")
@@ -2027,19 +2497,14 @@ def quant_sparse_lightning_indexer(
         or int(candidate_block_indices.shape[2]) != CANDIDATE_CAPACITY
     ):
         raise ValueError("candidate_block_indices must have shape (T1,1,2048)")
-    if (
-        candidate_block_indices.dtype != torch.int32
-        or candidate_block_indices.device.type != "npu"
-    ):
+    if candidate_block_indices.dtype != torch.int32 or candidate_block_indices.device.type != "npu":
         raise TypeError("candidate_block_indices must be an NPU int32 tensor")
     if (
         candidate_block_length.dtype != torch.int32
         or candidate_block_length.device.type != "npu"
         or int(candidate_block_length.numel()) != query_rows * N2
     ):
-        raise ValueError(
-            "candidate_block_length must be NPU int32 with T1*N2 entries"
-        )
+        raise ValueError("candidate_block_length must be NPU int32 with T1*N2 entries")
     candidate_length_2d = candidate_block_length.reshape(query_rows, N2)
 
     if cu_seqlens_q is None:
@@ -2054,9 +2519,7 @@ def quant_sparse_lightning_indexer(
             raise ValueError("cu_seqlens_q must be NPU int32 with shape (B+1,)")
         batch = int(cu_seqlens_q.numel()) - 1
     if seqused_q is not None and (
-        tuple(seqused_q.shape) != (batch,)
-        or seqused_q.dtype != torch.int32
-        or seqused_q.device.type != "npu"
+        tuple(seqused_q.shape) != (batch,) or seqused_q.dtype != torch.int32 or seqused_q.device.type != "npu"
     ):
         raise ValueError("seqused_q must be NPU int32 with shape (B,)")
 
@@ -2074,9 +2537,7 @@ def quant_sparse_lightning_indexer(
             raise ValueError("block_table must be NPU int32 with shape (B,max_blocks)")
         logical_k_capacity = int(block_table.shape[1]) * pa_block_size
     if seqused_k is not None and (
-        tuple(seqused_k.shape) != (batch,)
-        or seqused_k.dtype != torch.int32
-        or seqused_k.device.type != "npu"
+        tuple(seqused_k.shape) != (batch,) or seqused_k.dtype != torch.int32 or seqused_k.device.type != "npu"
     ):
         raise ValueError("seqused_k must be NPU int32 with shape (B,)")
 
@@ -2087,13 +2548,9 @@ def quant_sparse_lightning_indexer(
             or cmp_residual_k.dtype != torch.int32
             or cmp_residual_k.device.type != "npu"
         ):
-            raise ValueError(
-                "cmp_residual_k must be NPU int32 with shape (B,) for causal compression"
-            )
+            raise ValueError("cmp_residual_k must be NPU int32 with shape (B,) for causal compression")
     elif cmp_residual_k is not None:
-        raise ValueError(
-            "cmp_residual_k must be None unless mask_mode=3 and cmp_ratio!=1"
-        )
+        raise ValueError("cmp_residual_k must be None unless mask_mode=3 and cmp_ratio!=1")
     if output_idx_offset is not None and (
         tuple(output_idx_offset.shape) != (query_rows, N2)
         or output_idx_offset.dtype != torch.int32
@@ -2218,56 +2675,6 @@ def quant_sparse_lightning_indexer(
 __all__ = ["quant_sparse_lightning_indexer"]
 
 
-from cannbotdsl.package.native import register
-
-
-@register("qsli")
-def export_qsli():
-    """Export static profiles with dynamic tensor axes, without NPU execution."""
-    import json
-    import os
-
-    defaults = {'tokens': 16384, 'topk': 512, 'candidate_capacity': 2048, 'mask_mode': 3, 'cmp_ratio': 1, 'has_cu': True, 'has_seqused_q': True, 'has_seqused_k': True, 'has_block_table': True, 'has_output_offset': True, 'pa_block_size': 128, 'splits': 8, 'auto_metadata': False, 'layout_k': 'PA_BBND'}
-    profiles = [
-        dict(mask_mode=mask, cmp_ratio=ratio, pa_block_size=page,
-             has_output_offset=offset, layout_k=layout)
-        for mask in (0, 3)
-        for ratio in (1, 2)
-        for layout in ('PA_BBND', 'TND')
-        for page in ((64, 128) if layout == 'PA_BBND' else (0,))
-        for offset in (False, True)
-    ]
-    profile_path = os.environ.get("CANNBOTDSL_DS41_PROFILES")
-    if profile_path:
-        with open(profile_path, encoding="utf-8") as stream:
-            profiles = json.load(stream).get("qsli", profiles)
-    clear_caches()
-    clear_tnd_caches()
-    try:
-        exported = set()
-        for profile in profiles:
-            unknown = set(profile) - set(defaults)
-            if unknown:
-                raise ValueError(f"Unknown export profile fields: {sorted(unknown)}")
-            config = dict(defaults, **profile)
-            # cmp_ratio is unused without the causal mask; export one binary.
-            identity = tuple(
-                (name, value) for name, value in config.items()
-                if name != "cmp_ratio" or config["mask_mode"] == 3
-            )
-            if identity in exported:
-                continue
-            exported.add(identity)
-            runner_config = tuple(config[name] for name in defaults if name != 'layout_k')
-            if config['layout_k'] == 'TND':
-                _get_tnd_compiled_fused_runner(*runner_config)
-            elif config['layout_k'] == 'PA_BBND':
-                _get_compiled_fused_runner(*runner_config)
-            else:
-                raise ValueError("layout_k export profile must be PA_BBND or TND")
-    finally:
-        clear_caches()
-        clear_tnd_caches()
 class QsliTndGather(QsliVector0):
     """Use plain DMA for full contiguous blocks, NDDMA for tails/strides."""
 
@@ -2292,39 +2699,104 @@ class QsliTndGather(QsliVector0):
         # NDDMA loop order is innermost first. Padding is on token loop 1.
         if count == 8 and key.stride[0] == 64:
             ascvec.copy_gm2ub(
-                dst, arith.addi(dst_offset, _to_index(block_idx * 544)),
-                key_src, arith.addi(key_offset, _to_index(source_row * key.stride[0])),
-                dtypes.int32(1), dtypes.int32(512), dtypes.int64(512),
-                dtypes.int32(512), dtypes.int32(0), dtypes.int32(0))
+                dst,
+                arith.addi(dst_offset, _to_index(block_idx * 544)),
+                key_src,
+                arith.addi(key_offset, _to_index(source_row * key.stride[0])),
+                dtypes.int32(1),
+                dtypes.int32(512),
+                dtypes.int64(512),
+                dtypes.int32(512),
+                dtypes.int32(0),
+                dtypes.int32(0),
+            )
         else:
             ascvec.copy_gm2ub_nddma(
-                dst, arith.addi(dst_offset, _to_index(block_idx * 544)),
-                key_src, arith.addi(key_offset, _to_index(source_row * key.stride[0])),
-                dtypes.int32(64), dtypes.int32(count), dtypes.int32(1), dtypes.int32(1), dtypes.int32(1),
-                dtypes.int64(1), dtypes.int64(key.stride[0]), dtypes.int64(0), dtypes.int64(0), dtypes.int64(0),
-                dtypes.int64(1), dtypes.int64(64), dtypes.int64(0), dtypes.int64(0), dtypes.int64(0),
-                [0, 0, 0, 0, 0], [0, 8-count, 0, 0, 0], nearest=True)
+                dst,
+                arith.addi(dst_offset, _to_index(block_idx * 544)),
+                key_src,
+                arith.addi(key_offset, _to_index(source_row * key.stride[0])),
+                dtypes.int32(64),
+                dtypes.int32(count),
+                dtypes.int32(1),
+                dtypes.int32(1),
+                dtypes.int32(1),
+                dtypes.int64(1),
+                dtypes.int64(key.stride[0]),
+                dtypes.int64(0),
+                dtypes.int64(0),
+                dtypes.int64(0),
+                dtypes.int64(1),
+                dtypes.int64(64),
+                dtypes.int64(0),
+                dtypes.int64(0),
+                dtypes.int64(0),
+                [0, 0, 0, 0, 0],
+                [0, 8 - count, 0, 0, 0],
+                nearest=True,
+            )
         if count == 8 and key_scale.stride[0] == 4:
             ascvec.copy_gm2ub(
-                dst, arith.addi(dst_offset, _to_index(block_idx * 544 + 512)),
-                scale_src, arith.addi(scale_offset, _to_index(source_row * key_scale.stride[0])),
-                dtypes.int32(1), dtypes.int32(32), dtypes.int64(32),
-                dtypes.int32(32), dtypes.int32(0), dtypes.int32(0))
+                dst,
+                arith.addi(dst_offset, _to_index(block_idx * 544 + 512)),
+                scale_src,
+                arith.addi(scale_offset, _to_index(source_row * key_scale.stride[0])),
+                dtypes.int32(1),
+                dtypes.int32(32),
+                dtypes.int64(32),
+                dtypes.int32(32),
+                dtypes.int32(0),
+                dtypes.int32(0),
+            )
         else:
             ascvec.copy_gm2ub_nddma(
-                dst, arith.addi(dst_offset, _to_index(block_idx * 544 + 512)),
-                scale_src, arith.addi(scale_offset, _to_index(source_row * key_scale.stride[0])),
-                dtypes.int32(4), dtypes.int32(count), dtypes.int32(1), dtypes.int32(1), dtypes.int32(1),
-                dtypes.int64(1), dtypes.int64(key_scale.stride[0]), dtypes.int64(0), dtypes.int64(0), dtypes.int64(0),
-                dtypes.int64(1), dtypes.int64(4), dtypes.int64(0), dtypes.int64(0), dtypes.int64(0),
-                [0, 0, 0, 0, 0], [0, 8-count, 0, 0, 0], nearest=True)
+                dst,
+                arith.addi(dst_offset, _to_index(block_idx * 544 + 512)),
+                scale_src,
+                arith.addi(scale_offset, _to_index(source_row * key_scale.stride[0])),
+                dtypes.int32(4),
+                dtypes.int32(count),
+                dtypes.int32(1),
+                dtypes.int32(1),
+                dtypes.int32(1),
+                dtypes.int64(1),
+                dtypes.int64(key_scale.stride[0]),
+                dtypes.int64(0),
+                dtypes.int64(0),
+                dtypes.int64(0),
+                dtypes.int64(1),
+                dtypes.int64(4),
+                dtypes.int64(0),
+                dtypes.int64(0),
+                dtypes.int64(0),
+                [0, 0, 0, 0, 0],
+                [0, 8 - count, 0, 0, 0],
+                nearest=True,
+            )
 
     @jit
-    def _gather_half_tnd(self, key, key_scale, candidates, candidate_length,
-                         cu_k, query_row, batch_idx, tile, staging_key,
-                         staging_scale, worker, packed_ub, slot):
-        staging_row = (dtypes.int64(worker) * STAGING_DEPTH + dtypes.int64(tile) % STAGING_DEPTH) * TILE_N + dtypes.int64(self.subblock_idx) * (TILE_N // 2)
-        first_candidate = dtypes.int64(tile) * CANDIDATE_BLOCKS_PER_TILE + dtypes.int64(self.subblock_idx) * CANDIDATE_BLOCKS_PER_AIV
+    def _gather_half_tnd(
+        self,
+        key,
+        key_scale,
+        candidates,
+        candidate_length,
+        cu_k,
+        query_row,
+        batch_idx,
+        tile,
+        staging_key,
+        staging_scale,
+        worker,
+        packed_ub,
+        slot,
+    ):
+        staging_row = (
+            dtypes.int64(worker) * STAGING_DEPTH + dtypes.int64(tile) % STAGING_DEPTH
+        ) * TILE_N + dtypes.int64(self.subblock_idx) * (TILE_N // 2)
+        first_candidate = (
+            dtypes.int64(tile) * CANDIDATE_BLOCKS_PER_TILE + dtypes.int64(self.subblock_idx) * CANDIDATE_BLOCKS_PER_AIV
+        )
         base = dtypes.int64(cu_k[batch_idx])
         length = dtypes.int64(cu_k[batch_idx + 1]) - base
         if slot == 0:
@@ -2333,7 +2805,9 @@ class QsliTndGather(QsliVector0):
             vec_sync_wait(PIPE.MTE3, PIPE.MTE2, 3)
         for block_idx in range(CANDIDATE_BLOCKS_PER_AIV):
             pos = first_candidate + block_idx
-            safe_pos = dtypes.int64(dyn_select(pos < dtypes.int64(candidate_length), pos, dtypes.int64(candidate_length) - 1))
+            safe_pos = dtypes.int64(
+                dyn_select(pos < dtypes.int64(candidate_length), pos, dtypes.int64(candidate_length) - 1)
+            )
             block = dtypes.int64(candidates[query_row, 0, safe_pos])
             start = block * CANDIDATE_BLOCK_SIZE
             count = min(dtypes.int64(8), length - start)
@@ -2349,27 +2823,68 @@ class QsliTndGather(QsliVector0):
         src, src_offset = extract_buffer(packed_ub, access="read")
         k_dst, k_offset = extract_buffer(staging_key, access="write")
         s_dst, s_offset = extract_buffer(staging_scale, access="write")
-        ascvec.copy_ub2gm(k_dst, arith.addi(k_offset, _to_index(staging_row * PACKED_D)),
-            src, src_offset, dtypes.int32(CANDIDATE_BLOCKS_PER_AIV), dtypes.int32(512),
-            dtypes.int64(512), dtypes.int32(544))
-        ascvec.copy_ub2gm(s_dst, arith.addi(s_offset, _to_index(staging_row * 4)),
-            src, arith.addi(src_offset, _to_index(512)),
-            dtypes.int32(CANDIDATE_BLOCKS_PER_AIV), dtypes.int32(32), dtypes.int64(32), dtypes.int32(544))
+        ascvec.copy_ub2gm(
+            k_dst,
+            arith.addi(k_offset, _to_index(staging_row * PACKED_D)),
+            src,
+            src_offset,
+            dtypes.int32(CANDIDATE_BLOCKS_PER_AIV),
+            dtypes.int32(512),
+            dtypes.int64(512),
+            dtypes.int32(544),
+        )
+        ascvec.copy_ub2gm(
+            s_dst,
+            arith.addi(s_offset, _to_index(staging_row * 4)),
+            src,
+            arith.addi(src_offset, _to_index(512)),
+            dtypes.int32(CANDIDATE_BLOCKS_PER_AIV),
+            dtypes.int32(32),
+            dtypes.int64(32),
+            dtypes.int32(544),
+        )
         if slot == 0:
             vec_sync_notify(PIPE.MTE3, PIPE.MTE2, 2)
         else:
             vec_sync_notify(PIPE.MTE3, PIPE.MTE2, 3)
 
     @jit
-    def gather(self, key, key_scale, candidate_block_indices, candidate_block_length,
-               cu_seqlens_k, task_query_row, batch_idx, candidate_tile,
-               staging_key, staging_scale, task_idx, has_cu_k):
+    def gather(
+        self,
+        key,
+        key_scale,
+        candidate_block_indices,
+        candidate_block_length,
+        cu_seqlens_k,
+        task_query_row,
+        batch_idx,
+        candidate_tile,
+        staging_key,
+        staging_scale,
+        task_idx,
+        has_cu_k,
+    ):
         slot = candidate_tile % 2
-        packed = tile_view(self.packed_buffer, (1, CANDIDATE_BLOCKS_PER_AIV, 544), (slot, 0, 0)).view(CANDIDATE_BLOCKS_PER_AIV, 544)
-        self._gather_half_tnd(key, key_scale, candidate_block_indices,
-            candidate_block_length, cu_seqlens_k, task_query_row, batch_idx,
-            candidate_tile, staging_key, staging_scale, task_idx, packed, slot)
+        packed = tile_view(self.packed_buffer, (1, CANDIDATE_BLOCKS_PER_AIV, 544), (slot, 0, 0)).view(
+            CANDIDATE_BLOCKS_PER_AIV, 544
+        )
+        self._gather_half_tnd(
+            key,
+            key_scale,
+            candidate_block_indices,
+            candidate_block_length,
+            cu_seqlens_k,
+            task_query_row,
+            batch_idx,
+            candidate_tile,
+            staging_key,
+            staging_scale,
+            task_idx,
+            packed,
+            slot,
+        )
         vec_sync_intra_arrive(PIPE.MTE3, VECTOR0_READY_ID + candidate_tile % STAGING_DEPTH)
+
 
 class QsliTndFusedKernel:
     def __init__(
@@ -2399,22 +2914,14 @@ class QsliTndFusedKernel:
         self.has_residual = self.mask_mode == 3 and self.cmp_ratio != 1
         self.has_cu_k = bool(has_cu_k)
         self.has_output_offset = bool(has_output_offset)
-        self.qk_handoff = Buffer(
-            MemLoc.UB, (TILE_M * 2, TILE_N // 2), dtypes.bfloat16
-        )
+        self.qk_handoff = Buffer(MemLoc.UB, (TILE_M * 2, TILE_N // 2), dtypes.bfloat16)
         self.cube = QsliCube()
         self.vector0 = QsliTndGather(get_subblock_id())
         self.vector1 = QsliVector1(tokens)
         self.output_writer = QsliOutputWriter(self.topk_count)
-        self.topk_workspace = QsliLocalTopKWorkspace(
-            TOPK_TRUNK_LEN, self.topk_count
-        )
-        self.topk = QsliLocalTopKSelector(
-            self.topk_count, self.topk_workspace
-        )
-        self.position_mapper = QsliPositionMapper(
-            self.topk_count, candidate_capacity
-        )
+        self.topk_workspace = QsliLocalTopKWorkspace(TOPK_TRUNK_LEN, self.topk_count)
+        self.topk = QsliLocalTopKSelector(self.topk_count, self.topk_workspace)
+        self.position_mapper = QsliPositionMapper(self.topk_count, candidate_capacity)
 
     @jit
     def __call__(
@@ -2424,7 +2931,6 @@ class QsliTndFusedKernel:
         key_scale: Tensor,
         weights: Tensor,
         query_scale: Tensor,
-
         candidate_block_indices: Tensor,
         candidate_block_length: Tensor,
         cu_seqlens_q: Tensor,
@@ -2447,7 +2953,10 @@ class QsliTndFusedKernel:
         logical_k_capacity,
         metadata: Tensor,
         return_values,
-        partial_idx_address, partial_bits_address, final_idx_address, final_bits_address,
+        partial_idx_address,
+        partial_bits_address,
+        final_idx_address,
+        final_bits_address,
     ):
         worker_idx = dtypes.int64(get_block_idx())
         subblock_idx = dtypes.int64(get_subblock_id())
@@ -2475,32 +2984,51 @@ class QsliTndFusedKernel:
                 if batch_idx == first_b:
                     first_m = dtypes.int64(metadata[worker_idx, 2])
                 if batch_idx == last_b:
-                    last_m = dtypes.int64(metadata[worker_idx, 5]) + dtypes.int64(dyn_select(metadata[worker_idx, 6] > 0, 1, 0))
+                    last_m = dtypes.int64(metadata[worker_idx, 5]) + dtypes.int64(
+                        dyn_select(metadata[worker_idx, 6] > 0, 1, 0)
+                    )
                 self.vector0.prepare_identity()
                 prefetched_tiles = dtypes.int64(0)
                 for m_idx in dsl_range(first_m, last_m, unroll=1):
                     query_row = begin + m_idx
                     candidate_length = dtypes.int32(candidate_block_length[query_row, 0])
                     tile_begin = dtypes.int64(0)
-                    tile_end = (dtypes.int64(candidate_length) + TILE_N // CANDIDATE_BLOCK_SIZE - 1) // (TILE_N // CANDIDATE_BLOCK_SIZE)
+                    tile_end = (dtypes.int64(candidate_length) + TILE_N // CANDIDATE_BLOCK_SIZE - 1) // (
+                        TILE_N // CANDIDATE_BLOCK_SIZE
+                    )
                     if batch_idx == first_b and m_idx == first_m:
                         tile_begin = dtypes.int64(metadata[worker_idx, 3])
                     if batch_idx == last_b and m_idx == dtypes.int64(metadata[worker_idx, 5]):
                         tile_end = min(tile_end, dtypes.int64(metadata[worker_idx, 6]))
                     valid_s2 = actual
                     if self.mask_mode == 3:
-                        valid_s2 = min(actual, max(dtypes.int32(0), (actual * self.cmp_ratio + residual - used_q + dtypes.int32(m_idx) + 1) // self.cmp_ratio))
+                        valid_s2 = min(
+                            actual,
+                            max(
+                                dtypes.int32(0),
+                                (actual * self.cmp_ratio + residual - used_q + dtypes.int32(m_idx) + 1)
+                                // self.cmp_ratio,
+                            ),
+                        )
                     if m_idx >= dtypes.int64(used_q):
                         valid_s2 = dtypes.int32(0)
-                    full_tiles = (dtypes.int64(candidate_length) + TILE_N // CANDIDATE_BLOCK_SIZE - 1) // (TILE_N // CANDIDATE_BLOCK_SIZE)
+                    full_tiles = (dtypes.int64(candidate_length) + TILE_N // CANDIDATE_BLOCK_SIZE - 1) // (
+                        TILE_N // CANDIDATE_BLOCK_SIZE
+                    )
                     row_ld = valid_s2 > 0 and (tile_begin > 0 or tile_end < full_tiles)
-                    output_row = dtypes.int64(dyn_select(row_ld,workspace_cursor,query_row))
-                    idx_address = dtypes.int64(dyn_select(row_ld,partial_idx_address,final_idx_address))
-                    bits_address = dtypes.int64(dyn_select(row_ld,partial_bits_address,final_bits_address))
-                    sparse_indices = make_tensor(make_pointer(dtypes.int32,idx_address,MemLoc.GM),make_layout((max(query_rows,64),self.topk_count),stride=(self.topk_count,1)))
-                    sparse_value_bits = make_tensor(make_pointer(dtypes.uint16,bits_address,MemLoc.GM),make_layout((max(query_rows,64),self.topk_count),stride=(self.topk_count,1)))
+                    output_row = dtypes.int64(dyn_select(row_ld, workspace_cursor, query_row))
+                    idx_address = dtypes.int64(dyn_select(row_ld, partial_idx_address, final_idx_address))
+                    bits_address = dtypes.int64(dyn_select(row_ld, partial_bits_address, final_bits_address))
+                    sparse_indices = make_tensor(
+                        make_pointer(dtypes.int32, idx_address, MemLoc.GM),
+                        make_layout((max(query_rows, 64), self.topk_count), stride=(self.topk_count, 1)),
+                    )
+                    sparse_value_bits = make_tensor(
+                        make_pointer(dtypes.uint16, bits_address, MemLoc.GM),
+                        make_layout((max(query_rows, 64), self.topk_count), stride=(self.topk_count, 1)),
+                    )
                     if subblock_idx == dtypes.int64(0):
-                        self.output_writer.initialize(sparse_indices,sparse_value_bits,output_row)
+                        self.output_writer.initialize(sparse_indices, sparse_value_bits, output_row)
                     if row_ld:
                         workspace_cursor += 1
                     candidate_begin = tile_begin * (TILE_N // CANDIDATE_BLOCK_SIZE)
@@ -2510,15 +3038,23 @@ class QsliTndFusedKernel:
                         if valid_s2 > dtypes.int32(0):
                             if subblock_idx == dtypes.int64(0):
                                 self.position_mapper.count_visible(
-                                    candidate_block_indices, query_row, candidate_length, valid_s2,
-                                    dtypes.int32(candidate_begin), dtypes.int32(candidate_end),
-                                    self.vector1.valid_counts
+                                    candidate_block_indices,
+                                    query_row,
+                                    candidate_length,
+                                    valid_s2,
+                                    dtypes.int32(candidate_begin),
+                                    dtypes.int32(candidate_end),
+                                    self.vector1.valid_counts,
                                 )
                             else:
                                 self.position_mapper.load_own_counts(
-                                    candidate_block_indices, query_row, candidate_length, valid_s2,
-                                    dtypes.int32(candidate_begin), dtypes.int32(candidate_end),
-                                    self.vector1.valid_counts
+                                    candidate_block_indices,
+                                    query_row,
+                                    candidate_length,
+                                    valid_s2,
+                                    dtypes.int32(candidate_begin),
+                                    dtypes.int32(candidate_end),
+                                    self.vector1.valid_counts,
                                 )
 
                         if valid_s2 > dtypes.int32(0):
@@ -2553,14 +3089,11 @@ class QsliTndFusedKernel:
                                     candidate_tile = tick - 1
                                     self.vector0.wait_ready(candidate_tile)
                                     staging_row = (
-                                        worker_idx * STAGING_DEPTH
-                                        + dtypes.int64(candidate_tile) % STAGING_DEPTH
+                                        worker_idx * STAGING_DEPTH + dtypes.int64(candidate_tile) % STAGING_DEPTH
                                     ) * TILE_N
                                     self.cube.compute_qk(
                                         tile_view(
-                                            _offset_view(
-                                                staging_key_fp4, (staging_row, 0)
-                                            ),
+                                            _offset_view(staging_key_fp4, (staging_row, 0)),
                                             (TILE_N, LOGICAL_D),
                                             (0, 0),
                                         ),
@@ -2572,12 +3105,13 @@ class QsliTndFusedKernel:
                                             (TILE_N, 2, 2),
                                             (0, 0, 0),
                                         ),
-                                        self.qk_handoff, candidate_tile % 2,
+                                        self.qk_handoff,
+                                        candidate_tile % 2,
                                     )
                                     self.vector0.signal_consumed(candidate_tile)
                                     vec_sync_intra_wait(PIPE.V, 14 + candidate_tile % 2)
                                     self.vector1.compute(
-                                        tile_view(self.qk_handoff,(TILE_M,TILE_N//2),(candidate_tile % 2,0)),
+                                        tile_view(self.qk_handoff, (TILE_M, TILE_N // 2), (candidate_tile % 2, 0)),
                                         candidate_tile,
                                         subblock_idx,
                                         candidate_tile - tile_begin,
@@ -2585,32 +3119,49 @@ class QsliTndFusedKernel:
                                     )
                                     vec_sync_intra_arrive(PIPE.V, 4 + candidate_tile % 2)
 
-                            for final_tick in dsl_range(max(tile_begin, tile_end-STAGING_DEPTH), tile_end, unroll=1):
+                            for final_tick in dsl_range(max(tile_begin, tile_end - STAGING_DEPTH), tile_end, unroll=1):
                                 self.vector0.await_slot(final_tick)
                             self.vector0.drain_buffers()
                             for qk_slot in range_constexpr(2):
-                                cube_sync_intra_wait(PIPE.FIXPIPE,4+qk_slot)
-                                cube_sync_intra_wait(PIPE.FIXPIPE,20+qk_slot)
-                            self.vector1.join_scores(key_workspace,worker_idx,tile_end-tile_begin,subblock_idx)
+                                cube_sync_intra_wait(PIPE.FIXPIPE, 4 + qk_slot)
+                                cube_sync_intra_wait(PIPE.FIXPIPE, 20 + qk_slot)
+                            self.vector1.join_scores(key_workspace, worker_idx, tile_end - tile_begin, subblock_idx)
                             prefetched_tiles = dtypes.int64(0)
                             next_m = m_idx + 1
                             if next_m < last_m and next_m < dtypes.int64(used_q):
                                 next_row = query_row + 1
                                 next_length = dtypes.int32(candidate_block_length[next_row, 0])
-                                next_end = (dtypes.int64(next_length) + CANDIDATE_BLOCKS_PER_TILE - 1) // CANDIDATE_BLOCKS_PER_TILE
+                                next_end = (
+                                    dtypes.int64(next_length) + CANDIDATE_BLOCKS_PER_TILE - 1
+                                ) // CANDIDATE_BLOCKS_PER_TILE
                                 if batch_idx == last_b and next_m == dtypes.int64(metadata[worker_idx, 5]):
                                     next_end = min(next_end, dtypes.int64(metadata[worker_idx, 6]))
                                 next_visible = actual
                                 if self.mask_mode == 3:
-                                    next_visible = min(actual, max(dtypes.int32(0), (actual * self.cmp_ratio + residual - used_q + dtypes.int32(next_m) + 1) // self.cmp_ratio))
+                                    next_visible = min(
+                                        actual,
+                                        max(
+                                            dtypes.int32(0),
+                                            (actual * self.cmp_ratio + residual - used_q + dtypes.int32(next_m) + 1)
+                                            // self.cmp_ratio,
+                                        ),
+                                    )
                                 if next_length > 0 and next_end > 0 and next_visible > 0:
                                     self.vector0.begin_buffers()
                                     prefetched_tiles = min(dtypes.int64(STAGING_DEPTH), next_end)
                                     for future_tile in dsl_range(prefetched_tiles, unroll=1):
                                         self.vector0.gather(
-                                            key, key_scale, candidate_block_indices, next_length,
-                                            cu_seqlens_k, next_row, batch_idx, future_tile,
-                                            staging_key, staging_scale, worker_idx,
+                                            key,
+                                            key_scale,
+                                            candidate_block_indices,
+                                            next_length,
+                                            cu_seqlens_k,
+                                            next_row,
+                                            batch_idx,
+                                            future_tile,
+                                            staging_key,
+                                            staging_scale,
+                                            worker_idx,
                                             self.has_cu_k,
                                         )
                             if subblock_idx == dtypes.int64(0):
@@ -2634,9 +3185,7 @@ class QsliTndFusedKernel:
                                     )
                                     output_offset = dtypes.int32(0)
                                     if self.has_output_offset and not row_ld:
-                                        output_offset = dtypes.int32(
-                                            output_idx_offset[query_row, 0]
-                                        )
+                                        output_offset = dtypes.int32(output_idx_offset[query_row, 0])
                                     self.position_mapper.apply(
                                         self.topk.output_idx_stage,
                                         candidate_block_indices,
@@ -2673,6 +3222,7 @@ def _build_tnd_compiled_fused_runner(
 ):
     """Compile the dynamic TensorSpec contract using the standard DSL entry."""
     has_residual = int(mask_mode) == 3 and int(cmp_ratio) != 1
+
     @kernel
     def fused_body(
         query_address,
@@ -2680,7 +3230,6 @@ def _build_tnd_compiled_fused_runner(
         key_scale,
         weights: Tensor,
         query_scale: Tensor,
-
         candidate_block_indices,
         candidate_block_length: Tensor,
         cu_seqlens_q: Tensor,
@@ -2709,24 +3258,24 @@ def _build_tnd_compiled_fused_runner(
         output_offset_address,
     ):
         ld_enabled = metadata[36, 0] != 0
-        final_sparse_indices = make_tensor(make_pointer(dtypes.int32, dtypes.int64(final_sparse_indices_address), MemLoc.GM),
-            make_layout((query_rows, topk), stride=(topk, 1)))
-        final_sparse_bits = make_tensor(make_pointer(dtypes.uint16, dtypes.int64(final_sparse_bits_address), MemLoc.GM),
-            make_layout((query_rows, topk), stride=(topk, 1)))
+        final_sparse_indices = make_tensor(
+            make_pointer(dtypes.int32, dtypes.int64(final_sparse_indices_address), MemLoc.GM),
+            make_layout((query_rows, topk), stride=(topk, 1)),
+        )
+        final_sparse_bits = make_tensor(
+            make_pointer(dtypes.uint16, dtypes.int64(final_sparse_bits_address), MemLoc.GM),
+            make_layout((query_rows, topk), stride=(topk, 1)),
+        )
         query = make_tensor(
             make_pointer(dtypes.fp4x2_e2m1, dtypes.int64(query_address), MemLoc.GM),
             make_layout((query_rows * N1, LOGICAL_D), stride=(LOGICAL_D, 1)),
         )
         index_pointer = make_pointer(dtypes.int32, dtypes.int64(sparse_indices_address), MemLoc.GM)
         value_pointer = make_pointer(dtypes.uint16, dtypes.int64(sparse_value_address), MemLoc.GM)
-        sparse_indices = make_tensor(index_pointer,
-            make_layout((64, topk), stride=(topk, 1)))
-        sparse_value_bits = make_tensor(value_pointer,
-            make_layout((64, topk), stride=(topk, 1)))
-        merge_indices = make_tensor(index_pointer,
-            make_layout((64, topk), stride=(topk, 1)))
-        merge_bits = make_tensor(value_pointer,
-            make_layout((64, topk), stride=(topk, 1)))
+        sparse_indices = make_tensor(index_pointer, make_layout((64, topk), stride=(topk, 1)))
+        sparse_value_bits = make_tensor(value_pointer, make_layout((64, topk), stride=(topk, 1)))
+        merge_indices = make_tensor(index_pointer, make_layout((64, topk), stride=(topk, 1)))
+        merge_bits = make_tensor(value_pointer, make_layout((64, topk), stride=(topk, 1)))
         QsliTndFusedKernel(
             tokens,
             topk,
@@ -2746,7 +3295,6 @@ def _build_tnd_compiled_fused_runner(
             key_scale,
             weights,
             query_scale,
-
             candidate_block_indices,
             candidate_block_length,
             cu_seqlens_q,
@@ -2769,14 +3317,27 @@ def _build_tnd_compiled_fused_runner(
             logical_k_capacity,
             metadata,
             return_values,
-            sparse_indices_address, sparse_value_address, final_sparse_indices_address, final_sparse_bits_address,
+            sparse_indices_address,
+            sparse_value_address,
+            final_sparse_indices_address,
+            final_sparse_bits_address,
         )
         if ld_enabled:
             global_sync_all()
             channel_rewind(reset_sync_id=True)
             LdMergeStage(topk, splits)(
-                merge_indices, merge_bits, final_sparse_indices,
-                final_sparse_bits, metadata, query_rows, worker_count * 2, cu_seqlens_q, 1, has_cu, output_offset_address)
+                merge_indices,
+                merge_bits,
+                final_sparse_indices,
+                final_sparse_bits,
+                metadata,
+                query_rows,
+                worker_count * 2,
+                cu_seqlens_q,
+                1,
+                has_cu,
+                output_offset_address,
+            )
 
     def run_fused(
         query_address,
@@ -2784,7 +3345,6 @@ def _build_tnd_compiled_fused_runner(
         key_scale,
         weights: Tensor,
         query_scale: Tensor,
-
         candidate_block_indices,
         candidate_block_length: Tensor,
         cu_seqlens_q: Tensor,
@@ -2812,8 +3372,39 @@ def _build_tnd_compiled_fused_runner(
         merge_workers,
         output_offset_address,
     ):
-
-        fused_body[worker_count](query_address, key, key_scale, weights, query_scale, candidate_block_indices, candidate_block_length, cu_seqlens_q, seqused_q, cu_seqlens_k, seqused_k, cmp_residual_k, output_idx_offset, staging_key, staging_key_fp4, staging_scale, staging_scale_e8m0, key_workspace, selected_position_workspace, sparse_indices_address, sparse_value_address, worker_count, query_rows, batch_count, logical_k_capacity, metadata, final_sparse_indices_address, final_sparse_bits_address, return_values, merge_workers, output_offset_address)
+        fused_body[worker_count](
+            query_address,
+            key,
+            key_scale,
+            weights,
+            query_scale,
+            candidate_block_indices,
+            candidate_block_length,
+            cu_seqlens_q,
+            seqused_q,
+            cu_seqlens_k,
+            seqused_k,
+            cmp_residual_k,
+            output_idx_offset,
+            staging_key,
+            staging_key_fp4,
+            staging_scale,
+            staging_scale_e8m0,
+            key_workspace,
+            selected_position_workspace,
+            sparse_indices_address,
+            sparse_value_address,
+            worker_count,
+            query_rows,
+            batch_count,
+            logical_k_capacity,
+            metadata,
+            final_sparse_indices_address,
+            final_sparse_bits_address,
+            return_values,
+            merge_workers,
+            output_offset_address,
+        )
 
     query_rows_dim = cannbotdsl.Dim("T1")
     key_rows_dim = cannbotdsl.Dim("T2")
@@ -2827,19 +3418,11 @@ def _build_tnd_compiled_fused_runner(
     scale_stride_dim = cannbotdsl.Dim("KS_S0")
     fake = cannbotdsl.TensorSpec
     dummy_spec = fake((query_rows_dim, N2), dtypes.int32)
-    cu_spec = (
-        fake((boundary_dim,), dtypes.int32) if has_cu else dummy_spec
-    )
-    seqused_q_spec = (
-        fake((batch_dim,), dtypes.int32) if has_seqused_q else dummy_spec
-    )
+    cu_spec = fake((boundary_dim,), dtypes.int32) if has_cu else dummy_spec
+    seqused_q_spec = fake((batch_dim,), dtypes.int32) if has_seqused_q else dummy_spec
     cu_seqlens_k_spec = fake((boundary_dim,), dtypes.int32)
-    seqused_k_spec = (
-        fake((batch_dim,), dtypes.int32) if has_seqused_k else dummy_spec
-    )
-    residual_spec = (
-        fake((batch_dim,), dtypes.int32) if has_residual else dummy_spec
-    )
+    seqused_k_spec = fake((batch_dim,), dtypes.int32) if has_seqused_k else dummy_spec
+    residual_spec = fake((batch_dim,), dtypes.int32) if has_residual else dummy_spec
     offset_spec = fake((query_rows_dim, N2), dtypes.int32)
     compiled = jit(run_fused).compile(
         dtypes.int64,
@@ -2847,9 +3430,7 @@ def _build_tnd_compiled_fused_runner(
         fake((key_rows_dim, 1, 2, 2), dtypes.uint8, stride=(scale_stride_dim, 4, 2, 1)),
         fake((query_rows_dim, N1), dtypes.float32),
         fake((query_rows_dim * N1, 2, 2), dtypes.float8_e8m0),
-        fake(
-            (query_rows_dim, N2, candidate_capacity), dtypes.int32
-        ),
+        fake((query_rows_dim, N2, candidate_capacity), dtypes.int32),
         fake((query_rows_dim, N2), dtypes.int32),
         cu_spec,
         seqused_q_spec,
@@ -2865,9 +3446,7 @@ def _build_tnd_compiled_fused_runner(
             (staging_workers * STAGING_DEPTH * TILE_N, LOGICAL_D),
             dtypes.fp4x2_e2m1,
         ),
-        fake(
-            (staging_workers * STAGING_DEPTH * TILE_N, 4), dtypes.uint8
-        ),
+        fake((staging_workers * STAGING_DEPTH * TILE_N, 4), dtypes.uint8),
         fake(
             (staging_workers * STAGING_DEPTH * TILE_N, 2, 2),
             dtypes.float8_e8m0,
@@ -2891,7 +3470,7 @@ def _build_tnd_compiled_fused_runner(
 
 
 def clear_tnd_caches():
-    """Close cached dynamic executables before and after native export."""
+    """Close cached dynamic executables."""
     with _TND_COMPILED_KERNEL_LOCK:
         for compiled in _TND_COMPILED_KERNEL.values():
             compiled.close()
@@ -2900,7 +3479,6 @@ def clear_tnd_caches():
 
 def _get_tnd_compiled_fused_runner(*config):
     """Cache the dynamic QSLI executable; shape axes remain dynamic."""
-    # DSL native policy is process-wide; never compile a missing runtime binary.
     cache_key = tuple(config)
     with _TND_COMPILED_KERNEL_LOCK:
         compiled = _TND_COMPILED_KERNEL.get(cache_key)
@@ -2908,8 +3486,6 @@ def _get_tnd_compiled_fused_runner(*config):
             compiled = _build_tnd_compiled_fused_runner(*config)
             _TND_COMPILED_KERNEL[cache_key] = compiled
         return compiled
-
-
 
 
 def _validate_tnd_sequence(tensor, name, device, count=None):
@@ -2921,11 +3497,15 @@ def _validate_tnd_sequence(tensor, name, device, count=None):
         raise ValueError(f"{name} must have {count} entries")
 
 
-def _validate_tnd_geometry(lengths, cu_q, cu_k, used_q, used_k, residual, *,
-                           topk, mask_mode, cmp_ratio):
-    if (lengths.ndim != 2 or lengths.shape[1] != 1 or lengths.shape[0] <= 0
-            or lengths.dtype != torch.int32 or lengths.device.type != "npu"
-            or not lengths.is_contiguous()):
+def _validate_tnd_geometry(lengths, cu_q, cu_k, used_q, used_k, residual, *, topk, mask_mode, cmp_ratio):
+    if (
+        lengths.ndim != 2
+        or lengths.shape[1] != 1
+        or lengths.shape[0] <= 0
+        or lengths.dtype != torch.int32
+        or lengths.device.type != "npu"
+        or not lengths.is_contiguous()
+    ):
         raise ValueError("candidate_block_length must be contiguous NPU int32 (T1,1), T1>0")
     device = lengths.device
     _validate_tnd_sequence(cu_q, "cu_seqlens_q", device)
@@ -2944,6 +3524,7 @@ def _validate_tnd_geometry(lengths, cu_q, cu_k, used_q, used_k, residual, *,
         raise ValueError("cmp_residual_k requires mask_mode=3 and cmp_ratio!=1")
     return batch
 
+
 def _run_tnd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2951,16 +3532,16 @@ def _run_tnd(
     descale_q: torch.Tensor,
     candidate_block_indices: torch.Tensor,
     candidate_block_length: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_k: Optional[torch.Tensor] = None,
-    seqused_q: Optional[torch.Tensor] = None,
-    seqused_k: Optional[torch.Tensor] = None,
-    cmp_residual_k: Optional[torch.Tensor] = None,
-    block_table: Optional[torch.Tensor] = None,
-    output_idx_offset: Optional[torch.Tensor] = None,
-    metadata: Optional[torch.Tensor] = None,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
+    cmp_residual_k: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+    output_idx_offset: torch.Tensor | None = None,
+    metadata: torch.Tensor | None = None,
     *,
-    descale_k: Optional[torch.Tensor] = None,
+    descale_k: torch.Tensor | None = None,
     topk: int,
     candidate_block_size: int,
     quant_mode: int,
@@ -2981,17 +3562,13 @@ def _run_tnd(
     back to CPU.  ``metadata`` can supply reusable device-produced S2 shard records.
     """
     if int(quant_mode) != 1:
-        raise ValueError(
-            "quant_sparse_lightning_indexer supports quant_mode=1 only"
-        )
+        raise ValueError("quant_sparse_lightning_indexer supports quant_mode=1 only")
     if layout_q != "TND" or layout_k != "TND":
         raise ValueError("TND path requires TND Q and K")
     if block_table is not None:
         raise ValueError("block_table must be None for TND K")
     if q.device.type != "npu" or k.device.type != "npu":
-        raise ValueError(
-            "quant_sparse_lightning_indexer requires NPU q/k tensors"
-        )
+        raise ValueError("quant_sparse_lightning_indexer requires NPU q/k tensors")
     if q.dtype != torch.uint8 or k.dtype != torch.uint8:
         raise TypeError("q/k storage must be uint8 packed MXFP4")
     if q.ndim != 3 or tuple(q.shape[1:]) != (N1, PACKED_D):
@@ -3007,13 +3584,22 @@ def _run_tnd(
     _validate_pa_dim0_stride(descale_k, "descale_k")
     logical_k_capacity = int(k.shape[0])
     pa_block_size = 0  # unused by TND; preserved runner configuration position
-    for name, tensor in (("q", q), ("w", w), ("descale_q", descale_q),
-                         ("candidate_block_indices", candidate_block_indices)):
+    for name, tensor in (
+        ("q", q),
+        ("w", w),
+        ("descale_q", descale_q),
+        ("candidate_block_indices", candidate_block_indices),
+    ):
         if tensor is None or not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
-    for name, tensor in (("k", k), ("w", w), ("descale_q", descale_q),
-                         ("descale_k", descale_k), ("candidate_block_indices", candidate_block_indices),
-                         ("candidate_block_length", candidate_block_length)):
+    for name, tensor in (
+        ("k", k),
+        ("w", w),
+        ("descale_q", descale_q),
+        ("descale_k", descale_k),
+        ("candidate_block_indices", candidate_block_indices),
+        ("candidate_block_length", candidate_block_length),
+    ):
         if tensor.device != q.device:
             raise ValueError(f"{name} must share q's device")
 
@@ -3023,9 +3609,7 @@ def _run_tnd(
         raise ValueError("w must be an NPU tensor")
     expected_q_scale = (query_rows, N1, LOGICAL_D // 64, 2)
     if descale_q is None or tuple(descale_q.shape) != expected_q_scale:
-        raise ValueError(
-            "descale_q is required with shape (T1,32,D/64,2)"
-        )
+        raise ValueError("descale_q is required with shape (T1,32,D/64,2)")
     scale_dtypes = (torch.uint8, torch.float8_e8m0fnu)
     if descale_q.dtype not in scale_dtypes or descale_q.device.type != "npu":
         raise TypeError("descale_q must be an NPU E8M0/uint8 tensor")
@@ -3047,28 +3631,32 @@ def _run_tnd(
         or int(candidate_block_indices.shape[2]) != CANDIDATE_CAPACITY
     ):
         raise ValueError("candidate_block_indices must have shape (T1,1,2048)")
-    if (
-        candidate_block_indices.dtype != torch.int32
-        or candidate_block_indices.device.type != "npu"
-    ):
+    if candidate_block_indices.dtype != torch.int32 or candidate_block_indices.device.type != "npu":
         raise TypeError("candidate_block_indices must be an NPU int32 tensor")
     if (
         candidate_block_length.dtype != torch.int32
         or candidate_block_length.device.type != "npu"
         or int(candidate_block_length.numel()) != query_rows * N2
     ):
-        raise ValueError(
-            "candidate_block_length must be NPU int32 with T1*N2 entries"
-        )
+        raise ValueError("candidate_block_length must be NPU int32 with T1*N2 entries")
     candidate_length_2d = candidate_block_length.reshape(query_rows, N2)
 
     batch = _validate_tnd_geometry(
-        candidate_block_length, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k,
-        cmp_residual_k, topk=topk, mask_mode=mask_mode, cmp_ratio=cmp_ratio)
+        candidate_block_length,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        cmp_residual_k,
+        topk=topk,
+        mask_mode=mask_mode,
+        cmp_ratio=cmp_ratio,
+    )
     if output_idx_offset is not None and (
         tuple(output_idx_offset.shape) != (query_rows, N2)
         or output_idx_offset.dtype != torch.int32
-        or output_idx_offset.device != q.device or not output_idx_offset.is_contiguous()
+        or output_idx_offset.device != q.device
+        or not output_idx_offset.is_contiguous()
     ):
         raise ValueError("output_idx_offset must be contiguous int32 (T1,1) on q's device")
 

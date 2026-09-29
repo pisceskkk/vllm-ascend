@@ -47,6 +47,8 @@ def uses_a5_packed_cache() -> bool:
 
 def make_swa_cache_spec(*, block_size, window_size, head_size, dtype, cache_dtype):
     if uses_a5_packed_cache():
+        if head_size != A5_WIN_LOGICAL_DIM:
+            raise ValueError(f"A5 DeepSeek V4.1 requires head size {A5_WIN_LOGICAL_DIM}, got {head_size}")
         head_size = A5_WIN_ROW_BYTES
         dtype = torch.uint8
         cache_dtype = "a5_mxfp8_bf16_scale"
@@ -64,6 +66,8 @@ def make_swa_cache_spec(*, block_size, window_size, head_size, dtype, cache_dtyp
 
 def make_long_cache_spec(*, block_size, head_size, compress_ratio):
     if uses_a5_packed_cache():
+        if head_size != A5_CMP_LOGICAL_DIM:
+            raise ValueError(f"A5 DeepSeek V4.1 requires head size {A5_CMP_LOGICAL_DIM}, got {head_size}")
         head_size = A5_CMP_ROW_BYTES
         dtype = torch.uint8
         scale_dtype = torch.bfloat16
@@ -84,6 +88,8 @@ def make_long_cache_spec(*, block_size, head_size, compress_ratio):
 
 def make_index_cache_spec(*, block_size, head_size, compress_ratio):
     if uses_a5_packed_cache():
+        if head_size != A5_INDEX_LOGICAL_DIM:
+            raise ValueError(f"A5 DeepSeek V4.1 requires head size {A5_INDEX_LOGICAL_DIM}, got {head_size}")
         head_size = A5_INDEX_DATA_BYTES
         dtype = torch.uint8
         scale_dim = A5_INDEX_SCALE_COUNT
@@ -106,7 +112,7 @@ def make_index_cache_spec(*, block_size, head_size, compress_ratio):
 
 
 def make_folded_index_cache_spec(*, block_size):
-    """0923 QSLI candidate-source view: 8 K/scale rows per 544-byte row."""
+    """QSLI candidate-source view: eight K/scale rows per 544-byte row."""
     if block_size % A5_INDEX_FOLDED_GROUP_ROWS:
         raise ValueError("A5 folded index page must contain full 8-token groups")
     return AscendMLAAttentionSpec(

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import torch
 
+from vllm_ascend.ops.pythondsl import ops
 from vllm_ascend.ops.triton.build_window_indices import (
     build_window_indices_triton,
 )
@@ -13,8 +14,6 @@ from vllm_ascend.worker.device_metadata import (
     DeviceMetadataStage,
     wait_for_device_metadata,
 )
-
-from .package_loader import import_packaged_a5_module
 
 
 def build_window_indices(
@@ -32,19 +31,19 @@ def build_window_indices(
     )
 
 
-def build_smla_metadata(length_rows: torch.Tensor) -> torch.Tensor:
+def build_smla_metadata(length_rows: torch.Tensor, cu_seqlens_q: torch.Tensor) -> torch.Tensor:
     """Build the fixed A5 mixed-quant SMLA launch metadata."""
-    import_packaged_a5_module("cann_ops_transformer.ops.attention.mixed_quant_sparse_flash_mla_dsl")
-    return torch.ops.cann_ops_transformer.ds41.mixed_quant_sparse_flash_mla_metadata(
+    return ops.mixed_quant_sparse_flash_mla_metadata(
         length_rows,
         length_rows,
+        cu_seqlens_q=cu_seqlens_q,
         num_heads_q=64,
         num_heads_kv=1,
         head_dim=512,
         quant_mode=1,
         layout_q="TND",
         layout_kv="PA_BBND",
-        has_win_kv=True,
+        has_ori_kv=True,
         has_cmp_kv=True,
     )
 
@@ -72,8 +71,6 @@ def qsmla(
     softmax_scale,
     compressed_lengths=None,
 ):
-    import_packaged_a5_module("cann_ops_transformer.ops.attention.mixed_quant_sparse_flash_mla_dsl")
-
     ori_indices, ori_lengths = _resolve_window_indices(q, metadata, window_size)
     has_cmp = cmp_kv is not None
     if has_cmp:
@@ -81,10 +78,10 @@ def qsmla(
         cmp_lengths = compressed_lengths
     else:
         cmp_indices = None
-        cmp_lengths = torch.zeros_like(ori_lengths)
+        cmp_lengths = None
     task_metadata = metadata.swa.smla_metadata
     wait_for_device_metadata(DeviceMetadataStage.ATTENTION, id(task_metadata))
-    output, _ = torch.ops.cann_ops_transformer.ds41.mixed_quant_sparse_flash_mla(
+    output, _ = ops.mixed_quant_sparse_flash_mla(
         q,
         ori_kv=ori_kv,
         cmp_kv=cmp_kv,

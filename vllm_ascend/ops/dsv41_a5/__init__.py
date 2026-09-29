@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DeepSeek V4.1 A5 production operator adapters."""
+"""DeepSeek V4.1 A5 operator adapters."""
 
 from vllm_ascend.ops.triton.a5_slot_mapping import build_a5_slot_mapping
 
