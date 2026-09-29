@@ -8,6 +8,7 @@ above the cutoff must all be present. Attention uses FP32 softmax with an
 explicit sink and independently decoded cache rows (rtol=0.02, atol=0.02).
 """
 
+import importlib
 import math
 from types import SimpleNamespace
 
@@ -16,6 +17,7 @@ import torch
 import torch_npu  # noqa: F401
 
 from tests.e2e.nightly.single_node.ops.singlecard_ops.dsv41_reference import (
+    assert_candidate_topk,
     assert_topk,
     decode_attention_cache,
     dequantize_indexer,
@@ -39,10 +41,14 @@ def initialize_device_properties():
     init_device_properties_triton()
 
 
-def _assert_indexer_metadata(metadata, expected_tiles):
+def _assert_indexer_metadata(metadata, expected_tiles, workers=None):
     # The LI ABI contains lexicographic [begin, end) task boundaries.
     # Enumerate logical work independently and require single ownership.
     words = metadata.cpu()
+    if workers is None:
+        workers = min(32, int(torch.npu.get_device_properties(metadata.device).cube_core_num))
+    assert bool((words[workers * 8 : 288] == 0).all())
+    assert bool((words[288 + workers * 16 : 864] == 0).all())
     ownership = {tile: 0 for tile in expected_tiles}
     for record in words[:288].reshape(36, 8).tolist():
         if record[0] == 0:
@@ -58,14 +64,102 @@ def _assert_indexer_metadata(metadata, expected_tiles):
     assert bool((words[864:] == 0).all())
 
 
-@pytest.mark.parametrize("ratio,candidates_enabled", [(1, False), (1, True), (2, True)])
+@pytest.mark.parametrize("sparse", [False, True])
 @torch.inference_mode()
-def test_indexer_metadata_cache_and_candidates(ratio, candidates_enabled):
+def test_indexer_metadata_32_worker_abi(sparse):
+    """Exercise 32-worker AICPU scheduling without launching 32 Cube workers.
+
+    This verifies the retained LI/LD ABI on any supported device. Numerical
+    core execution uses the real physical worker count in the module tests.
+    """
+    name = "quant_sparse_lightning_indexer" if sparse else "quant_lightning_indexer"
+    module = importlib.import_module(f"vllm_ascend.ops.pythondsl.{name}_metadata_dsl")
+    cu = torch.tensor([0, 7], dtype=torch.int32, device="npu")
+    used = torch.tensor([16449], dtype=torch.int32, device="npu")
+    candidates = torch.full((7, 1), 2048, dtype=torch.int32, device="npu")
+    metadata = torch.empty(1024, dtype=torch.int32, device="npu")
+    groups = 7 if sparse else 2
+    scratch = torch.empty(groups * 36, dtype=torch.int64, device="npu")
+    _, compiled = module.compiled_metadata()
+    compiled.launch(
+        module.current_raw_stream(metadata.device.index),
+        cu=cu.data_ptr(),
+        used_q=0,
+        used_k=used.data_ptr(),
+        residual=0,
+        candidate_length=candidates.data_ptr() if sparse else 0,
+        output_offset=0,
+        output=metadata.data_ptr(),
+        scratch=scratch.data_ptr(),
+        has_cu=1,
+        has_q=0,
+        has_k=1,
+        has_residual=0,
+        sparse=int(sparse),
+        mask=3,
+        ratio=1,
+        total_q=7,
+        batch=1,
+        max_tasks=groups,
+        capacity=16449,
+        splits=8,
+        workers=32,
+        groups=groups,
+        query_rows=1 if sparse else 6,
+        heads=32,
+        ld=1,
+        has_offset=0,
+    )
+    expected_tiles = [(0, group, tile) for group in range(groups) for tile in range(32 if sparse else 65)]
+    _assert_indexer_metadata(metadata, expected_tiles, workers=32)
+    words = metadata.cpu()
+    li = words[:288].reshape(36, 8).tolist()
+    assert all(record[0] == 1 for record in li[:32])
+    # Derive each merge's fan-in from independent logical tile ownership,
+    # then require single ownership of every query row in that merge.
+    owners = [set() for _ in range(groups)]
+    for worker, record in enumerate(li[:32]):
+        begin, end = tuple(record[1:4]), tuple(record[4:7])
+        for tile in expected_tiles:
+            if begin <= tile < end:
+                owners[tile[1]].add(worker)
+    merge_rows = {
+        (group, row): 0
+        for group in range(groups)
+        if len(owners[group]) > 1
+        for row in range(1 if sparse else min(6, 7 - group * 6))
+    }
+    workspace_ranges = {}
+    for record in words[288:864].reshape(72, 8).tolist():
+        if not record[0]:
+            assert record == [0] * 8
+            continue
+        enabled, batch, group, base, parts, first_row, rows, reserved = record
+        assert enabled == 1 and batch == 0 and reserved == 0
+        assert parts == len(owners[group]) and parts > 1
+        assert base >= 0 and rows > 0
+        if group in workspace_ranges:
+            assert workspace_ranges[group] == (base, parts)
+        workspace_ranges[group] = (base, parts)
+        for row in range(first_row, first_row + rows):
+            merge_rows[group, row] += 1
+    assert merge_rows and all(count == 1 for count in merge_rows.values())
+    slots = [slot for base, parts in workspace_ranges.values() for slot in range(base, base + parts)]
+    assert sorted(slots) == list(range(len(slots)))
+
+
+@pytest.mark.parametrize(
+    "ratio,candidates_enabled,large_workload",
+    [(1, False, False), (1, True, False), (2, True, False), pytest.param(1, True, True, id="candidate-truncation")],
+)
+@torch.inference_mode()
+def test_indexer_metadata_cache_and_candidates(ratio, candidates_enabled, large_workload):
     torch.manual_seed(412)
-    lengths = [769, 145]
-    query_lengths = [4, 3]
+    lengths = [16449, 513] if large_workload else [769, 145]
+    query_lengths = [7, 3] if large_workload else [4, 3]
+    total_queries = sum(query_lengths)
     residual = [0, 1] if ratio == 2 else [0, 0]
-    cu_cpu = torch.tensor([0, 4, 7], dtype=torch.int32)
+    cu_cpu = torch.tensor([0, query_lengths[0], total_queries], dtype=torch.int32)
     cu, used = cu_cpu.npu(), torch.tensor(lengths, dtype=torch.int32, device="npu")
     rem = torch.tensor(residual, dtype=torch.int32, device="npu") if ratio != 1 else None
     page_size = 128
@@ -74,6 +168,7 @@ def test_indexer_metadata_cache_and_candidates(ratio, candidates_enabled):
     query = torch.randn(sum(query_lengths), 32, 128).to(torch.bfloat16)
     key = torch.randn(sum(lengths), 128).to(torch.bfloat16)
     weights = torch.randn(sum(query_lengths), 32) / 32
+    weights_npu = weights.npu()
     # Signed head weights exercise signed score ordering, including below zero.
     query_data, query_scale = quantize_mxfp4_indexer(query.npu())
     q_ref, qs_ref = quantize_indexer(query)
@@ -92,8 +187,8 @@ def test_indexer_metadata_cache_and_candidates(ratio, candidates_enabled):
     write_mxfp4_indexer_cache(key.npu(), slots, data_cache, scale_cache)
     fold_indexer_cache_rows((data_cache, scale_cache), folded, slots)
     candidate_args = dict(candidate_topk_blocks=2048, candidate_block_size=8) if candidates_enabled else {}
-    metadata = ops.quant_lightning_indexer_metadata(
-        cu,
+    metadata_args = dict(
+        cu_seqlens_q=cu,
         seqused_k=used,
         cmp_residual_k=rem,
         batch_size=2,
@@ -109,6 +204,7 @@ def test_indexer_metadata_cache_and_candidates(ratio, candidates_enabled):
         layout_k="PA_BBND",
         **candidate_args,
     )
+    metadata = ops.quant_lightning_indexer_metadata(**metadata_args)
     common = dict(
         cu_seqlens_q=cu,
         seqused_k=used,
@@ -124,7 +220,7 @@ def test_indexer_metadata_cache_and_candidates(ratio, candidates_enabled):
     indices, values, candidates, candidate_lengths = ops.quant_lightning_indexer(
         query_data,
         data_cache,
-        weights.npu(),
+        weights_npu,
         query_scale.unflatten(-1, (2, 2)),
         scale_cache.unflatten(-1, (2, 2)),
         512,
@@ -157,16 +253,49 @@ def test_indexer_metadata_cache_and_candidates(ratio, candidates_enabled):
                 (batch, query_tile, tile) for tile in range(math.ceil(visible_lengths[last_row] / 256))
             )
     _assert_indexer_metadata(metadata, expected_tiles)
+    if large_workload:
+        assert len(expected_tiles) > 32
     for row, (score, visible) in enumerate(zip(scores, visible_lengths)):
         eligible = torch.arange(score.numel()) < visible
         assert_topk(indices[row], values[row], score, eligible)
         if candidates_enabled:
-            expected_blocks = math.ceil(visible / 8)
-            assert int(candidate_lengths[row].cpu()) == expected_blocks
-            selected_blocks = candidates[row, 0, :expected_blocks].cpu().sort().values
-            torch.testing.assert_close(
-                selected_blocks, torch.arange(expected_blocks, dtype=torch.int32), rtol=0, atol=0
+            assert_candidate_topk(candidates[row], candidate_lengths[row], score, visible)
+    if large_workload:
+        # Capture metadata and the LD barrier path. Negating packed Q changes
+        # every score while preserving shapes and preallocated graph addresses.
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph, capture_error_mode="thread_local", auto_dispatch_capture=True):
+            captured_metadata = ops.quant_lightning_indexer_metadata(**metadata_args)
+            captured_indices, captured_values, captured_candidates, captured_lengths = ops.quant_lightning_indexer(
+                query_data,
+                data_cache,
+                weights_npu,
+                query_scale.unflatten(-1, (2, 2)),
+                scale_cache.unflatten(-1, (2, 2)),
+                512,
+                1,
+                metadata=captured_metadata,
+                **candidate_args,
+                **common,
             )
+        for sign in (-1, 1):
+            query_data.bitwise_xor_(0x88)
+            graph.replay()
+            _assert_indexer_metadata(captured_metadata, expected_tiles)
+            q_offset = k_offset = 0
+            for qlen, klen in zip(query_lengths, lengths):
+                replay_scores = indexer_scores(
+                    q_decoded[q_offset : q_offset + qlen] * sign,
+                    k_decoded[k_offset : k_offset + klen],
+                    weights[q_offset : q_offset + qlen],
+                )
+                for local_row, score in enumerate(replay_scores):
+                    row = q_offset + local_row
+                    visible = visible_lengths[row]
+                    assert_topk(captured_indices[row], captured_values[row], score, torch.arange(klen) < visible)
+                    assert_candidate_topk(captured_candidates[row], captured_lengths[row], score, visible)
+                q_offset += qlen
+                k_offset += klen
     source_metadata = SimpleNamespace(
         qli_metadata=metadata,
         query_start_loc=cu,
@@ -184,12 +313,12 @@ def test_indexer_metadata_cache_and_candidates(ratio, candidates_enabled):
         dtype=torch.int64,
         device="npu",
     )
-    output = torch.empty((7, 512), dtype=torch.int32, device="npu")
-    topk_lengths = torch.empty((7, 1), dtype=torch.int32, device="npu")
+    output = torch.empty((total_queries, 512), dtype=torch.int32, device="npu")
+    topk_lengths = torch.empty((total_queries, 1), dtype=torch.int32, device="npu")
     adapter_candidate_lengths = torch.empty_like(candidate_lengths)
     adapted, _ = run_a5_indexer(
         query.npu(),
-        weights.npu(),
+        weights_npu,
         positions,
         (data_cache, scale_cache, folded),
         source_metadata,
@@ -226,9 +355,10 @@ def test_indexer_metadata_cache_and_candidates(ratio, candidates_enabled):
         selected_lengths = candidate_lengths.clone()
         allowed = []
         for row, (score, visible) in enumerate(zip(scores, visible_lengths)):
-            blocks = list(range(math.ceil(visible / 8)))
+            count = int(candidate_lengths[row].cpu())
+            blocks = candidates[row, 0, :count].cpu().tolist()
             if restricted:
-                blocks = blocks[::2][::-1] if row else []
+                blocks = sorted(blocks)[::2][::-1] if row else []
                 if candidate_mode == "empty":
                     blocks = []
                 selected_candidates[row].fill_(2**30)
@@ -241,9 +371,9 @@ def test_indexer_metadata_cache_and_candidates(ratio, candidates_enabled):
                 (torch.arange(score.numel()) < visible)
                 & torch.isin(torch.arange(score.numel()) // 8, torch.tensor(blocks, dtype=torch.int64))
             )
-        sparse_metadata = ops.quant_sparse_lightning_indexer_metadata(
-            selected_lengths,
-            cu,
+        sparse_metadata_args = dict(
+            candidate_block_length=selected_lengths,
+            cu_seqlens_q=cu,
             seqused_k=used,
             cmp_residual_k=rem,
             batch_size=2,
@@ -260,6 +390,7 @@ def test_indexer_metadata_cache_and_candidates(ratio, candidates_enabled):
             layout_q="TND",
             layout_k="PA_BBND",
         )
+        sparse_metadata = ops.quant_sparse_lightning_indexer_metadata(**sparse_metadata_args)
         lengths_cpu = selected_lengths.cpu().flatten().tolist()
         sparse_tiles = []
         for batch, qlen in enumerate(query_lengths):
@@ -270,7 +401,7 @@ def test_indexer_metadata_cache_and_candidates(ratio, candidates_enabled):
         sparse_indices, sparse_values = ops.quant_sparse_lightning_indexer(
             query_data,
             folded.squeeze(2),
-            weights.npu(),
+            weights_npu,
             query_scale.unflatten(-1, (2, 2)),
             selected_candidates,
             selected_lengths,
@@ -286,9 +417,42 @@ def test_indexer_metadata_cache_and_candidates(ratio, candidates_enabled):
                 torch.testing.assert_close(
                     sparse_values[row].cpu().sort().values, values[row].cpu().sort().values, rtol=0, atol=0
                 )
+        if large_workload and candidate_mode == "all":
+            sparse_graph = torch.npu.NPUGraph()
+            with torch.npu.graph(sparse_graph, capture_error_mode="thread_local", auto_dispatch_capture=True):
+                captured_sparse_metadata = ops.quant_sparse_lightning_indexer_metadata(**sparse_metadata_args)
+                captured_sparse_indices, captured_sparse_values = ops.quant_sparse_lightning_indexer(
+                    query_data,
+                    folded.squeeze(2),
+                    weights_npu,
+                    query_scale.unflatten(-1, (2, 2)),
+                    selected_candidates,
+                    selected_lengths,
+                    512,
+                    1,
+                    8,
+                    metadata=captured_sparse_metadata,
+                    **common,
+                )
+            for sign in (-1, 1):
+                query_data.bitwise_xor_(0x88)
+                sparse_graph.replay()
+                _assert_indexer_metadata(captured_sparse_metadata, sparse_tiles)
+                q_offset = k_offset = 0
+                for qlen, klen in zip(query_lengths, lengths):
+                    replay_scores = indexer_scores(
+                        q_decoded[q_offset : q_offset + qlen] * sign,
+                        k_decoded[k_offset : k_offset + klen],
+                        weights[q_offset : q_offset + qlen],
+                    )
+                    for local_row, score in enumerate(replay_scores):
+                        row = q_offset + local_row
+                        assert_topk(captured_sparse_indices[row], captured_sparse_values[row], score, allowed[row])
+                    q_offset += qlen
+                    k_offset += klen
         adapted, _ = run_a5_indexer(
             query.npu(),
-            weights.npu(),
+            weights_npu,
             positions,
             (data_cache, scale_cache, folded),
             source_metadata,
@@ -303,7 +467,7 @@ def test_indexer_metadata_cache_and_candidates(ratio, candidates_enabled):
             topk_lengths=topk_lengths,
             indices_output=output,
         )
-        for row in range(7):
+        for row in range(total_queries):
             expected = sparse_indices[row, 0].cpu()
             expected = torch.where(expected >= 0, expected, torch.iinfo(torch.int32).max).sort().values
             expected[expected == torch.iinfo(torch.int32).max] = -1

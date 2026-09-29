@@ -50,6 +50,8 @@ from cannbotdsl.tensor import (
     tile_view,
 )
 
+from vllm_ascend.ops.pythondsl.utils import INDEXER_MAX_WORKERS, get_indexer_worker_count
+
 
 def _to_index(value):
     return coerce_scalar_value(value, ir.IndexType.get())
@@ -71,7 +73,7 @@ STAGING_DEPTH = 4
 VECTOR0_READY_ID = 6
 AIV1_SYNC_ID_OFFSET = 16
 TOPK_TRUNK_LEN = 16384
-MAX_CUBE_WORKERS = 32
+MAX_CUBE_WORKERS = INDEXER_MAX_WORKERS
 
 
 def _offset_view(tensor, offsets):
@@ -2567,14 +2569,14 @@ def quant_sparse_lightning_indexer(
     # Streaming-merge workspace capacity; actual shard boundaries come from metadata.
     split_count = max(1, min(8, 16384 // int(topk)))
     auto_metadata = False
-    worker_count = MAX_CUBE_WORKERS
+    worker_count = get_indexer_worker_count(q.device)
     if metadata.dtype != torch.int32 or metadata.ndim != 1 or metadata.numel() != 1024 or not metadata.is_contiguous():
         raise ValueError("metadata must be contiguous int32 [1024] in ASC LI/LD boundary format")
     if metadata.device != q.device:
         raise ValueError("metadata must be on the same device as q")
     metadata = metadata.view(128, 8)
     tokens = full_tokens
-    worker_count = MAX_CUBE_WORKERS
+    worker_count = get_indexer_worker_count(q.device)
 
     sparse_indices = torch.empty(
         (64, N2, int(topk)),
@@ -3667,7 +3669,7 @@ def _run_tnd(
     full_tokens = CANDIDATE_CAPACITY * CANDIDATE_BLOCK_SIZE
     split_count = max(1, min(8, 16384 // int(topk)))
     auto_metadata = False
-    worker_count = MAX_CUBE_WORKERS
+    worker_count = get_indexer_worker_count(q.device)
     if metadata is None:
         raise ValueError("metadata is required; call quant_sparse_lightning_indexer_metadata before this operator")
     if metadata.device != q.device:
@@ -3676,7 +3678,7 @@ def _run_tnd(
         raise ValueError("metadata must be contiguous int32 [1024] in ASC LI/LD boundary format")
     metadata = metadata.view(128, 8)
     tokens = full_tokens
-    worker_count = MAX_CUBE_WORKERS
+    worker_count = get_indexer_worker_count(q.device)
 
     sparse_indices = torch.empty(
         (64, N2, int(topk)),

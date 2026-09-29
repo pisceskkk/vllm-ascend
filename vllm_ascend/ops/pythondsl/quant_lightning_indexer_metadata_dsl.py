@@ -22,6 +22,8 @@ from cannbotdsl.aicpu import (
     current_raw_stream,
 )
 
+from vllm_ascend.ops.pythondsl.utils import get_indexer_worker_count
+
 
 class Args:
     cu: GmIn(I32)
@@ -360,7 +362,7 @@ def build_metadata(
     output_idx_offset=None,
 ):
     groups = q.shape[0] if sparse else batch * max_tasks
-    workers = 32
+    workers = get_indexer_worker_count(q.device)
     output = torch.empty((1024,), dtype=torch.int32, device=q.device)
     scratch = torch.empty((batch + 1,), dtype=torch.int64, device=q.device)
     _, compiled = compiled_metadata()

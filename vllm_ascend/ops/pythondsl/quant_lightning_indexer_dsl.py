@@ -51,6 +51,8 @@ from cannbotdsl.tensor import (
     tile_view,
 )
 
+from vllm_ascend.ops.pythondsl.utils import INDEXER_MAX_WORKERS, get_indexer_worker_count
+
 # Group six N1=32 query rows into an M192 tile; N1=64 uses four rows.
 QUERY_TILE_ROWS = 6
 TILE_M = 32 * QUERY_TILE_ROWS
@@ -64,7 +66,7 @@ N2 = 1
 VEC_TILE = 128
 CANDIDATE_BLOCK_SIZE = 8
 TOPK_TRUNK_LEN = 26624
-MAX_CUBE_WORKERS = 32
+MAX_CUBE_WORKERS = INDEXER_MAX_WORKERS
 KEY_STORAGE_ROW_ELEMENTS = N2 * PACKED_D
 KEY_SCALE_STORAGE_ROW_ELEMENTS = N2 * 2 * 2
 
@@ -5207,13 +5209,13 @@ def quant_lightning_indexer(
     # Workspace capacity; AICPU metadata owns the actual shard boundaries.
     split_count = max(1, min(8, 16384 // int(topk)))
     auto_metadata = False
-    worker_count = MAX_CUBE_WORKERS
+    worker_count = get_indexer_worker_count(q.device)
     if metadata.dtype != torch.int32 or metadata.ndim != 1 or metadata.numel() != 1024 or not metadata.is_contiguous():
         raise ValueError("metadata must be contiguous int32 [1024] in ASC LI/LD boundary format")
     if metadata.device != q.device:
         raise ValueError("metadata must be on the same device as q")
     metadata = metadata.view(128, 8)
-    worker_count = MAX_CUBE_WORKERS
+    worker_count = get_indexer_worker_count(q.device)
     workspace_row_count = MAX_CUBE_WORKERS * (TILE_M // N1)
     shard_pad = tokens_pad
     # Public outputs and GM scratch are allocation-only Torch calls.  The
@@ -6044,13 +6046,13 @@ def _run_tnd(
     # Workspace capacity; AICPU metadata owns the actual shard boundaries.
     split_count = max(1, min(8, 16384 // int(topk)))
     auto_metadata = False
-    worker_count = MAX_CUBE_WORKERS
+    worker_count = get_indexer_worker_count(q.device)
     if metadata.dtype != torch.int32 or metadata.ndim != 1 or metadata.numel() != 1024 or not metadata.is_contiguous():
         raise ValueError("metadata must be contiguous int32 [1024] in ASC LI/LD boundary format")
     if metadata.device != q.device:
         raise ValueError("metadata must be on the same device as q")
     metadata = metadata.view(128, 8)
-    worker_count = MAX_CUBE_WORKERS
+    worker_count = get_indexer_worker_count(q.device)
     workspace_row_count = MAX_CUBE_WORKERS * (TILE_M // N1)
     shard_pad = tokens_pad
     # Public outputs and GM scratch are allocation-only Torch calls.  The

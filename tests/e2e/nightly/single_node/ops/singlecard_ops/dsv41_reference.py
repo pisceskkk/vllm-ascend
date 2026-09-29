@@ -90,3 +90,23 @@ def assert_topk(indices, values, scores, eligible, topk=512):
     assert bool((scores[chosen] >= cutoff).all())
     mandatory = torch.nonzero(eligible & (scores > cutoff)).flatten()
     assert bool(torch.isin(mandatory, chosen).all())
+
+
+def assert_candidate_topk(indices, length, scores, visible, topk=2048):
+    """Rank complete blocks by their maximum; retain the newest partial block."""
+    block_count = (visible + 7) // 8
+    count = min(topk, block_count)
+    assert int(length.cpu()) == count
+    selected = indices.cpu().flatten()[:count].long()
+    assert selected.unique().numel() == count
+    assert bool(((selected >= 0) & (selected < block_count)).all())
+    block_scores = torch.full((block_count * 8,), -torch.inf)
+    block_scores[:visible] = scores[:visible]
+    block_scores = block_scores.reshape(-1, 8).amax(-1)
+    if visible % 8:
+        block_scores[-1] = torch.inf
+        assert bool((selected == block_count - 1).any())
+    cutoff = block_scores.topk(count).values[-1]
+    assert bool((block_scores[selected] >= cutoff).all())
+    mandatory = torch.nonzero(block_scores > cutoff).flatten()
+    assert bool(torch.isin(mandatory, selected).all())

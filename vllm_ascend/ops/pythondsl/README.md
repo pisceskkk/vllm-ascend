@@ -25,6 +25,13 @@ MXFP4/BF16-scale cache rows. All three metadata operators return INT32[1024].
 Supply device prefix sums, sequence lengths, and metadata explicitly in model
 execution; optional sequence defaults are for standalone use.
 
+The indexers use `min(32, device Cube core count)` workers for both metadata
+scheduling and kernel launch. The limit of 32 is the workspace/tuning capacity,
+not a device assumption: a 32-core A5 keeps 32 workers, and a 28-core A5 uses 28.
+The fused LD merge contains a global barrier, so every launched worker must fit
+in one resident wave. Device properties are cached on the host during warmup;
+choosing the worker count does not read a device tensor or synchronize a stream.
+
 The source kernels retain their compiler allocation and synchronization order.
 Some DSL buffer declarations intentionally have no subsequent Python reference;
 the AICPU `zeros` expression is a compiler intrinsic. Local lint annotations
