@@ -6,16 +6,14 @@ set -Eeuo pipefail
 case "${1:-}" in
   prefill) role=prefill; kv_role=kv_producer; recompute=false; default_port=18121; engine_id=0 ;;
   decode) role=decode; kv_role=kv_consumer; recompute=true; default_port=18123; engine_id=1 ;;
-  *) echo "Usage: MODEL_PATH=... ROLE_HOST=... COMM_IFNAME=... VLLM_ASCEND_ROOT=... DSV41_LEGACY_OPP=... bash $0 {prefill|decode}" >&2; exit 2 ;;
+  *) echo "Usage: MODEL_PATH=... ROLE_HOST=... COMM_IFNAME=... VLLM_ASCEND_ROOT=... bash $0 {prefill|decode}" >&2; exit 2 ;;
 esac
 
 : "${MODEL_PATH:?Set MODEL_PATH to the DeepSeek-V4.1-Flash checkpoint}"
 : "${ROLE_HOST:?Set ROLE_HOST to the communication IP address of this node}"
 : "${COMM_IFNAME:?Set COMM_IFNAME to the communication network interface}"
 : "${VLLM_ASCEND_ROOT:?Set VLLM_ASCEND_ROOT to the installed vllm-ascend checkout}"
-: "${DSV41_LEGACY_OPP:?Set DSV41_LEGACY_OPP to the validated legacy custom_transformer vendor directory}"
 CANN_HOME="${CANN_HOME:-/usr/local/Ascend/ascend-toolkit}"
-CUSTOMIZE_OPP="${CUSTOMIZE_OPP:-${CANN_HOME}/latest/opp/vendors/customize}"
 WORK_DIR="${WORK_DIR:-${PWD}/dsv41-recompute-pd}"
 LOG_DIR="${LOG_DIR:-${WORK_DIR}/logs}"
 CACHE_DIR="${CACHE_DIR:-${WORK_DIR}/cache/${role}}"
@@ -45,20 +43,19 @@ export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 unset HCCL_DETERMINISTIC VLLM_COMPUTE_NANS_IN_LOGITS VLLM_RAISE_ON_LOGIT_NANS
+unset PYTHONPATH LD_LIBRARY_PATH LD_PRELOAD ASCEND_CUSTOM_OPP_PATH
+unset VLLM_ASCEND_BUNDLED_OPP DSV41_A5_DSL_SOURCE DSV41_A5_OPERATOR_RELEASE
 
 set +u
 # shellcheck disable=SC1091
 source "${CANN_HOME}/set_env.sh"
 set -u
-unset ATB_HOME_PATH ASDOPS_HOME_PATH ATB_SPEED_HOME_PATH ASCEND_LAUNCH_BLOCKING
+unset ATB_HOME_PATH ASDOPS_HOME_PATH ATB_SPEED_HOME_PATH ASCEND_LAUNCH_BLOCKING LD_PRELOAD
 export PYTHONPATH="${VLLM_ASCEND_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
-# Preserve the three-vendor loader order of the validated PD environment.
-export VLLM_ASCEND_BUNDLED_OPP="${VLLM_ASCEND_ROOT}/vllm_ascend/_cann_ops_custom/vendors/custom_transformer"
-export ASCEND_CUSTOM_OPP_PATH="${CUSTOMIZE_OPP}:${VLLM_ASCEND_BUNDLED_OPP}:${DSV41_LEGACY_OPP}"
-export LD_LIBRARY_PATH="${DSV41_LEGACY_OPP}/op_api/lib:${CUSTOMIZE_OPP}/op_api/lib:${VLLM_ASCEND_BUNDLED_OPP}/op_api/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-export LD_PRELOAD="${CUSTOMIZE_OPP}/op_api/lib/libcust_opapi.so:${VLLM_ASCEND_BUNDLED_OPP}/op_api/lib/libcust_opapi.so:${DSV41_LEGACY_OPP}/op_api/lib/libcust_opapi.so:${CANN_HOME}/latest/lib64/libopapi_nn.so"
-export DSV41_A5_DSL_SOURCE=arena
+# Use the complete operator package from this checkout through normal dlopen.
+export ASCEND_CUSTOM_OPP_PATH="${VLLM_ASCEND_ROOT}/vllm_ascend/_cann_ops_custom/vendors/custom_transformer"
+export LD_LIBRARY_PATH="${ASCEND_CUSTOM_OPP_PATH}/op_api/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export CANNBOTDSL_NATIVE_BINARY_MODE=prefer
 
 mkdir -p "${LOG_DIR}" "${CACHE_DIR}"

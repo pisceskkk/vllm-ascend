@@ -6,17 +6,29 @@ The launch configuration keeps async scheduling, five DSpark draft tokens with a
 
 ## Runtime prerequisites
 
-Use the same compatible vLLM, torch-npu, CANN and V4.1 operator installation on both nodes, with this source installed. The launch script reproduces the validated PD environment's **three-vendor operator stack**:
+This complete-package example requires [PR #3](https://github.com/linfeng-yuan/vllm-ascend/pull/3), [PR #4](https://github.com/linfeng-yuan/vllm-ascend/pull/4) and [PR #5](https://github.com/linfeng-yuan/vllm-ascend/pull/5) applied together to `0929_950DT_vllm0300`. PR #3 supplies the async metadata optimization; PR #4 supplies the in-tree V4.1 operators and their native call paths; PR #5 supplies fixed Engram DP slots. PR #5 retains that target branch as its base: checking out PR #5 alone does not include the operator migration from PR #4.
+
+Use the same compatible vLLM, torch-npu and CANN installation on both nodes, with the combined source and complete 31-operator package plus extension:
 
 | Variable | Required location |
 | --- | --- |
-| `VLLM_ASCEND_ROOT` | Installed vllm-ascend checkout, including `vllm_ascend/_cann_ops_custom/vendors/custom_transformer` |
-| `CUSTOMIZE_OPP` | CANN `customize` vendor; defaults to `$CANN_HOME/latest/opp/vendors/customize` |
-| `DSV41_LEGACY_OPP` | Compatible legacy `custom_transformer` vendor |
+| `VLLM_ASCEND_ROOT` | Installed vllm-ascend checkout, including `vllm_ascend/vllm_ascend_C*.so` and `vllm_ascend/_cann_ops_custom/vendors/custom_transformer` |
 | `CANN_HOME` | Toolkit root containing `set_env.sh`; defaults to `/usr/local/Ascend/ascend-toolkit` |
 | `VLLM_BIN` | vLLM executable from the prepared Python environment; defaults to `vllm` on `PATH` |
 
-All three vendors must already be installed. The script preserves their `ASCEND_CUSTOM_OPP_PATH`, library search and `LD_PRELOAD` ordering, and selects the installed arena PythonDSL implementation. These loader settings apply to this operator stack; they are not the loader recipe for the separately built, complete 31-operator package. The script prepends the selected source checkout to `PYTHONPATH` while retaining the toolkit's pyACL paths.
+Use the same complete operator artifacts on both nodes. The script clears inherited operator paths and `LD_PRELOAD`, then loads the toolkit environment and selects only this checkout's bundled vendor in `ASCEND_CUSTOM_OPP_PATH`. The custom API library is resolved through the normal local `dlopen` path; do not preload custom or toolkit operator libraries. PythonDSL operators come from the checkout, without the legacy arena selector. The selected source is prepended to `PYTHONPATH` while retaining the toolkit's pyACL paths.
+
+Reuse validated artifacts built for this native source, hardware and CANN version when they are already available; the Python-only fixed-slot change does not require recompilation. Otherwise, prepare the repository's build dependencies and build the complete package through the normal entry point, with at least 256-way build parallelism on the Ascend 950DT build host:
+
+```bash
+cd "$VLLM_ASCEND_ROOT"
+source "${CANN_HOME:-/usr/local/Ascend/ascend-toolkit}/set_env.sh"
+unset LD_PRELOAD ASCEND_CUSTOM_OPP_PATH
+export MAX_JOBS=256 CMAKE_BUILD_PARALLEL_LEVEL=256 COMPILE_CUSTOM_KERNELS=1
+export SOC_VERSION=ascend950dt_9572
+export PYTHONPATH="$PWD${PYTHONPATH:+:${PYTHONPATH}}"
+python setup.py build_ext --inplace
+```
 
 Both nodes need the complete checkpoint, eight visible devices and network access to each other's HTTP and Mooncake/HCCL communication ports. `ROLE_HOST` must be reachable from the other node and correspond to `COMM_IFNAME`. Run each command inside its prepared container or environment. No credentials, container setup or operator build is included.
 
@@ -27,7 +39,6 @@ On the prefill node, replace the example paths and network values:
 ```bash
 export MODEL_PATH=/models/DeepSeek-V4.1-Flash
 export VLLM_ASCEND_ROOT=/workspace/vllm-ascend
-export DSV41_LEGACY_OPP=/opt/dsv41/legacy_opp/vendors/custom_transformer
 export ROLE_HOST=192.0.2.10
 export COMM_IFNAME=eth0
 export WORK_DIR=/var/tmp/dsv41-pd
