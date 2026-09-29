@@ -295,6 +295,10 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
         keeps its own ``num_tokens`` window. Returns ``[num_tokens, n_hash_cols,
         dim]`` bf16 with the heads back in checkpoint order.
         """
+        return self.finish_local_rows(self.embed_local_rows(gathered), num_tokens)
+
+    def embed_local_rows(self, gathered: torch.Tensor) -> torch.Tensor:
+        """Look up this rank's heads without submitting a TP collective."""
         # The kernel walks ids as [token, columns] with a unit inner stride, and
         # `gathered` is a slice of a [tokens, layers, columns] buffer.
         gathered = gathered.contiguous()
@@ -304,6 +308,10 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
             device=gathered.device,
         )
         self.lookup(gathered, out)
+        return out
+
+    def finish_local_rows(self, out: torch.Tensor, num_tokens: int) -> torch.Tensor:
+        """Restore DP/TP head order on the caller's stream."""
         if self.dp_size > 1:
             out = _gather_engram_rows(out, num_tokens)
         else:

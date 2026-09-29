@@ -381,6 +381,14 @@ requests, and mixed-length concurrent request smoke tests. These checks do
 not establish dataset accuracy or performance. Other Engram storage formats
 and model runner V2 are not covered by this smoke validation.
 
+For an opt-in experiment with Engram lookup overlap during eager prefill, add
+`"multistream_engram_overlap": true` to `--additional-config`. The runner
+hashes token history and reads this rank's INT8 Engram rows on an auxiliary
+NPU stream while the backbone starts. It waits at each Engram layer before
+the TP row gather and gate. DP-sharded Engram tables and graph replay retain
+the synchronous path. The flag is off by default; measure correctness and
+latency on the target workload before using it for serving.
+
 ## 6 Functional Verification
 
 ### 6.1 Text Request

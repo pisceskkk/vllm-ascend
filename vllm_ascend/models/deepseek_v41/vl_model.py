@@ -232,6 +232,28 @@ class AscendDeepseekV41ForCausalLM(
         )
 
     @property
+    def engram_multistream_supported(self) -> bool:
+        return self.language_model.engram_multistream_supported
+
+    def prepare_engram_local_inputs(
+        self,
+        input_ids,
+        positions,
+        lookback_token_ids=None,
+        query_start_loc=None,
+        slot_mapping=None,
+        block_table=None,
+    ):
+        return self.language_model.prepare_engram_local_inputs(
+            input_ids,
+            positions,
+            lookback_token_ids,
+            query_start_loc,
+            slot_mapping,
+            block_table,
+        )
+
+    @property
     def token_lookback_depth(self) -> int:
         """What the runner sizes the prompt lookback buffer from."""
         return self.language_model.token_lookback_depth

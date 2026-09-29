@@ -15,6 +15,7 @@ from safetensors.torch import save_file
 
 from vllm_ascend.models.deepseek_v41.engram import embedding as embedding_mod
 from vllm_ascend.models.deepseek_v41.engram import npu
+from vllm_ascend.models.deepseek_v41 import model as model_mod
 from vllm_ascend.patch.platform.patch_engram_config import AscendEngramConfig
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -186,6 +187,156 @@ def test_shared_table_skips_per_step_dp_gather(monkeypatch):
     table.embed_gathered = lambda gathered, count: gathered[count : 2 * count]
     assert table.forward(ids).tolist() == [[7, 8]]
     assert calls == [True, False]
+
+
+def test_engram_local_rows_finish_tp_gather_on_consumer_stream(monkeypatch):
+    table = object.__new__(embedding_mod.AscendParallelEngramEmbedding)
+    torch.nn.Module.__init__(table)
+    table.dp_size = 1
+    table.tp_size = 2
+    table.n_hash_cols = 4
+    local = torch.arange(8, dtype=torch.bfloat16).view(1, 2, 4)
+    calls = []
+
+    def gather(rows, dim):
+        calls.append((rows, dim))
+        return torch.cat((rows, rows + 100), dim=dim)
+
+    monkeypatch.setattr(embedding_mod, "tensor_model_parallel_all_gather", gather)
+    result = table.finish_local_rows(local, 1)
+    assert calls == [(local, 1)]
+    assert torch.equal(result[:, :2], local)
+    assert torch.equal(result[:, 2:], local + 100)
+
+
+def test_engram_local_lookup_records_each_layer_before_next_lookup(monkeypatch):
+    trace = []
+
+    class Event:
+        next_id = 0
+
+        def __init__(self):
+            self.name = f"event{Event.next_id}"
+            Event.next_id += 1
+
+        def record(self, stream):
+            trace.append((self.name, "record", stream))
+
+    class HashState:
+        lookback_depth = 2
+
+        def ensure_cache(self):
+            return True
+
+        def __call__(self, *args):
+            trace.append(("hash", "run", None))
+            return torch.arange(8, dtype=torch.int32).view(2, 2, 2)
+
+    def table(layer):
+        def local(ids):
+            trace.append((f"lookup{layer}", "run", None))
+            return ids.unsqueeze(-1).expand(-1, -1, 4).bfloat16()
+
+        def full(ids, count):
+            raise AssertionError("TP gather must remain on the consumer stream")
+
+        return SimpleNamespace(embed_local_rows=local, embed_gathered=full)
+
+    model = object.__new__(model_mod.DeepseekV41Model)
+    torch.nn.Module.__init__(model)
+    model.has_engram = True
+    model.engram_dp_shared_memory = True
+    model.engram_hash = HashState()
+    model.config = SimpleNamespace(engram_layer_ids=(1, 14), image_token_id=999)
+    layers = [SimpleNamespace(engram=None) for _ in range(15)]
+    layers[1].engram = SimpleNamespace(embed_tokens=table(1))
+    layers[14].engram = SimpleNamespace(embed_tokens=table(14))
+    model.layers = layers
+    monkeypatch.setattr(torch.npu, "Event", Event)
+    monkeypatch.setattr(torch.npu, "current_stream", lambda: "aux")
+    monkeypatch.setattr(model_mod, "gather_engram_hashes", lambda ids, **kwargs: ids)
+    result = model.prepare_engram_local_inputs(
+        torch.tensor([1, 2]),
+        torch.tensor([0, 1]),
+        query_start_loc=torch.tensor([0, 2]),
+        slot_mapping=torch.tensor([0, 1]),
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+    )
+    assert result["engram_mask"].tolist() == [True, True]
+    assert result["engram_local_rows"][1].shape == (2, 2, 4)
+    assert result["engram_local_rows"][14].shape == (2, 2, 4)
+    names = [item[0] for item in trace]
+    mask_event = result["engram_mask_ready_event"].name
+    first = result["engram_ready_events"][1].name
+    second = result["engram_ready_events"][14].name
+    assert names.index(mask_event) < names.index("hash")
+    assert names.index("hash") < names.index("lookup1") < names.index(first)
+    assert names.index(first) < names.index("lookup14") < names.index(second)
+
+
+def test_engram_consumer_waits_at_each_layer(monkeypatch):
+    trace = []
+
+    class Stream:
+        def wait_event(self, event):
+            trace.append(("wait", event))
+
+    class Engram:
+        def __init__(self, layer):
+            self.layer = layer
+            self.embed_tokens = SimpleNamespace(finish_local_rows=self.finish)
+
+        def finish(self, rows, tokens):
+            trace.append(("tp_gather", self.layer))
+            assert rows.shape[0] == tokens
+            return rows
+
+        def __call__(self, hidden, rows, mask, rotation):
+            trace.append(("gate", self.layer))
+            assert mask.all()
+            return hidden + rows.view_as(hidden)
+
+    class Layer:
+        def __init__(self, index):
+            self.layer_idx = index
+            self.engram = Engram(index) if index in (1, 14) else None
+
+        def __call__(self, positions, hidden, pre_mix, scaling, input_ids):
+            trace.append(("layer", self.layer_idx))
+            return hidden, pre_mix
+
+        def hc_collapse(self, hidden, pre_mix):
+            return hidden[:, 0]
+
+    model = object.__new__(model_mod.DeepseekV41Model)
+    torch.nn.Module.__init__(model)
+    model.embed_tokens = lambda ids: torch.ones((ids.shape[0], 4))
+    model.shared_attention_state = SimpleNamespace(reset=lambda: None)
+    model.use_sequence_parallel = False
+    model.hc_mult = 1
+    model.needs_moe_input_ids = False
+    model.aux_hidden_state_layers = ()
+    model.layers = [Layer(index) for index in range(15)]
+    model.norm = lambda hidden: hidden
+    model.engram_rotation = torch.eye(32)
+    monkeypatch.setattr(torch.npu, "current_stream", Stream)
+    local = {layer: torch.ones((2, 1, 4)) for layer in (1, 14)}
+    output = model.forward(
+        torch.tensor([3, 4]),
+        torch.tensor([0, 1]),
+        None,
+        engram_mask=torch.tensor([True, True]),
+        engram_local_rows=local,
+        engram_mask_ready_event="mask",
+        engram_ready_events={1: "ready1", 14: "ready14"},
+    )
+    assert output.shape == (2, 4)
+    assert trace.index(("wait", "mask")) < trace.index(("layer", 0))
+    assert trace.index(("layer", 0)) < trace.index(("wait", "ready1"))
+    assert trace.index(("wait", "ready1")) < trace.index(("tp_gather", 1))
+    assert trace.index(("gate", 1)) < trace.index(("layer", 1))
+    assert trace.index(("layer", 13)) < trace.index(("wait", "ready14"))
+    assert trace.index(("wait", "ready14")) < trace.index(("tp_gather", 14))
 
 
 def _runner(rows, computed, prompt):
