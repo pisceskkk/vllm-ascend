@@ -1,10 +1,10 @@
 import math
-import re as _re
 import sys
 import threading
 from enum import IntEnum
 
 import cannbotdsl
+import regex as _re
 import torch
 from cannbotdsl import dtypes
 from cannbotdsl import select as dyn_select

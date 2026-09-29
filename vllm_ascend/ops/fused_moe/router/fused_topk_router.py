@@ -24,6 +24,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.ops.fused_moe.router.grouped_topk_router import AscendGroupedTopKRouter
+from vllm_ascend.utils import load_custom_op_library
 
 DEEPSEEK_V4_IMAGE_SENTINEL_BASE_ID = 129257
 DEEPSEEK_V4_IMAGE_SENTINEL_COUNT = 5
@@ -118,6 +119,15 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
         self.tid2eid = tid2eid
         self.bias_vl = bias_vl
         self.image_sentinel_lo = image_sentinel_lo
+        profile = get_current_hardware_profile()
+        if (
+            scoring_func == "sqrtsoftplus"
+            and profile.supports(HardwareCapability.MOE_GATING_TOP_K_HASH_VISION)
+            and not profile.supports(HardwareCapability.RUNTIME_CUSTOM_OPS)
+        ):
+            # A5 skips the worker's global custom-op loader. V4 routers also
+            # need this native op without constructing a V4.1 backend first.
+            load_custom_op_library()
 
     def is_fused_supported(
         self,

@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import subprocess
+import sys
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +12,7 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.forward_context import set_forward_context
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl
 from vllm_ascend.ops.fused_moe.router.fused_topk_router import AscendFusedTopKRouter
 from vllm_ascend.utils import load_custom_op_library
@@ -207,3 +211,41 @@ def test_dsv41_router_and_weighted_experts(route):
         for slot in range(TOP_K):
             expected[token] += (hidden[token] @ experts[expected_ids[token, slot]]) * expected_weights[token, slot]
     torch.testing.assert_close(actual.cpu(), expected, rtol=3e-4, atol=3e-4)
+
+
+def test_a5_router_loads_native_op_without_v41_backend():
+    """Use a fresh process so this module's autouse loader cannot hide regressions."""
+    profile = get_current_hardware_profile()
+    if not profile.supports(HardwareCapability.MOE_GATING_TOP_K_HASH_VISION) or profile.supports(
+        HardwareCapability.RUNTIME_CUSTOM_OPS
+    ):
+        pytest.skip("This regression requires A5's selective native-op loading policy")
+    script = textwrap.dedent("""
+        import torch
+        import torch_npu
+        from vllm_ascend.ops.fused_moe.router.fused_topk_router import AscendFusedTopKRouter
+        from vllm_ascend.utils import enable_custom_op
+
+        torch.npu.set_device(0)
+        assert not enable_custom_op()
+        assert not hasattr(torch.ops._C_ascend, "moe_gating_top_k_hash")
+        router = AscendFusedTopKRouter(
+            top_k=6, global_num_experts=384, scoring_func="sqrtsoftplus",
+            routed_scaling_factor=1.5,
+        )
+        assert hasattr(torch.ops._C_ascend, "moe_gating_top_k_hash")
+        # No V4.1 backend or explicit native-op loader is constructed here.
+        generator = torch.Generator().manual_seed(971)
+        logits = torch.randn(9, 384, generator=generator) * 2
+        hidden = torch.zeros(9, 32, device="npu")
+        weights, indices = router._compute_routing(hidden, logits.npu(), torch.int32)
+        scores = torch.logaddexp(logits.double(), torch.zeros_like(logits).double()).sqrt()
+        expected_scores, expected_indices = scores.topk(6, dim=-1)
+        expected_weights = expected_scores / expected_scores.sum(dim=-1, keepdim=True) * 1.5
+        torch.testing.assert_close(indices.cpu(), expected_indices.int(), rtol=0, atol=0)
+        torch.testing.assert_close(weights.cpu(), expected_weights.float(), rtol=1e-5, atol=1e-5)
+        print("FRESH_PROCESS_ROUTER_PASS", flush=True)
+    """)
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=180)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "FRESH_PROCESS_ROUTER_PASS" in result.stdout

@@ -311,6 +311,98 @@ def test_indexer_metadata_cache_and_candidates(ratio, candidates_enabled):
             assert int(topk_lengths[row].cpu()) == min(512, int(allowed[row].sum()))
 
 
+@pytest.mark.parametrize("ratio", [1, 2])
+@torch.inference_mode()
+def test_sparse_indexer_without_dense_predecessor(ratio):
+    """QSLI consumes independently chosen candidates, including an empty row."""
+    torch.manual_seed(414)
+    lengths, query_lengths = [513, 131], [2, 1]
+    residual = [0, 1] if ratio == 2 else [0, 0]
+    cu = torch.tensor([0, 2, 3], dtype=torch.int32, device="npu")
+    used = torch.tensor(lengths, dtype=torch.int32, device="npu")
+    rem = torch.tensor(residual, dtype=torch.int32, device="npu") if ratio != 1 else None
+    table = torch.tensor([[6, 2, 8, 1, 4], [0, 7, 3, 5, 9]], dtype=torch.int32)
+    query = torch.randn(3, 32, 128).to(torch.bfloat16)
+    key = torch.randn(sum(lengths), 128).to(torch.bfloat16)
+    weights = torch.randn(3, 32) / 32
+    q_ref, qs_ref = quantize_indexer(query)
+    k_ref, ks_ref = quantize_indexer(key)
+    query_data, query_scale = quantize_mxfp4_indexer(query.npu())
+    coordinates = [
+        [int(table[batch, token // 128]), token % 128]
+        for batch, length in enumerate(lengths)
+        for token in range(length)
+    ]
+    slots = torch.tensor(coordinates, dtype=torch.int32, device="npu")
+    data_cache = torch.zeros((10, 128, 1, 64), dtype=torch.uint8, device="npu")
+    scale_cache = torch.ones((10, 128, 1, 4), dtype=torch.uint8, device="npu")
+    folded = torch.zeros((10, 16, 1, 544), dtype=torch.uint8, device="npu")
+    write_mxfp4_indexer_cache(key.npu(), slots, data_cache, scale_cache)
+    fold_indexer_cache_rows((data_cache, scale_cache), folded, slots)
+    blocks = [list(range(64, -1, -2)), [], [16, 3, 1]]
+    candidates = torch.full((3, 1, 2048), 2**30, dtype=torch.int32, device="npu")
+    candidate_lengths = torch.tensor([[len(row)] for row in blocks], dtype=torch.int32, device="npu")
+    for row, selected in enumerate(blocks):
+        if selected:
+            candidates[row, 0, : len(selected)] = torch.tensor(selected, dtype=torch.int32, device="npu")
+    common = dict(
+        cu_seqlens_q=cu,
+        seqused_k=used,
+        cmp_residual_k=rem,
+        max_seqlen_q=2,
+        mask_mode=3,
+        cmp_ratio=ratio,
+        layout_q="TND",
+        layout_k="PA_BBND",
+    )
+    metadata = ops.quant_sparse_lightning_indexer_metadata(
+        candidate_lengths,
+        batch_size=2,
+        max_seqlen_k=max(lengths),
+        num_heads_q=32,
+        num_heads_k=1,
+        head_dim=128,
+        topk=512,
+        quant_mode=1,
+        candidate_block_size=8,
+        **common,
+    )
+    _assert_indexer_metadata(metadata, [(0, 0, 0), (1, 0, 0)])
+    indices, values = ops.quant_sparse_lightning_indexer(
+        query_data,
+        folded.squeeze(2),
+        weights.npu(),
+        query_scale.unflatten(-1, (2, 2)),
+        candidates,
+        candidate_lengths,
+        512,
+        1,
+        8,
+        metadata=metadata,
+        block_table=table.npu(),
+        return_value=True,
+        **common,
+    )
+    decoded_q = dequantize_indexer(q_ref, qs_ref)
+    decoded_k = dequantize_indexer(k_ref, ks_ref)
+    q_offset = k_offset = 0
+    for batch, (qlen, klen) in enumerate(zip(query_lengths, lengths)):
+        scores = indexer_scores(
+            decoded_q[q_offset : q_offset + qlen],
+            decoded_k[k_offset : k_offset + klen],
+            weights[q_offset : q_offset + qlen],
+        )
+        for row in range(qlen):
+            visible = min(klen, (klen * ratio + residual[batch] - qlen + row + 1) // ratio)
+            token_ids = torch.arange(klen)
+            eligible = (token_ids < visible) & torch.isin(
+                token_ids // 8, torch.tensor(blocks[q_offset + row], dtype=torch.int64)
+            )
+            assert_topk(indices[q_offset + row], values[q_offset + row], scores[row], eligible)
+        q_offset += qlen
+        k_offset += klen
+
+
 def _assert_attention_metadata(metadata, cu):
     # Verify the ABI by recovering the assigned global row intervals, rather
     # than copying the metadata kernel's partition algorithm.

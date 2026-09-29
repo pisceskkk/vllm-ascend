@@ -48,12 +48,12 @@ at::Tensor compressor_v2_meta(
     TORCH_CHECK(cmp_ratio > 0, "cmp_ratio must be positive");
     TORCH_CHECK(x.dim() == 2 || x.dim() == 3, "x must be 2D or 3D");
     if (x.dim() == 3) {
-        return at::empty_symint({x.sym_size(0), (x.sym_size(1) + cmp_ratio - 1) / cmp_ratio,
+        return at::empty_symint(c10::SymDimVector{x.sym_size(0), (x.sym_size(1) + cmp_ratio - 1) / cmp_ratio,
                                wkv.sym_size(0)}, x.options());
     }
     TORCH_CHECK(cu_seqlens.has_value(), "cu_seqlens is required for 2D x");
     auto capacity = (x.sym_size(0) / cmp_ratio + cu_seqlens->sym_numel() - 1).min(x.sym_size(0));
-    return at::empty_symint({capacity, wkv.sym_size(0)}, x.options());
+    return at::empty_symint(c10::SymDimVector{capacity, wkv.sym_size(0)}, x.options());
 }
 
 
