@@ -4088,6 +4088,7 @@ class NPUModelRunner(GPUModelRunner):
         profile_seq_lens: int | None = None,
         profile_cpp: bool = False,
         skip_gdn_state_update: bool = False,
+        uniform_dp_warmup: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
@@ -4424,6 +4425,10 @@ class NPUModelRunner(GPUModelRunner):
                 has_sinks = self._has_sinks,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
             ):
+                # Initialization/CPP warmups use the same configured shape on
+                # every DP rank and may exceed the decode communication slot.
+                # Ordinary idle dummy batches must keep the fixed decode slot.
+                get_forward_context().engram_uniform_dp_warmup = uniform_dp_warmup or profile_cpp
                 if not is_graph_capturing and self.ascend_config.enable_force_eplb \
                     and self.vllm_config.model_config.is_moe:
                     build_force_eplb_topk(self.device, self.max_num_tokens)
