@@ -8,12 +8,15 @@ creating another communicator or modifying vLLM parallel state.
 """
 
 import torch
+from vllm.config import get_current_vllm_config
 from vllm.distributed import get_dp_group, get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
 
 # Upstream #56741 normalized the V4.1 model package name.
 from vllm.models.deepseek_v41.common.engram import DEAD_ID
 from vllm.triton_utils import tl, triton
+
+from vllm_ascend.utils import get_potential_max_tokens, is_pd_decode_recompute_scheduler_enabled
 
 
 def get_engram_dp_group():
@@ -40,7 +43,24 @@ def engram_head_shard_rank() -> int:
 
 def engram_gathered_num_tokens() -> int:
     """Per-replica token slot for the node-local Engram DP group."""
-    dp_metadata = get_forward_context().dp_metadata
+    context = get_forward_context()
+    if (
+        not getattr(context, "in_profile_run", False)
+        and not getattr(context, "engram_uniform_dp_warmup", False)
+        and is_pd_decode_recompute_scheduler_enabled()
+    ):
+        # Recompute decode can skip the DP metadata all-reduce. Its token
+        # vector then contains only local counts, including on idle ranks or
+        # ranks using different graph buckets. Size both Engram exchanges
+        # from the shared configuration, never from that local vector.
+        config = get_current_vllm_config()
+        scheduler = config.scheduler_config
+        query_len = 1 + config.speculative_config.num_speculative_tokens if config.speculative_config else 1
+        return max(
+            get_potential_max_tokens(),
+            min(scheduler.max_num_batched_tokens, scheduler.max_num_seqs * query_len),
+        )
+    dp_metadata = context.dp_metadata
     if dp_metadata is None:
         raise RuntimeError("a DP-shared engram table needs DP token metadata")
     group = get_engram_dp_group()
@@ -53,8 +73,8 @@ def engram_gathered_num_tokens() -> int:
 def gather_engram_hashes(hash_ids: torch.Tensor, *, dp_shared_memory: bool = False) -> torch.Tensor:
     """Collect the n-gram ids of every DP replica sharing one table.
 
-    Replicas are padded to a common token slot, so the gathered shape is
-    static under CUDA graph capture (where DP already pads alike).
+    Replicas are padded to a common token slot, including when recompute
+    decode skips DP metadata synchronization and local graph sizes differ.
     """
     dp_group = get_engram_dp_group()
     if dp_group is None or dp_shared_memory:
