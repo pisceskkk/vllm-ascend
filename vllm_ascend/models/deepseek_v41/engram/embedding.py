@@ -40,6 +40,7 @@ from .npu import (
     quantize_engram_rows,
 )
 from .parallel import (
+    EngramAuxGroups,
     _gather_engram_rows,
     engram_head_shard_rank,
     gather_engram_hashes,
@@ -288,14 +289,16 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
                     self.weight_scale_inv.data[offset:target_end].copy_(scales)
         logger.info("Engram rows [%d, %d) loaded from %s", start, end, index[key])
 
-    def embed_gathered(self, gathered: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    def embed_gathered(
+        self, gathered: torch.Tensor, num_tokens: int, *, aux_groups: EngramAuxGroups | None = None
+    ) -> torch.Tensor:
         """Embed ids already gathered across the EDP group.
 
         ``gathered`` is ``[slot * EDP, n_hash_cols]`` rank-major; each replica
         keeps its own ``num_tokens`` window. Returns ``[num_tokens, n_hash_cols,
         dim]`` bf16 with the heads back in checkpoint order.
         """
-        return self.finish_local_rows(self.embed_local_rows(gathered), num_tokens)
+        return self.finish_local_rows(self.embed_local_rows(gathered), num_tokens, aux_groups=aux_groups)
 
     def embed_local_rows(self, gathered: torch.Tensor) -> torch.Tensor:
         """Look up this rank's heads without submitting a TP collective."""
@@ -310,14 +313,18 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
         self.lookup(gathered, out)
         return out
 
-    def finish_local_rows(self, out: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    def finish_local_rows(
+        self, out: torch.Tensor, num_tokens: int, *, aux_groups: EngramAuxGroups | None = None
+    ) -> torch.Tensor:
         """Restore DP/TP head order on the caller's stream."""
         if self.dp_size > 1:
-            out = _gather_engram_rows(out, num_tokens)
+            out = _gather_engram_rows(out, num_tokens, aux_groups=aux_groups)
         else:
             out = out[:num_tokens]
         if self.tp_size > 1:
-            out = tensor_model_parallel_all_gather(out, dim=1)
+            out = (
+                tensor_model_parallel_all_gather(out, dim=1) if aux_groups is None else aux_groups.gather_tp_heads(out)
+            )
         return out[:, : self.n_hash_cols]
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:

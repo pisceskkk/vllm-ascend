@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import torch
 
 from vllm_ascend.models.deepseek_v41.engram.graph_inputs import EngramGraphInputs, wait_engram_event
+from vllm_ascend.models.deepseek_v41.model import DeepseekV41Model
 from vllm_ascend.models.deepseek_v41.vl_model import AscendDeepseekV41ForCausalLM
 
 
@@ -43,6 +44,19 @@ def test_graph_frontiers_stay_bound_to_each_descriptor(monkeypatch):
     full = EngramGraphInputs(tables, 192, "cpu", full_rows=True).bindings("full")
     assert "engram_local_rows" not in full
     assert full["engram_lookups"][1].shape == (192, 96)
+
+    model = object.__new__(DeepseekV41Model)
+    torch.nn.Module.__init__(model)
+    model.has_engram, model.engram_dp_shared_memory = True, False
+    model._engram_aux_groups = object()
+    model._engram_local_graph_inputs, model._engram_max_tokens = None, 192
+    model.config = SimpleNamespace(engram_layer_ids=(1, 14))
+    model.engram_rotation = torch.eye(32)
+    model.layers = [SimpleNamespace(engram=SimpleNamespace(embed_tokens=tables.get(layer))) for layer in range(15)]
+    bindings = model.prepare_engram_overlap_graph_inputs(96, "aux96", prime=True)
+    assert model.engram_multistream_supported and model.engram_graph_multistream_supported
+    assert "engram_local_rows" not in bindings
+    assert bindings["engram_lookups"][1].shape == (192, 96)
 
 
 def test_multimodal_wrapper_exposes_graph_producer_contract():

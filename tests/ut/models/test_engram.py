@@ -13,9 +13,9 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from vllm_ascend.models.deepseek_v41 import model as model_mod
 from vllm_ascend.models.deepseek_v41.engram import embedding as embedding_mod
 from vllm_ascend.models.deepseek_v41.engram import npu
-from vllm_ascend.models.deepseek_v41 import model as model_mod
 from vllm_ascend.patch.platform.patch_engram_config import AscendEngramConfig
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -114,9 +114,7 @@ def test_loader_applies_mxfp8_checkpoint_scales(tmp_path):
     table.weight_scale_inv = torch.nn.Parameter(torch.empty((19, 2), dtype=torch.float32), requires_grad=False)
     table.load_checkpoint(tmp_path, key, chunk_rows=7)
     decoded = npu.dequantize_engram_rows(table.weight, table.weight_scale_inv)
-    expected = (
-        checkpoint_weight.float().unflatten(-1, (-1, 32)) * checkpoint_scale.float().unsqueeze(-1)
-    ).flatten(-2)
+    expected = (checkpoint_weight.float().unflatten(-1, (-1, 32)) * checkpoint_scale.float().unsqueeze(-1)).flatten(-2)
     torch.testing.assert_close(decoded.float(), expected, rtol=0, atol=0.02)
 
 
@@ -276,7 +274,8 @@ def test_engram_local_lookup_records_each_layer_before_next_lookup(monkeypatch):
     assert names.index(first) < names.index("lookup14") < names.index(second)
 
 
-def test_engram_consumer_waits_at_each_layer(monkeypatch):
+@pytest.mark.parametrize("full_rows", [False, True])
+def test_engram_consumer_waits_at_each_layer(monkeypatch, full_rows):
     trace = []
 
     class Stream:
@@ -323,19 +322,27 @@ def test_engram_consumer_waits_at_each_layer(monkeypatch):
     model.engram_rotation = torch.eye(32)
     monkeypatch.setattr(torch.npu, "current_stream", Stream)
     local = {layer: torch.ones((2, 1, 4)) for layer in (1, 14)}
+    row_inputs = (
+        {"engram_lookups": {layer: rows.flatten(1) for layer, rows in local.items()}}
+        if full_rows
+        else {"engram_local_rows": local}
+    )
     output = model.forward(
         torch.tensor([3, 4]),
         torch.tensor([0, 1]),
         None,
         engram_mask=torch.tensor([True, True]),
-        engram_local_rows=local,
+        **row_inputs,
         engram_mask_ready_event="mask",
         engram_ready_events={1: "ready1", 14: "ready14"},
     )
     assert output.shape == (2, 4)
     assert trace.index(("wait", "mask")) < trace.index(("layer", 0))
     assert trace.index(("layer", 0)) < trace.index(("wait", "ready1"))
-    assert trace.index(("wait", "ready1")) < trace.index(("tp_gather", 1))
+    if full_rows:
+        assert not any(item[0] == "tp_gather" for item in trace)
+    else:
+        assert trace.index(("wait", "ready1")) < trace.index(("tp_gather", 1))
     assert trace.index(("gate", 1)) < trace.index(("layer", 1))
     assert trace.index(("layer", 13)) < trace.index(("wait", "ready14"))
     assert trace.index(("wait", "ready14")) < trace.index(("tp_gather", 14))

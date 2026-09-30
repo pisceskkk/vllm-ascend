@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Engram DP routing overlaps a graph on a separate EP communicator."""
+"""Engram auxiliary DP/TP exchanges with captured main-stream collectives."""
 
 import socket
 from types import SimpleNamespace
@@ -9,6 +9,7 @@ from unittest.mock import patch
 import torch
 import torch.multiprocessing as mp
 import torch_npu  # noqa: F401
+from vllm.config import CUDAGraphMode
 from vllm.distributed import parallel_state
 from vllm.forward_context import override_forward_context
 
@@ -31,23 +32,33 @@ from vllm_ascend.models.deepseek_v41.model import DeepseekV41Model
 
 
 @torch.inference_mode()
-def _worker(rank, port):
+def _worker(rank, port, topology):
     torch.npu.set_device(rank)
+    world_size = 4 if topology == "dp_tp" else 2
     parallel_state.init_distributed_environment(
-        world_size=2,
+        world_size=world_size,
         rank=rank,
         local_rank=rank,
         distributed_init_method=f"tcp://127.0.0.1:{port}",
         backend="hccl",
     )
+    groups = None
     try:
+        dp_enabled, tp_enabled = topology != "tp", topology != "dp"
+        dp_ranks = [[0, 2], [1, 3]] if topology == "dp_tp" else ([[0, 1]] if dp_enabled else [[0], [1]])
+        tp_ranks = [[0, 1], [2, 3]] if topology == "dp_tp" else ([[0, 1]] if tp_enabled else [[0], [1]])
         parallel_state._DP = parallel_state.init_model_parallel_group(
-            [[0, 1]], rank, "hccl", group_name="engram_dp_overlap"
+            dp_ranks, rank, "hccl", group_name="engram_dp_overlap"
         )
         parallel_state._TP = parallel_state.init_model_parallel_group(
-            [[0], [1]], rank, "hccl", group_name="engram_tp_overlap"
+            tp_ranks, rank, "hccl", group_name="engram_tp_overlap"
         )
-        ep = parallel_state.init_model_parallel_group([[0, 1]], rank, "hccl", group_name="engram_ep_overlap")
+        dp_rank = parallel_state.get_dp_group().rank_in_group
+        tp = parallel_state.get_tp_group()
+        ep = parallel_state.init_model_parallel_group(
+            [list(range(world_size))], rank, "hccl", group_name="engram_ep_overlap"
+        )
+        groups = parallel.EngramAuxGroups()
         rows = sum(_HEAD_SIZES)
         codes = ((torch.arange(rows * _DIM).view(rows, _DIM) * 13) % 251 - 125).to(torch.int8)
         scales = torch.pow(2.0, torch.arange(rows * (_DIM // 32)).view(rows, _DIM // 32) % 5 - 3).float()
@@ -76,23 +87,29 @@ def _worker(rank, port):
         model = object.__new__(DeepseekV41Model)
         torch.nn.Module.__init__(model)
         model.has_engram, model.engram_dp_shared_memory = True, False
+        model._engram_aux_groups = groups
         model.engram_hash = HashState()
         model.config = SimpleNamespace(engram_layer_ids=(1, 14), image_token_id=999)
         model.layers = [SimpleNamespace(engram=SimpleNamespace(embed_tokens=tables.get(layer))) for layer in range(15)]
         model._engram_max_tokens, model._engram_local_graph_inputs = _CAPACITY, None
         model.engram_rotation = torch.eye(32, device="npu")
         main, aux = torch.npu.current_stream(), torch.npu.Stream()
-        bucket = (6, 48)[rank]
+        bucket = (6, 48)[dp_rank] if dp_enabled else 48
         with patch.object(parallel, "engram_gathered_num_tokens", return_value=_CAPACITY):
             binding = model.prepare_engram_overlap_graph_inputs(bucket, bucket, prime=True)
             ep_input = torch.full((8,), rank + 1.0, device="npu")
             # Initialize the collective before capturing its fixed addresses.
             ep.all_reduce(ep_input)
             ep_input.fill_(rank + 1.0)
+            tp_input = torch.full((8,), rank + 1.0, device="npu")
+            if tp_enabled:
+                tp.all_reduce(tp_input)
+                tp_input.fill_(rank + 1.0)
             graph = torch.npu.NPUGraph()
             with torch.npu.graph(graph):
                 wait_engram_event(binding["engram_mask_ready_event"], True)
                 reduced = ep.all_reduce(ep_input)
+                tp_reduced = tp.all_reduce(tp_input) if tp_enabled else tp_input
                 outputs = {}
                 for layer in (1, 14):
                     wait_engram_event(binding["engram_ready_events"][layer], True)
@@ -100,16 +117,18 @@ def _worker(rank, port):
                         binding["engram_mask"][:bucket, None], binding["engram_lookups"][layer][:bucket], 0
                     )
             for phase, counts in enumerate(((2, 31), (5, 3), (0, 36), (1, 0)) * 3):
-                count = counts[rank]
-                ids_cpu = torch.stack([_ids(count, rank, phase + layer) for layer in range(2)], dim=1)
+                count = counts[dp_rank] if dp_enabled else counts[0]
+                token_rank = dp_rank if dp_enabled else 0
+                ids_cpu = torch.stack([_ids(count, token_rank, phase + layer) for layer in range(2)], dim=1)
                 model.engram_hash.ids = ids_cpu.npu()
                 tokens = torch.ones(count, dtype=torch.int32, device="npu")
                 positions = torch.arange(count, device="npu")
                 query = torch.tensor([0, count] if count else [0], dtype=torch.int32, device="npu")
                 block = torch.zeros((1 if count else 0, 1), dtype=torch.int32, device="npu")
                 ep_input.fill_(rank + 1.0)
+                tp_input.fill_(rank + 1.0)
                 aux.wait_stream(main)
-                with override_forward_context(_context(bucket)), torch.npu.stream(aux):
+                with override_forward_context(_context(bucket, mode=CUDAGraphMode.FULL)), torch.npu.stream(aux):
                     model.prepare_engram_graph_overlap_inputs(
                         tokens,
                         positions,
@@ -121,15 +140,49 @@ def _worker(rank, port):
                     )
                 graph.replay()
                 main.wait_stream(aux)
-                assert torch.equal(reduced.cpu(), torch.full((8,), 3.0))
+                assert torch.equal(reduced.cpu(), torch.full((8,), world_size * (world_size + 1) / 2))
+                if tp_enabled:
+                    assert torch.equal(
+                        tp_reduced.cpu(), torch.full((8,), float(sum(member + 1 for member in tp.ranks)))
+                    )
                 for slot, layer in enumerate((1, 14)):
                     expected = torch.zeros((bucket, len(_HEAD_SIZES), _DIM), dtype=torch.bfloat16)
                     expected[:count] = _reference(ids_cpu[:, slot], codes, scales)
                     assert torch.equal(outputs[layer].cpu(), expected.flatten(1)), (rank, phase, layer)
-        print(f"ENGRAM_DP_GRAPH_OVERLAP_12_REPLAYS_PASSED rank={rank}", flush=True)
+        # Eager uses the same producer exchanges, with ordinary per-step events.
+        for phase, counts in enumerate(((2, 31), (0, 36), (1, 0))):
+            count = counts[dp_rank] if dp_enabled else counts[0]
+            ids_cpu = torch.stack(
+                [_ids(count, dp_rank if dp_enabled else 0, phase + layer) for layer in range(2)], dim=1
+            )
+            model.engram_hash.ids = ids_cpu.npu()
+            tokens = torch.ones(count, dtype=torch.int32, device="npu")
+            query = torch.tensor([0, count] if count else [0], dtype=torch.int32, device="npu")
+            block = torch.zeros((1 if count else 0, 1), dtype=torch.int32, device="npu")
+            aux.wait_stream(main)
+            with (
+                patch.object(parallel, "engram_gathered_num_tokens", return_value=_CAPACITY),
+                override_forward_context(_context(count)),
+                torch.npu.stream(aux),
+            ):
+                result = model.prepare_engram_local_inputs(
+                    tokens,
+                    torch.arange(count, device="npu"),
+                    query_start_loc=query,
+                    block_table=block,
+                )
+            wait_engram_event(result["engram_mask_ready_event"], False)
+            for slot, layer in enumerate((1, 14)):
+                wait_engram_event(result["engram_ready_events"][layer], False)
+                expected = _reference(ids_cpu[:, slot], codes, scales).flatten(1)
+                assert torch.equal(result["engram_lookups"][layer].cpu(), expected)
+            main.wait_stream(aux)
+        print(f"ENGRAM_AUX_{topology.upper()}_GRAPH_12_EAGER_3_PASSED rank={rank}", flush=True)
         ep.destroy()
     finally:
         torch.npu.synchronize()
+        if groups is not None:
+            groups.close()
         parallel_state.destroy_model_parallel()
         parallel_state.destroy_distributed_environment()
 
@@ -138,8 +191,16 @@ def test_engram_dp_graph_overlap_with_unequal_and_empty_rank_batches():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port,), nprocs=2, join=True)
+    mp.spawn(_worker, args=(port, "dp"), nprocs=2, join=True)
+
+
+def test_engram_tp_graph_overlap_with_main_tp_collectives():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_worker, args=(port, "tp"), nprocs=2, join=True)
 
 
 if __name__ == "__main__":
     test_engram_dp_graph_overlap_with_unequal_and_empty_rank_batches()
+    test_engram_tp_graph_overlap_with_main_tp_collectives()

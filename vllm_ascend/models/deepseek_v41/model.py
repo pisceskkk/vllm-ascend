@@ -89,7 +89,7 @@ from .engram.embedding import (
 )
 from .engram.graph_inputs import EngramGraphInputs, wait_engram_event
 from .engram.layer import AscendEngram
-from .engram.parallel import gather_engram_hashes, get_engram_dp_size
+from .engram.parallel import EngramAuxGroups, gather_engram_hashes, get_engram_dp_size
 from .indexer import DeepseekV41Indexer
 
 
@@ -1064,6 +1064,13 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             # Ascend SWA slot metadata (see engram/hash_state.py).
             swa_cache_layer = self.layers[config.engram_layer_ids[0]].self_attn.dsa_attn.swa_cache_layer
             self.engram_hash = create_engram_hash_state(vllm_config, config, swa_cache_layer)
+        # Group creation is collective across world ranks. Do this once during
+        # model initialization, never lazily in rank-local routing or capture.
+        self._engram_aux_groups = (
+            EngramAuxGroups(dp_shared_memory=self.engram_dp_shared_memory)
+            if self.has_engram and get_ascend_config().multistream_engram_overlap
+            else None
+        )
 
     def _make_empty_intermediate_tensors(self, batch_size, dtype, device):
         return IntermediateTensors(
@@ -1093,6 +1100,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         full_output_buffers=None,
         mask_output_buffer=None,
         padded_tokens=None,
+        aux_groups=None,
     ):
         """Hash on device with upstream NgramHashState, then look up head shards.
 
@@ -1171,7 +1179,9 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         if participates:
             assert hashes is not None
             # One DP gather feeds every layer sharing the split table.
-            gathered = gather_engram_hashes(hashes, dp_shared_memory=self.engram_dp_shared_memory)
+            gathered = gather_engram_hashes(
+                hashes, dp_shared_memory=self.engram_dp_shared_memory, aux_groups=aux_groups
+            )
             for slot, (layer_id, table) in enumerate(zip(config.engram_layer_ids, tables)):
                 if local_only:
                     if local_output_buffers is None:
@@ -1183,7 +1193,10 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                         buffer[rows:padded_tokens].zero_()
                         lookups[layer_id] = buffer
                 else:
-                    lookups[layer_id] = table.embed_gathered(gathered[:, slot], hashes.shape[0]).flatten(1)
+                    collective_args = {} if aux_groups is None else {"aux_groups": aux_groups}
+                    lookups[layer_id] = table.embed_gathered(
+                        gathered[:, slot], hashes.shape[0], **collective_args
+                    ).flatten(1)
                     if full_output_buffers is not None:
                         values = lookups[layer_id]
                         buffer = full_output_buffers[layer_id]
@@ -1211,16 +1224,17 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
 
     @property
     def engram_multistream_supported(self) -> bool:
-        # DP-sharded tables need per-step DP collectives. Keep all collectives
-        # on the main stream and overlap only a local or shared table lookup.
-        return self.has_engram and (self.engram_dp_shared_memory or get_engram_dp_size() == 1)
+        return self.has_engram and (
+            getattr(self, "_engram_aux_groups", None) is not None
+            or self.engram_dp_shared_memory
+            or get_engram_dp_size() == 1
+        )
 
     @property
     def engram_graph_multistream_supported(self) -> bool:
-        # TP1: Engram's DP device communicator is separate from MoE's EP
-        # communicator; all Engram collectives retain their producer order.
-        # For sharded DP+TP, TP gathers would share the attention communicator,
-        # so keep that combination synchronous until its order is validated.
+        # Sibling groups isolate both DP and TP producer collectives from
+        # the main graph. Retain the local/TP1 contract for callers without
+        # auxiliary groups (including the existing graph fixtures).
         return self.has_engram and (self.engram_multistream_supported or get_tensor_model_parallel_world_size() == 1)
 
     def prepare_engram_local_inputs(
@@ -1235,31 +1249,38 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         graph_inputs=None,
         padded_tokens=None,
     ):
-        """Submit hash and local lookups; return per-layer completion events."""
+        """Submit lookups and auxiliary exchanges; publish completed tables.
+
+        Without sibling groups, retain the local-row consumer contract.
+        """
         if not self.engram_multistream_supported:
-            raise RuntimeError("Engram local lookup overlap requires an unsharded DP table")
+            raise RuntimeError("Engram DP lookup overlap requires initialized auxiliary groups")
+        aux_groups = getattr(self, "_engram_aux_groups", None)
+        local_only = aux_groups is None
         mask_ready = torch.npu.Event() if graph_inputs is None else graph_inputs["engram_mask_ready_event"]
         ready = (
             {layer: torch.npu.Event() for layer in self.config.engram_layer_ids}
             if graph_inputs is None
             else graph_inputs["engram_ready_events"]
         )
-        local_rows, mask = self.prepare_engram(
+        rows, mask = self.prepare_engram(
             input_ids,
             positions,
             lookback_token_ids,
             query_start_loc,
             slot_mapping,
             block_table,
-            local_only=True,
+            local_only=local_only,
             mask_ready_event=mask_ready,
             ready_events=ready,
-            local_output_buffers=None if graph_inputs is None else graph_inputs["engram_local_rows"],
+            local_output_buffers=None if graph_inputs is None else graph_inputs.get("engram_local_rows"),
+            full_output_buffers=None if graph_inputs is None else graph_inputs.get("engram_lookups"),
             mask_output_buffer=None if graph_inputs is None else graph_inputs["engram_mask"],
             padded_tokens=padded_tokens,
+            aux_groups=aux_groups,
         )
         return {
-            "engram_local_rows": local_rows,
+            "engram_local_rows" if local_only else "engram_lookups": rows,
             "engram_mask": mask,
             "engram_mask_ready_event": mask_ready,
             "engram_ready_events": ready,
@@ -1269,7 +1290,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
     def prepare_engram_overlap_graph_inputs(self, padded_tokens, batch_descriptor, *, prime=False):
         """Bind graph waits to fixed rows; producer work stays outside."""
         if not self.engram_graph_multistream_supported:
-            raise RuntimeError("Engram graph overlap requires a local table or TP1")
+            raise RuntimeError("Engram graph overlap requires initialized auxiliary groups for sharded DP+TP")
         if padded_tokens > self._engram_max_tokens:
             raise ValueError("Engram graph input exceeds the allocated token capacity")
         if self._engram_local_graph_inputs is None:
@@ -1278,7 +1299,8 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                 tables,
                 self._engram_max_tokens,
                 self.engram_rotation.device,
-                full_rows=not self.engram_multistream_supported,
+                full_rows=getattr(self, "_engram_aux_groups", None) is not None
+                or not self.engram_multistream_supported,
             )
         return self._engram_local_graph_inputs.bindings(batch_descriptor, prime=prime)
 
@@ -1304,6 +1326,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             mask_ready_event=graph_inputs["engram_mask_ready_event"],
             ready_events=graph_inputs["engram_ready_events"],
             padded_tokens=padded_tokens,
+            aux_groups=getattr(self, "_engram_aux_groups", None),
         )
         return graph_inputs
 

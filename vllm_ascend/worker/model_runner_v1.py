@@ -3347,10 +3347,9 @@ class NPUModelRunner(GPUModelRunner):
                 else:
                     model_inputs.update(self.model.prepare_engram_graph_inputs(num_tokens_padded))
             elif overlap_enabled:
-                # Hash/row fetch do not read hidden states. Local-table TP
-                # gathers stay at the consumer. For sharded DP with TP1, the
-                # Engram DP exchanges run here on their own communicator;
-                # graph MoE collectives use the separate EP communicator.
+                # Hash/row fetch do not read hidden states. Engram's sibling
+                # DP/TP groups submit all exchanges here; the main stream
+                # waits for completed rows only at each table's consumer.
                 main_stream = torch.npu.current_stream()
                 # Allocate fixed buffers before switching streams. External
                 # events bind the graph's wait/reset tasks to this producer;
@@ -3390,6 +3389,15 @@ class NPUModelRunner(GPUModelRunner):
                                 padded_tokens=num_tokens_padded,
                             )
                         )
+                    # Eager results are allocated on the producer stream and
+                    # consumed on main. Retain them until those reads finish,
+                    # even if an exception drops the Python input dictionary.
+                    for key in ("engram_lookups", "engram_local_rows"):
+                        for tensor in model_inputs.get(key, {}).values():
+                            tensor.record_stream(main_stream)
+                    mask = model_inputs.get("engram_mask")
+                    if mask is not None:
+                        mask.record_stream(main_stream)
                 except Exception:
                     main_stream.wait_stream(engram_overlap_stream)
                     raise
