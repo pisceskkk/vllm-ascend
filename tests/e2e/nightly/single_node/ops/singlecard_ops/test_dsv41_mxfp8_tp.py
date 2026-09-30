@@ -7,6 +7,7 @@ import torch
 import torch_npu
 
 from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8DSDynamicLinearMethod
+from vllm_ascend.utils import load_custom_op_library
 
 
 @pytest.mark.parametrize("width", [288, 320])
@@ -43,3 +44,40 @@ def test_deepseek_mxfp8_tp_scale_pairs(width, graph_mode):
         x.mul_(1.25)
         graph.replay()
         torch.testing.assert_close(replayed.cpu().float(), reference(), rtol=0.02, atol=0.04)
+
+
+@pytest.mark.parametrize("width", [576, 640])
+@pytest.mark.parametrize("graph_mode", [False, True])
+@torch.inference_mode()
+def test_swiglu_mx_odd_tp_groups(width, graph_mode):
+    load_custom_op_library()
+    torch.manual_seed(414)
+    x = (torch.randn(3, width, device="npu") * 5).to(torch.bfloat16)
+
+    def invoke():
+        return torch.ops._C_ascend.npu_swiglu_group_quant(
+            x, topk_weight=None, group_index=None, dst_type=torch.float8_e4m3fn, quant_mode=2, clamp_value=7.0
+        )
+
+    def check(quantized, scale):
+        gate, up = x.cpu().float().chunk(2, dim=-1)
+        gate, up = gate.clamp(max=7), up.clamp(min=-7, max=7)
+        activation = (gate * torch.sigmoid(gate) * up).to(torch.bfloat16).npu()
+        ref_quantized, ref_scale = torch_npu.npu_dynamic_mx_quant(activation, dst_type=torch.float8_e4m3fn, scale_alg=0)
+        ref_exponent = ref_scale.cpu().view(torch.uint8).reshape(3, -1).float()
+        ref_factors = torch.exp2(ref_exponent - 127).repeat_interleave(32, dim=-1)[:, : width // 2]
+        expected = ref_quantized.cpu().float() * ref_factors
+        exponent = scale.cpu().view(torch.uint8).reshape(3, -1).float()
+        factors = torch.exp2(exponent - 127).repeat_interleave(32, dim=-1)[:, : width // 2]
+        decoded = quantized.cpu().float() * factors
+        torch.testing.assert_close(decoded, expected, rtol=0.07, atol=0.03)
+
+    quantized, scale, _ = invoke()
+    check(quantized, scale)
+    if graph_mode:
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph, capture_error_mode="thread_local", auto_dispatch_capture=True):
+            quantized, scale, _ = invoke()
+        x.mul_(1.25)
+        graph.replay()
+        check(quantized, scale)

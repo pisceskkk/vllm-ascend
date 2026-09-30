@@ -1780,8 +1780,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> construct_swiglu_group_quant_outp
         TORCH_CHECK(x_last_dim % 256 == 0,
                     "In group quant, the last dim of x should be divisible by 256, actual ", x_last_dim, ".");
     } else {
-        TORCH_CHECK(x_last_dim % 128 == 0,
-                    "In mx quant, the last dim of x should be divisible by 128, actual ", x_last_dim, ".");
+        TORCH_CHECK(x_last_dim % (SWIGLU_FACTOR * PER_MX_FP16) == 0,
+                    "In mx quant, the last dim of x should be divisible by 64, actual ", x_last_dim, ".");
     }
 
     y_size.back() = y_size.back() / SWIGLU_FACTOR;
@@ -1823,14 +1823,28 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_swiglu_group_quant_npu(
     double clamp_value = 0.0)
 {
     int64_t dst_type_code = get_type_code(dst_type);
-    auto output_tensors = construct_swiglu_group_quant_output_tensor(x, dst_type_code, quant_mode, ue8m0_scale);
+    // The kernel writes MX scale pairs with an even group stride. Pad both
+    // SwiGLU halves so an odd TP group count preserves the per-row layout.
+    at::Tensor kernel_x = x;
+    int64_t original_width = x.size(-1) / 2;
+    bool pad_mx_tail = quant_mode == 2 && x.size(-1) % 128 == 64;
+    if (pad_mx_tail) {
+        kernel_x = at::cat({at::constant_pad_nd(x.narrow(-1, 0, original_width), {0, 32}, 0),
+                            at::constant_pad_nd(x.narrow(-1, original_width, original_width), {0, 32}, 0)}, -1);
+    }
+    auto output_tensors = construct_swiglu_group_quant_output_tensor(kernel_x, dst_type_code, quant_mode, ue8m0_scale);
     at::Tensor y = std::get<0>(output_tensors);
     at::Tensor scale = std::get<1>(output_tensors);
     at::Tensor y_origin = std::get<2>(output_tensors);
 
-    EXEC_NPU_CMD(aclnnSwigluGroupQuant, x, topk_weight, group_index, dst_type_code, quant_mode, group_size,
+    EXEC_NPU_CMD(aclnnSwigluGroupQuant, kernel_x, topk_weight, group_index, dst_type_code, quant_mode, group_size,
                  round_scale, ue8m0_scale, output_origin, group_list_type, clamp_value, y, scale, y_origin);
 
+    if (pad_mx_tail) {
+        y = y.narrow(-1, 0, original_width).contiguous();
+        y_origin = output_origin ? y_origin.narrow(-1, 0, original_width).contiguous()
+                                 : at::empty(y.sizes(), x.options());
+    }
     return std::tuple<at::Tensor, at::Tensor, at::Tensor>(y, scale, y_origin);
 }
 
