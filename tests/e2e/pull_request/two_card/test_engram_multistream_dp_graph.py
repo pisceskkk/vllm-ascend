@@ -27,7 +27,6 @@ from tests.e2e.pull_request.two_card.test_engram_fixed_slots import (
 )
 from vllm_ascend.models.deepseek_v41.engram import parallel
 from vllm_ascend.models.deepseek_v41.engram.embedding import AscendParallelEngramEmbedding
-from vllm_ascend.models.deepseek_v41.engram.graph_inputs import wait_engram_event
 from vllm_ascend.models.deepseek_v41.model import DeepseekV41Model
 
 
@@ -91,7 +90,8 @@ def _worker(rank, port, topology):
         model.engram_hash = HashState()
         model.config = SimpleNamespace(engram_layer_ids=(1, 14), image_token_id=999)
         model.layers = [SimpleNamespace(engram=SimpleNamespace(embed_tokens=tables.get(layer))) for layer in range(15)]
-        model._engram_max_tokens, model._engram_graph_inputs = _CAPACITY, None
+        model._engram_max_tokens, model._engram_input_buffers = _CAPACITY, None
+        model._engram_graph_events = {}
         model.engram_rotation = torch.eye(32, device="npu")
         main, aux = torch.npu.current_stream(), torch.npu.Stream()
         bucket = (6, 48)[dp_rank] if dp_enabled else 48
@@ -107,12 +107,12 @@ def _worker(rank, port, topology):
                 tp_input.fill_(rank + 1.0)
             graph = torch.npu.NPUGraph()
             with torch.npu.graph(graph):
-                wait_engram_event(binding["engram_mask_ready_event"], True)
+                model._wait_engram_event(binding["engram_mask_ready_event"], True)
                 reduced = ep.all_reduce(ep_input)
                 tp_reduced = tp.all_reduce(tp_input) if tp_enabled else tp_input
                 outputs = {}
                 for layer in (1, 14):
-                    wait_engram_event(binding["engram_ready_events"][layer], True)
+                    model._wait_engram_event(binding["engram_ready_events"][layer], True)
                     outputs[layer] = torch.where(
                         binding["engram_mask"][:bucket, None], binding["engram_lookups"][layer][:bucket], 0
                     )
@@ -171,9 +171,9 @@ def _worker(rank, port, topology):
                     query_start_loc=query,
                     block_table=block,
                 )
-            wait_engram_event(result["engram_mask_ready_event"], False)
+            model._wait_engram_event(result["engram_mask_ready_event"], False)
             for slot, layer in enumerate((1, 14)):
-                wait_engram_event(result["engram_ready_events"][layer], False)
+                model._wait_engram_event(result["engram_ready_events"][layer], False)
                 expected = _reference(ids_cpu[:, slot], codes, scales).flatten(1)
                 assert torch.equal(result["engram_lookups"][layer].cpu(), expected)
             main.wait_stream(aux)

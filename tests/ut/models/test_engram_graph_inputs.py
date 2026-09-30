@@ -7,7 +7,6 @@ from unittest.mock import Mock
 import torch
 from vllm.config import CUDAGraphMode
 
-from vllm_ascend.models.deepseek_v41.engram.graph_inputs import EngramGraphInputs, wait_engram_event
 from vllm_ascend.models.deepseek_v41.model import DeepseekV41Model
 from vllm_ascend.models.deepseek_v41.vl_model import AscendDeepseekV41ForCausalLM
 from vllm_ascend.worker import model_runner_v1 as runner_mod
@@ -29,10 +28,22 @@ def test_graph_frontiers_stay_bound_to_each_descriptor(monkeypatch):
     monkeypatch.setattr(torch.npu, "ExternalEvent", Event)
     monkeypatch.setattr(torch.npu, "current_stream", lambda: "main")
     tables = {layer: SimpleNamespace(n_hash_cols=24, dim=4) for layer in (1, 14)}
-    inputs = EngramGraphInputs(tables, 192, "cpu")
-    first = inputs.bindings("batch96", prime=True)
-    second = inputs.bindings("batch192", prime=True)
-    replay = inputs.bindings("batch96")
+    model = object.__new__(DeepseekV41Model)
+    torch.nn.Module.__init__(model)
+    model._engram_input_buffers, model._engram_max_tokens = None, 192
+    model._engram_graph_events = {}
+    model.config = SimpleNamespace(engram_layer_ids=(1, 14))
+    model.engram_rotation = torch.eye(32)
+    model.layers = [SimpleNamespace(engram=SimpleNamespace(embed_tokens=tables.get(layer))) for layer in range(15)]
+    synchronous = model.prepare_engram_graph_inputs()
+    first = model.prepare_engram_overlap_graph_inputs("batch96", prime=True)
+    second = model.prepare_engram_overlap_graph_inputs("batch192", prime=True)
+    replay = model.prepare_engram_overlap_graph_inputs("batch96")
+    buffers, mask = model._engram_input_buffers
+    assert synchronous["engram_lookups"] is buffers
+    assert first["engram_lookups"] is buffers
+    assert synchronous["engram_mask"] is first["engram_mask"] is mask
+    assert model.prepare_engram_graph_inputs()["engram_mask"] is mask
     assert len(calls) == 6
     assert replay["engram_mask_ready_event"] is first["engram_mask_ready_event"]
     assert second["engram_mask_ready_event"] is not first["engram_mask_ready_event"]
@@ -42,21 +53,13 @@ def test_graph_frontiers_stay_bound_to_each_descriptor(monkeypatch):
         assert replay["engram_ready_events"][layer] is first["engram_ready_events"][layer]
         assert second["engram_ready_events"][layer] is not first["engram_ready_events"][layer]
     event = first["engram_ready_events"][1]
-    wait_engram_event(event, True)
+    model._wait_engram_event(event, True)
     assert calls[-2:] == [(event, "wait", "main"), (event, "reset", "main")]
-
-    model = object.__new__(DeepseekV41Model)
-    torch.nn.Module.__init__(model)
-    model.has_engram, model.engram_dp_shared_memory = True, False
-    model._engram_graph_inputs, model._engram_max_tokens = None, 192
-    model.config = SimpleNamespace(engram_layer_ids=(1, 14))
-    model.engram_rotation = torch.eye(32)
-    model.layers = [SimpleNamespace(engram=SimpleNamespace(embed_tokens=tables.get(layer))) for layer in range(15)]
-    synchronous = model.prepare_engram_graph_inputs()
-    bindings = model.prepare_engram_overlap_graph_inputs("aux96", prime=True)
-    assert bindings["engram_lookups"] is synchronous["engram_lookups"]
-    assert bindings["engram_mask"] is synchronous["engram_mask"]
-    assert bindings["engram_lookups"][1].shape == (192, 96)
+    main = Mock()
+    monkeypatch.setattr(torch.npu, "current_stream", lambda: main)
+    model._wait_engram_event(event, False)
+    main.wait_event.assert_called_once_with(event)
+    assert calls[-2:] == [(event, "wait", "main"), (event, "reset", "main")]
 
 
 def test_multimodal_wrapper_exposes_graph_producer_contract():

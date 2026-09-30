@@ -87,7 +87,6 @@ from .engram.embedding import (
     AscendParallelEngramEmbedding,
     preflight_engram_checkpoint,
 )
-from .engram.graph_inputs import EngramGraphInputs, wait_engram_event
 from .engram.layer import AscendEngram
 from .engram.parallel import EngramAuxGroups, gather_engram_hashes, get_engram_dp_size
 from .indexer import DeepseekV41Indexer
@@ -1048,7 +1047,8 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                 embed.bind_checkpoint(self.engram_weight_root, f"layers.{layer_id}.engram.embed.weight")
                 self.layers[layer_id].engram.embed_tokens = embed
         self.engram_hash = None
-        self._engram_graph_inputs = None
+        self._engram_input_buffers = None
+        self._engram_graph_events = {}
         self._engram_max_tokens = max(
             vllm_config.scheduler_config.max_num_batched_tokens,
             vllm_config.compilation_config.max_cudagraph_capture_size or 0,
@@ -1250,8 +1250,37 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
 
     def prepare_engram_overlap_graph_inputs(self, batch_descriptor, *, prime=False):
         """Bind the graph's wait/reset tasks to this descriptor's producer events."""
-        self.prepare_engram_graph_inputs()
-        return self._engram_graph_inputs.bindings(batch_descriptor, prime=prime)
+        graph_inputs = self.prepare_engram_graph_inputs()
+        # Each captured graph retains its own external wait/reset events.
+        if batch_descriptor not in self._engram_graph_events:
+            self._engram_graph_events[batch_descriptor] = (
+                torch.npu.ExternalEvent(),
+                {layer: torch.npu.ExternalEvent() for layer in self.config.engram_layer_ids},
+            )
+        mask_ready, ready = self._engram_graph_events[batch_descriptor]
+        if prime:
+            # Capture warmups consume initialized buffers without running the
+            # producer. Record their events so the consumer waits can finish.
+            stream = torch.npu.current_stream()
+            mask_ready.record(stream)
+            for event in ready.values():
+                event.record(stream)
+        return {
+            **graph_inputs,
+            "engram_mask_ready_event": mask_ready,
+            "engram_ready_events": ready,
+            "engram_graph_events": True,
+        }
+
+    def _wait_engram_event(self, event, external):
+        stream = torch.npu.current_stream()
+        if external:
+            # Capture device wait/reset tasks that consume each replay's
+            # producer record, rather than a capture-time dependency.
+            event.wait(stream)
+            event.reset(stream)
+        else:
+            stream.wait_event(event)
 
     def prepare_engram_inputs(
         self,
@@ -1286,10 +1315,26 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
 
     def prepare_engram_graph_inputs(self):
         """Reuse fixed rows and mask for synchronous preparation and graph replay."""
-        if self._engram_graph_inputs is None:
-            tables = {layer: self.layers[layer].engram.embed_tokens for layer in self.config.engram_layer_ids}
-            self._engram_graph_inputs = EngramGraphInputs(tables, self._engram_max_tokens, self.engram_rotation.device)
-        return {"engram_lookups": self._engram_graph_inputs.rows, "engram_mask": self._engram_graph_inputs.mask}
+        if self._engram_input_buffers is None:
+            capacity = self._engram_max_tokens
+            device = self.engram_rotation.device
+            self._engram_input_buffers = (
+                {
+                    layer: torch.zeros(
+                        (
+                            capacity,
+                            self.layers[layer].engram.embed_tokens.n_hash_cols
+                            * self.layers[layer].engram.embed_tokens.dim,
+                        ),
+                        dtype=torch.bfloat16,
+                        device=device,
+                    )
+                    for layer in self.config.engram_layer_ids
+                },
+                torch.zeros(capacity, dtype=torch.bool, device=device),
+            )
+        buffers, mask_buffer = self._engram_input_buffers
+        return {"engram_lookups": buffers, "engram_mask": mask_buffer}
 
     def forward(
         self,
@@ -1313,7 +1358,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         self.shared_attention_state.reset()
         full_num_tokens = positions.shape[0]
         if engram_mask_ready_event is not None:
-            wait_engram_event(engram_mask_ready_event, engram_graph_events)
+            self._wait_engram_event(engram_mask_ready_event, engram_graph_events)
         # Slice capacity-sized graph buffers before SP splits the token axis.
         token_mask = token_mask[:full_num_tokens]
         lookups = {layer_idx: lookup[:full_num_tokens] for layer_idx, lookup in lookups.items()}
@@ -1344,7 +1389,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             if layer.engram is not None and token_mask.numel():
                 n = hidden_states.shape[0]
                 if engram_ready_events is not None:
-                    wait_engram_event(engram_ready_events[layer.layer_idx], engram_graph_events)
+                    self._wait_engram_event(engram_ready_events[layer.layer_idx], engram_graph_events)
                 # SP includes a copy, so it must follow the producer wait.
                 lookup = lookups[layer.layer_idx]
                 if use_sequence_parallel:

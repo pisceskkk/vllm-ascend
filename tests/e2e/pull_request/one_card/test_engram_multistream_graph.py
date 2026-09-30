@@ -13,7 +13,6 @@ import vllm_ascend.ops  # noqa: F401
 
 # isort: split
 from vllm_ascend.models.deepseek_v41.engram.embedding import AscendParallelEngramEmbedding
-from vllm_ascend.models.deepseek_v41.engram.graph_inputs import EngramGraphInputs, wait_engram_event
 from vllm_ascend.models.deepseek_v41.engram.npu import HostUvaBuffer
 from vllm_ascend.models.deepseek_v41.model import DeepseekV41Model
 
@@ -58,20 +57,22 @@ def test_engram_external_events_refresh_rows_padding_and_empty_batches():
     model.engram_hash = HashState()
     model.config = SimpleNamespace(engram_layer_ids=(1, 14), image_token_id=999)
     model.layers = [SimpleNamespace(engram=SimpleNamespace(embed_tokens=tables.get(layer))) for layer in range(15)]
-    inputs = EngramGraphInputs(tables, capacity, torch.device("npu:0"))
+    model._engram_input_buffers, model._engram_max_tokens = None, capacity
+    model._engram_graph_events = {}
+    model.engram_rotation = torch.eye(32, device="npu")
     aux = torch.npu.Stream()
     main = torch.npu.current_stream()
     graphs, outputs = {}, {}
     try:
         with patch("vllm_ascend.models.deepseek_v41.model.gather_engram_hashes", lambda ids, **kwargs: ids):
             for size in (96, 192):
-                bindings = inputs.bindings(size, prime=True)
+                bindings = model.prepare_engram_overlap_graph_inputs(size, prime=True)
                 graph = torch.npu.NPUGraph()
                 with torch.npu.graph(graph):
-                    wait_engram_event(bindings["engram_mask_ready_event"], True)
+                    model._wait_engram_event(bindings["engram_mask_ready_event"], True)
                     output = {}
                     for layer in (1, 14):
-                        wait_engram_event(bindings["engram_ready_events"][layer], True)
+                        model._wait_engram_event(bindings["engram_ready_events"][layer], True)
                         output[layer] = torch.where(
                             bindings["engram_mask"][:size, None],
                             bindings["engram_lookups"][layer][:size],
@@ -89,7 +90,7 @@ def test_engram_external_events_refresh_rows_padding_and_empty_batches():
                 ids_device = ids.npu()
                 query = torch.tensor([0, count] if count else [0], dtype=torch.int32, device="npu")
                 blocks = torch.zeros((1 if count else 0, 1), dtype=torch.int32, device="npu")
-                binding = inputs.bindings(size)
+                binding = model.prepare_engram_overlap_graph_inputs(size)
                 aux.wait_stream(main)
                 with torch.npu.stream(aux):
                     model.prepare_engram_overlap_inputs(
