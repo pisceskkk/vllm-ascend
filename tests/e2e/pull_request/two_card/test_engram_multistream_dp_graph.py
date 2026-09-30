@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Engram auxiliary DP/TP exchanges with captured main-stream collectives."""
+"""Engram auxiliary-stream exchanges through existing DP/TP groups."""
 
 import socket
 from types import SimpleNamespace
@@ -41,7 +41,6 @@ def _worker(rank, port, topology):
         distributed_init_method=f"tcp://127.0.0.1:{port}",
         backend="hccl",
     )
-    groups = None
     try:
         dp_enabled, tp_enabled = topology != "tp", topology != "dp"
         dp_ranks = [[0, 2], [1, 3]] if topology == "dp_tp" else ([[0, 1]] if dp_enabled else [[0], [1]])
@@ -57,7 +56,6 @@ def _worker(rank, port, topology):
         ep = parallel_state.init_model_parallel_group(
             [list(range(world_size))], rank, "hccl", group_name="engram_ep_overlap"
         )
-        groups = parallel.EngramAuxGroups()
         rows = sum(_HEAD_SIZES)
         codes = ((torch.arange(rows * _DIM).view(rows, _DIM) * 13) % 251 - 125).to(torch.int8)
         scales = torch.pow(2.0, torch.arange(rows * (_DIM // 32)).view(rows, _DIM // 32) % 5 - 3).float()
@@ -86,7 +84,6 @@ def _worker(rank, port, topology):
         model = object.__new__(DeepseekV41Model)
         torch.nn.Module.__init__(model)
         model.has_engram, model.engram_dp_shared_memory = True, False
-        model._engram_aux_groups = groups
         model.engram_hash = HashState()
         model.config = SimpleNamespace(engram_layer_ids=(1, 14), image_token_id=999)
         model.layers = [SimpleNamespace(engram=SimpleNamespace(embed_tokens=tables.get(layer))) for layer in range(15)]
@@ -177,12 +174,10 @@ def _worker(rank, port, topology):
                 expected = _reference(ids_cpu[:, slot], codes, scales).flatten(1)
                 assert torch.equal(result["engram_lookups"][layer].cpu(), expected)
             main.wait_stream(aux)
-        print(f"ENGRAM_AUX_{topology.upper()}_GRAPH_12_EAGER_3_PASSED rank={rank}", flush=True)
+        print(f"ENGRAM_MULTISTREAM_{topology.upper()}_GRAPH_12_EAGER_3_PASSED rank={rank}", flush=True)
         ep.destroy()
     finally:
         torch.npu.synchronize()
-        if groups is not None:
-            groups.close()
         parallel_state.destroy_model_parallel()
         parallel_state.destroy_distributed_environment()
 

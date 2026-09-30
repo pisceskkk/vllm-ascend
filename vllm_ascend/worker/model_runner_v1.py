@@ -3338,9 +3338,9 @@ class NPUModelRunner(GPUModelRunner):
                 else:
                     model_inputs.update(self.model.prepare_engram_graph_inputs())
             elif overlap_enabled:
-                # Hash/row fetch do not read hidden states. Engram's sibling
-                # DP/TP groups submit all exchanges here; the main stream
-                # waits for completed rows only at each table's consumer.
+                # Hash/row fetch do not read hidden states. Submit Engram
+                # exchanges through the existing DP/TP groups on this stream.
+                # Main waits for completed rows at each table's consumer.
                 main_stream = torch.npu.current_stream()
                 # Allocate fixed buffers before switching streams. External
                 # events bind the graph's wait/reset tasks to this producer;

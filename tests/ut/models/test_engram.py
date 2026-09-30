@@ -193,6 +193,7 @@ def test_engram_rows_finish_tp_gather_on_calling_stream(monkeypatch):
     table.dp_size = 1
     table.tp_size = 2
     table.n_hash_cols = 4
+    table.dim = 4
     local = torch.arange(8, dtype=torch.bfloat16).view(1, 2, 4)
     calls = []
 
@@ -207,6 +208,8 @@ def test_engram_rows_finish_tp_gather_on_calling_stream(monkeypatch):
     assert torch.equal(calls[0][0], local)
     assert torch.equal(result[:, :2], local)
     assert torch.equal(result[:, 2:], local + 100)
+    assert table.finish_local_rows(local[:0], 0).shape == (0, 4, 4)
+    assert len(calls) == 1
 
 
 def test_engram_lookup_records_each_layer_before_next_lookup(monkeypatch):
@@ -233,8 +236,7 @@ def test_engram_lookup_records_each_layer_before_next_lookup(monkeypatch):
             return torch.arange(8, dtype=torch.int32).view(2, 2, 2)
 
     def table(layer):
-        def full(ids, count, *, aux_groups):
-            assert aux_groups is model._engram_aux_groups
+        def full(ids, count):
             trace.append((f"lookup{layer}", "run", None))
             return ids.unsqueeze(-1).expand(-1, -1, 4).bfloat16()
 
@@ -244,7 +246,6 @@ def test_engram_lookup_records_each_layer_before_next_lookup(monkeypatch):
     torch.nn.Module.__init__(model)
     model.has_engram = True
     model.engram_dp_shared_memory = True
-    model._engram_aux_groups = object()
     model.engram_hash = HashState()
     model.config = SimpleNamespace(engram_layer_ids=(1, 14), image_token_id=999)
     layers = [SimpleNamespace(engram=None) for _ in range(15)]

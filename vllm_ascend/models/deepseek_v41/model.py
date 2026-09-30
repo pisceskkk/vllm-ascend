@@ -88,7 +88,7 @@ from .engram.embedding import (
     preflight_engram_checkpoint,
 )
 from .engram.layer import AscendEngram
-from .engram.parallel import EngramAuxGroups, gather_engram_hashes, get_engram_dp_size
+from .engram.parallel import gather_engram_hashes, get_engram_dp_size
 from .indexer import DeepseekV41Indexer
 
 
@@ -1063,13 +1063,6 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             # Ascend SWA slot metadata (see engram/hash_state.py).
             swa_cache_layer = self.layers[config.engram_layer_ids[0]].self_attn.dsa_attn.swa_cache_layer
             self.engram_hash = create_engram_hash_state(vllm_config, config, swa_cache_layer)
-        # Group creation is collective across world ranks. Do this once during
-        # model initialization, never lazily in rank-local routing or capture.
-        self._engram_aux_groups = (
-            EngramAuxGroups(dp_shared_memory=self.engram_dp_shared_memory)
-            if self.has_engram and get_ascend_config().multistream_engram_overlap
-            else None
-        )
 
     def _make_empty_intermediate_tensors(self, batch_size, dtype, device):
         return IntermediateTensors(
@@ -1097,7 +1090,6 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         full_output_buffers=None,
         mask_output_buffer=None,
         padded_tokens=None,
-        aux_groups=None,
     ):
         """Hash on device with upstream NgramHashState, then look up head shards.
 
@@ -1176,13 +1168,9 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         if participates:
             assert hashes is not None
             # One DP gather feeds every layer sharing the split table.
-            gathered = gather_engram_hashes(
-                hashes, dp_shared_memory=self.engram_dp_shared_memory, aux_groups=aux_groups
-            )
+            gathered = gather_engram_hashes(hashes, dp_shared_memory=self.engram_dp_shared_memory)
             for slot, (layer_id, table) in enumerate(zip(config.engram_layer_ids, tables)):
-                lookups[layer_id] = table.embed_gathered(
-                    gathered[:, slot], hashes.shape[0], aux_groups=aux_groups
-                ).flatten(1)
+                lookups[layer_id] = table.embed_gathered(gathered[:, slot], hashes.shape[0]).flatten(1)
                 if full_output_buffers is not None:
                     values = lookups[layer_id]
                     buffer = full_output_buffers[layer_id]
@@ -1238,7 +1226,6 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             full_output_buffers=None if graph_inputs is None else graph_inputs["engram_lookups"],
             mask_output_buffer=None if graph_inputs is None else graph_inputs["engram_mask"],
             padded_tokens=padded_tokens,
-            aux_groups=self._engram_aux_groups,
         )
         return {
             "engram_lookups": rows,

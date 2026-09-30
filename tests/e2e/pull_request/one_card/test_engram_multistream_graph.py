@@ -41,7 +41,6 @@ def test_engram_external_events_refresh_rows_padding_and_empty_batches():
     torch.nn.Module.__init__(model)
     model.has_engram = True
     model.engram_dp_shared_memory = True
-    model._engram_aux_groups = None
 
     # Inject already-known IDs to isolate graph buffer/event correctness from
     # hash arithmetic, which has separate real-cache coverage.
