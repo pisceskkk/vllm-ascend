@@ -25,7 +25,6 @@ SCALE_GROUP = 32
 # separately.
 CHUNK_ROWS = 1 << 22
 ACL_HOST_REG_MAPPED = 0x2
-ACL_HOST_REG_PINNED = 0x10000000
 
 
 def engram_cpu_offload(vllm_config) -> bool:
@@ -186,7 +185,9 @@ class HostUvaBuffer:
         self.buffer = (ctypes.c_char * size).from_address(self.pointer.value)
         self.tensor = torch.frombuffer(self.buffer, dtype=dtype).reshape(shape)
         try:
-            rc = self.lib.aclrtHostRegisterV2(self.pointer, size, ACL_HOST_REG_MAPPED | ACL_HOST_REG_PINNED)
+            # aclrtMallocHost already provides pinned backing. Register only
+            # the device mapping; requesting PINNED again is rejected by A5.
+            rc = self.lib.aclrtHostRegisterV2(self.pointer, size, ACL_HOST_REG_MAPPED)
             if rc:
                 raise RuntimeError(f"aclrtHostRegisterV2 failed: rc={rc} size={size}")
             address = ctypes.c_void_p()
@@ -367,7 +368,9 @@ class SharedUvaBuffer:
                     self.shm = shared_memory.SharedMemory(name=name)
             assert self.shm.size >= size
             address_of_mapping = ctypes.c_void_p(ctypes.addressof(ctypes.c_char.from_buffer(self.shm.buf)))
-            rc = self.lib.aclrtHostRegisterV2(address_of_mapping, size, ACL_HOST_REG_MAPPED | ACL_HOST_REG_PINNED)
+            # Map the shared backing through the driver's UVA path. Explicit
+            # PINNED registration fails for the full Engram table on A5.
+            rc = self.lib.aclrtHostRegisterV2(address_of_mapping, size, ACL_HOST_REG_MAPPED)
             if rc:
                 raise RuntimeError(f"aclrtHostRegisterV2 failed: rc={rc} size={size}")
             # Registration succeeded: from here on the mapping owes exactly one
