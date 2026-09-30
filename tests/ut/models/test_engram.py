@@ -204,7 +204,9 @@ def test_engram_local_rows_finish_tp_gather_on_consumer_stream(monkeypatch):
 
     monkeypatch.setattr(embedding_mod, "tensor_model_parallel_all_gather", gather)
     result = table.finish_local_rows(local, 1)
-    assert calls == [(local, 1)]
+    assert len(calls) == 1
+    assert calls[0][1] == 1
+    assert torch.equal(calls[0][0], local)
     assert torch.equal(result[:, :2], local)
     assert torch.equal(result[:, 2:], local + 100)
 
