@@ -1597,7 +1597,7 @@ def test_dspark_v41_noncausal_metadata_preserves_full_visible_block(runtime, mon
     full = builder.build_for_drafting(common, 1)
     torch.testing.assert_close(
         native.call_args.kwargs["ori_topk_length"],
-        (full.ori_sparse_indices >= 0).sum(-1, dtype=torch.int32),
+        (full.ori_sparse_indices >= 0).sum((-1, -2), dtype=torch.int32),
     )
     assert full.ori_topk_length is native.call_args.kwargs["ori_topk_length"]
     assert full.ori_mask_mode == 0
@@ -1608,7 +1608,7 @@ def test_dspark_v41_noncausal_metadata_preserves_full_visible_block(runtime, mon
     assert full.ori_sparse_indices[0, 0, : len(expected)].tolist() == expected
     assert torch.all(full.ori_sparse_indices[0, 0, len(expected) :] == -1)
     assert full.ori_sparse_indices[3, 0, :5].tolist() == list(range(5))
-    assert full.ori_topk_length[:, 0].tolist() == [len(expected)] * 3 + [5]
+    assert full.ori_topk_length.tolist() == [len(expected)] * 3 + [5]
     if rank is None:
         return
     monkeypatch.setattr(
