@@ -393,6 +393,8 @@ class NPUModelRunner(GPUModelRunner):
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
         self.lookback_token_ids: CpuGpuBuffer | None = None
+        self._engram_overlap_stream: torch.npu.Stream | None = None
+        self._engram_capture_active = False
 
         self.device_metadata_executor: DeviceMetadataExecutor | None = None
         self.device_metadata_providers: dict[int, DeviceMetadataTaskProvider] | None = None
@@ -3319,33 +3321,22 @@ class NPUModelRunner(GPUModelRunner):
             **model_kwargs,
         }
         # Routing runs before replay on every DP, never inside capture.
-        prepare_engram = getattr(self.model, "prepare_engram_inputs", None)
         engram_overlap_stream = None
-        if prepare_engram is not None:
+        if self.vllm_config.engram_config is not None:
             overlap_enabled = (
                 get_ascend_config().multistream_engram_overlap
-                and (
-                    forward_context.cudagraph_runtime_mode == CUDAGraphMode.NONE
-                    and self.model.engram_multistream_supported
-                    or forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
-                    and self.model.engram_graph_multistream_supported
-                )
+                and forward_context.cudagraph_runtime_mode in (CUDAGraphMode.NONE, CUDAGraphMode.FULL)
             )
             full_graph_overlap = overlap_enabled and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
-            capturing = (
-                getattr(self, "_engram_capture_active", False)
-                or getattr(forward_context, "capturing", False)
-                or torch.npu.is_current_stream_capturing()
-            )
-            if capturing:
+            if self._engram_capture_active:
                 if full_graph_overlap:
                     model_inputs.update(
                         self.model.prepare_engram_overlap_graph_inputs(
-                            num_tokens_padded, forward_context.batch_descriptor, prime=True
+                            forward_context.batch_descriptor, prime=True
                         )
                     )
                 else:
-                    model_inputs.update(self.model.prepare_engram_graph_inputs(num_tokens_padded))
+                    model_inputs.update(self.model.prepare_engram_graph_inputs())
             elif overlap_enabled:
                 # Hash/row fetch do not read hidden states. Engram's sibling
                 # DP/TP groups submit all exchanges here; the main stream
@@ -3356,12 +3347,12 @@ class NPUModelRunner(GPUModelRunner):
                 # ordinary eager events must not be captured as graph inputs.
                 graph_inputs = (
                     self.model.prepare_engram_overlap_graph_inputs(
-                        num_tokens_padded, forward_context.batch_descriptor
+                        forward_context.batch_descriptor
                     )
                     if full_graph_overlap
                     else None
                 )
-                engram_overlap_stream = getattr(self, "_engram_overlap_stream", None)
+                engram_overlap_stream = self._engram_overlap_stream
                 if engram_overlap_stream is None:
                     engram_overlap_stream = torch.npu.Stream(device=input_ids.device)
                     self._engram_overlap_stream = engram_overlap_stream
@@ -3375,12 +3366,8 @@ class NPUModelRunner(GPUModelRunner):
                         tensor.record_stream(engram_overlap_stream)
                 try:
                     with torch.npu.stream(engram_overlap_stream):
-                        prepare_overlap = (
-                            self.model.prepare_engram_graph_overlap_inputs
-                            if full_graph_overlap else self.model.prepare_engram_local_inputs
-                        )
                         model_inputs.update(
-                            prepare_overlap(
+                            self.model.prepare_engram_overlap_inputs(
                                 input_ids,
                                 positions,
                                 lookback,
@@ -3392,12 +3379,9 @@ class NPUModelRunner(GPUModelRunner):
                     # Eager results are allocated on the producer stream and
                     # consumed on main. Retain them until those reads finish,
                     # even if an exception drops the Python input dictionary.
-                    for key in ("engram_lookups", "engram_local_rows"):
-                        for tensor in model_inputs.get(key, {}).values():
-                            tensor.record_stream(main_stream)
-                    mask = model_inputs.get("engram_mask")
-                    if mask is not None:
-                        mask.record_stream(main_stream)
+                    for tensor in model_inputs["engram_lookups"].values():
+                        tensor.record_stream(main_stream)
+                    model_inputs["engram_mask"].record_stream(main_stream)
                 except Exception:
                     main_stream.wait_stream(engram_overlap_stream)
                     raise
@@ -3411,7 +3395,7 @@ class NPUModelRunner(GPUModelRunner):
                 # state fills itself, which is what keeps async draft
                 # placeholders out of the history.
                 model_inputs.update(
-                    prepare_engram(
+                    self.model.prepare_engram_inputs(
                         input_ids,
                         positions,
                         num_tokens_padded,

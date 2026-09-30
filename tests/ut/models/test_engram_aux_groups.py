@@ -31,8 +31,6 @@ def test_sibling_groups_are_created_once_in_dp_tp_order_and_closed(monkeypatch, 
     groups.close()
     groups.close()
     assert calls[-1 if shared else -2 :] == ([("close", "tp")] if shared else [("close", "tp"), ("close", "dp")])
-    with pytest.raises(RuntimeError, match="closed"):
-        groups.gather_tp_heads(torch.ones(1, 1, 4))
 
 
 def test_partial_group_creation_failure_releases_dp_group(monkeypatch):
@@ -133,13 +131,12 @@ def test_producer_routes_all_three_dp_gathers_before_table_events(monkeypatch, i
     model.config = SimpleNamespace(engram_layer_ids=(1, 14), image_token_id=999)
     model.layers = [SimpleNamespace(engram=SimpleNamespace(embed_tokens=table(layer))) for layer in range(15)]
     count = 1 if idle else 2
-    result = model.prepare_engram_local_inputs(
+    result = model.prepare_engram_overlap_inputs(
         torch.ones(count, dtype=torch.int32),
         torch.arange(count),
         query_start_loc=torch.tensor([0] if idle else [0, count], dtype=torch.int32),
         block_table=torch.zeros((0 if idle else 1, 1), dtype=torch.int32),
     )
-    assert "engram_local_rows" not in result
     assert result["engram_lookups"][1].shape == (count, 96)
     assert result["engram_mask"].tolist() == [not idle] * count
     assert calls == [

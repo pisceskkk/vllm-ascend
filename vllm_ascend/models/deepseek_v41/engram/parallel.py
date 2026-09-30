@@ -74,12 +74,8 @@ class EngramAuxGroups:
         self._finalizer()
 
     def _gather(self, values, group, size):
-        if not self._finalizer.alive:
-            raise RuntimeError("Engram auxiliary groups have been closed")
         if size == 1:
             return values
-        if group is None:
-            raise RuntimeError("Engram auxiliary communicator is missing")
         values = values.contiguous()
         gathered = values.new_empty((size * values.shape[0], *values.shape[1:]))
         # All members of this group have the same shape. An empty TP replica

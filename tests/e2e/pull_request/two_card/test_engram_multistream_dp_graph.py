@@ -91,12 +91,12 @@ def _worker(rank, port, topology):
         model.engram_hash = HashState()
         model.config = SimpleNamespace(engram_layer_ids=(1, 14), image_token_id=999)
         model.layers = [SimpleNamespace(engram=SimpleNamespace(embed_tokens=tables.get(layer))) for layer in range(15)]
-        model._engram_max_tokens, model._engram_local_graph_inputs = _CAPACITY, None
+        model._engram_max_tokens, model._engram_graph_inputs = _CAPACITY, None
         model.engram_rotation = torch.eye(32, device="npu")
         main, aux = torch.npu.current_stream(), torch.npu.Stream()
         bucket = (6, 48)[dp_rank] if dp_enabled else 48
         with patch.object(parallel, "engram_gathered_num_tokens", return_value=_CAPACITY):
-            binding = model.prepare_engram_overlap_graph_inputs(bucket, bucket, prime=True)
+            binding = model.prepare_engram_overlap_graph_inputs(bucket, prime=True)
             ep_input = torch.full((8,), rank + 1.0, device="npu")
             # Initialize the collective before capturing its fixed addresses.
             ep.all_reduce(ep_input)
@@ -129,7 +129,7 @@ def _worker(rank, port, topology):
                 tp_input.fill_(rank + 1.0)
                 aux.wait_stream(main)
                 with override_forward_context(_context(bucket, mode=CUDAGraphMode.FULL)), torch.npu.stream(aux):
-                    model.prepare_engram_graph_overlap_inputs(
+                    model.prepare_engram_overlap_inputs(
                         tokens,
                         positions,
                         None,
@@ -165,7 +165,7 @@ def _worker(rank, port, topology):
                 override_forward_context(_context(count)),
                 torch.npu.stream(aux),
             ):
-                result = model.prepare_engram_local_inputs(
+                result = model.prepare_engram_overlap_inputs(
                     tokens,
                     torch.arange(count, device="npu"),
                     query_start_loc=query,

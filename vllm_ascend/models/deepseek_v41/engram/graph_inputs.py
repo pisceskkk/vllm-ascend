@@ -1,18 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Fixed-address local lookup inputs and per-graph external frontiers."""
+"""Fixed-address Engram lookup inputs and per-graph external frontiers."""
 
 import torch
 
 
 class EngramGraphInputs:
-    def __init__(self, tables, capacity, device, *, full_rows=False):
-        self.full_rows = full_rows
+    def __init__(self, tables, capacity, device):
         self.rows = {
             layer: torch.zeros(
-                (capacity, table.n_hash_cols * table.dim)
-                if full_rows
-                else (capacity, table.part_n_hash_cols, table.dim),
+                (capacity, table.n_hash_cols * table.dim),
                 dtype=torch.bfloat16,
                 device=device,
             )
@@ -38,7 +35,7 @@ class EngramGraphInputs:
             for event in ready.values():
                 event.record(stream)
         return {
-            "engram_lookups" if self.full_rows else "engram_local_rows": self.rows,
+            "engram_lookups": self.rows,
             "engram_mask": self.mask,
             "engram_mask_ready_event": mask_ready,
             "engram_ready_events": ready,

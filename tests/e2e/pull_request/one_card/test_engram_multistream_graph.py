@@ -34,6 +34,7 @@ def test_engram_external_events_refresh_rows_padding_and_empty_batches():
         table = object.__new__(AscendParallelEngramEmbedding)
         torch.nn.Module.__init__(table)
         table.part_n_hash_cols, table.dim, table.head_start = heads, width, 0
+        table.n_hash_cols, table.dp_size, table.tp_size = heads, 1, 1
         table.vocab_start_idx, table.vocab_end_idx = 0, vocab
         table._codes_uva, table._scales_uva = host_codes, host_scales
         tables[layer] = table
@@ -41,6 +42,7 @@ def test_engram_external_events_refresh_rows_padding_and_empty_batches():
     torch.nn.Module.__init__(model)
     model.has_engram = True
     model.engram_dp_shared_memory = True
+    model._engram_aux_groups = None
 
     # Inject already-known IDs to isolate graph buffer/event correctness from
     # hash arithmetic, which has separate real-cache coverage.
@@ -71,8 +73,8 @@ def test_engram_external_events_refresh_rows_padding_and_empty_batches():
                     for layer in (1, 14):
                         wait_engram_event(bindings["engram_ready_events"][layer], True)
                         output[layer] = torch.where(
-                            bindings["engram_mask"][:size, None, None],
-                            bindings["engram_local_rows"][layer][:size],
+                            bindings["engram_mask"][:size, None],
+                            bindings["engram_lookups"][layer][:size],
                             0,
                         )
                 graphs[size], outputs[size] = graph, output
@@ -90,7 +92,7 @@ def test_engram_external_events_refresh_rows_padding_and_empty_batches():
                 binding = inputs.bindings(size)
                 aux.wait_stream(main)
                 with torch.npu.stream(aux):
-                    model.prepare_engram_local_inputs(
+                    model.prepare_engram_overlap_inputs(
                         ids_device,
                         positions,
                         query_start_loc=query,
@@ -105,7 +107,7 @@ def test_engram_external_events_refresh_rows_padding_and_empty_batches():
                     if row >= 0:
                         oracle[token] = (codes[row].float() * 0.25).bfloat16()
                 for layer in (1, 14):
-                    assert torch.equal(outputs[size][layer].cpu(), oracle), (phase, size, count, layer)
+                    assert torch.equal(outputs[size][layer].cpu(), oracle.flatten(1)), (phase, size, count, layer)
     finally:
         torch.npu.synchronize()
         host_codes.close()
