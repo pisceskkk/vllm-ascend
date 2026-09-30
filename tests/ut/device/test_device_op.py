@@ -9,7 +9,9 @@ from vllm_ascend.device.device_op import A5DeviceAdaptor, BaseDeviceAdaptor
 
 def test_deepseek_v41_backend_is_device_routed():
     assert BaseDeviceAdaptor.get_deepseek_v41_backend() is None
-    assert A5DeviceAdaptor.get_deepseek_v41_backend().__name__ == "vllm_ascend.ops.dsv41_a5"
+    with mock.patch("vllm_ascend.utils.load_custom_op_library") as load_library:
+        assert A5DeviceAdaptor.get_deepseek_v41_backend().__name__ == "vllm_ascend.ops.dsv41_a5"
+    load_library.assert_called_once_with()
 
 
 def test_reshape_and_cache_makes_scatter_inputs_contiguous():

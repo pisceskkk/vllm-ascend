@@ -6,18 +6,21 @@ workspace index/count, M start/count, reserved. Remaining words are zero.
 M is the operator's query tile index; S2 is a 512-token tile index.
 """
 
-from functools import lru_cache
 import tempfile
+from functools import lru_cache
+
 import torch
 from cannbotdsl.aicpu import (
-    GmIn,
-    GmOut,
     I32,
     I64,
     U32,
+    GmIn,
+    GmOut,
     aicpu_kernel,
     current_raw_stream,
 )
+
+from vllm_ascend.ops.pythondsl.utils import get_indexer_worker_count
 
 
 class Args:
@@ -58,8 +61,6 @@ def metadata_kernel(a: Args):
     if a.sparse != 0:
         groups = total_q
     workers = a.workers
-    if a.sparse != 0:
-        workers = 32
     # ASC cost formula, with the active M extent for tail groups.
     for i in range(1024):
         a.output[i] = 0
@@ -138,10 +139,10 @@ def metadata_kernel(a: Args):
         a.scratch[3 * groups + (g * 8 + 7)] = qoff
     # ASC AssignByBatch -> AssignByRow -> AssignByBlock -> ForceAssign.
     # The cursor is a lexicographic (B, M, S2) boundary. No per-query split cap.
-    first_group = zeros(I64, workers)
-    last_group = zeros(I64, workers)
-    first_tile = zeros(I64, workers)
-    last_tile = zeros(I64, workers)
+    first_group = zeros(I64, workers)  # noqa: F821
+    last_group = zeros(I64, workers)  # noqa: F821
+    first_tile = zeros(I64, workers)  # noqa: F821
+    last_tile = zeros(I64, workers)  # noqa: F821
     max_row_cost = 0
     for g in range(groups):
         n = a.scratch[g]
@@ -177,9 +178,7 @@ def metadata_kernel(a: Args):
                 if end == g:
                     start = at
                 if n > start:
-                    batch_cost += (n - start - 1) * a.scratch[groups + end] + a.scratch[
-                        2 * groups + end
-                    ]
+                    batch_cost += (n - start - 1) * a.scratch[groups + end] + a.scratch[2 * groups + end]
                     batch_blocks += n - start
                     batch_last = a.scratch[2 * groups + end]
                 end += 1
@@ -194,9 +193,7 @@ def metadata_kernel(a: Args):
             n = a.scratch[g]
             row_cost = 0
             if n > at:
-                row_cost = (n - at - 1) * a.scratch[groups + g] + a.scratch[
-                    2 * groups + g
-                ]
+                row_cost = (n - at - 1) * a.scratch[groups + g] + a.scratch[2 * groups + g]
             if used + row_cost > limit + a.scratch[2 * groups + g] // 2:
                 break
             used += row_cost
@@ -256,10 +253,10 @@ def metadata_kernel(a: Args):
         else:
             a.output[c * 8 + 4] = a.batch
     # Record only cross-core rows. Compact workspace slots follow ASC FD order.
-    fd_group = zeros(I64, workers)
-    fd_parts = zeros(I64, workers)
-    fd_base = zeros(I64, workers)
-    fd_rows = zeros(I64, workers)
+    fd_group = zeros(I64, workers)  # noqa: F821
+    fd_parts = zeros(I64, workers)  # noqa: F821
+    fd_base = zeros(I64, workers)  # noqa: F821
+    fd_rows = zeros(I64, workers)  # noqa: F821
     fd_num = 0
     workspace = 0
     total_fd_load = 0
@@ -269,9 +266,7 @@ def metadata_kernel(a: Args):
             group = last_group[c]
             first = c
             end = c + 1
-            while (
-                end < used_cores - 1 and last_group[end] == group and last_tile[end] > 0
-            ):
+            while end < used_cores - 1 and last_group[end] == group and last_tile[end] > 0:
                 end += 1
             parts = end - first + 1
             fd_group[fd_num] = group
@@ -293,10 +288,7 @@ def metadata_kernel(a: Args):
                 cursor = fd_base[f]
                 if first_group[owner] == fd_group[f]:
                     for previous in range(owner):
-                        if (
-                            last_group[previous] == fd_group[f]
-                            and last_tile[previous] > 0
-                        ):
+                        if last_group[previous] == fd_group[f] and last_tile[previous] > 0:
                             cursor += 1
                 break
         a.output[owner * 8 + 7] = cursor
@@ -338,6 +330,7 @@ def metadata_kernel(a: Args):
 @lru_cache(None)
 def compiled_metadata():
     from pathlib import Path
+
     from cannbotdsl.aicpu.toolchain import CompiledAicpuKernel, compile_aicpu_kernel
 
     binary = Path(__file__).parent / "_aicpu" / "qsli_metadata_kernel.so"
@@ -349,9 +342,7 @@ def compiled_metadata():
             launch_mode="interface",
         )
     directory = tempfile.TemporaryDirectory(prefix="qsli_metadata_aicpu_")
-    return directory, compile_aicpu_kernel(
-        metadata_kernel, workdir=directory.name, launch_mode="interface"
-    )
+    return directory, compile_aicpu_kernel(metadata_kernel, workdir=directory.name, launch_mode="interface")
 
 
 def choose_splits(tasks, tokens, topk):
@@ -380,11 +371,9 @@ def build_metadata(
     output_idx_offset=None,
 ):
     groups = q.shape[0] if sparse else batch * max_tasks
-    workers = 32
+    workers = get_indexer_worker_count(q.device)
     output = torch.empty((1024,), dtype=torch.int32, device=q.device)
-    scratch = torch.empty(
-        (groups * (12 + 3 * splits),), dtype=torch.int64, device=q.device
-    )
+    scratch = torch.empty((groups * (12 + 3 * splits),), dtype=torch.int64, device=q.device)
     _, compiled = compiled_metadata()
     tensors = dict(
         cu=cu,
@@ -450,27 +439,15 @@ def metadata_geometry(
     if layout_q != "TND" or layout_k != "PA_BBND":
         raise ValueError("metadata supports TND queries and PA_BBND keys")
     if num_heads_q not in (32, 64) or num_heads_k != 1 or head_dim != 128:
-        raise ValueError(
-            "MX4 metadata requires Nq=32/64, Nk=1 and logical head_dim=128"
-        )
+        raise ValueError("MX4 metadata requires Nq=32/64, Nk=1 and logical head_dim=128")
     if mask_mode not in (0, 3) or not 1 <= cmp_ratio <= 128 or topk <= 0:
         raise ValueError("invalid mask_mode, cmp_ratio or topk")
-    tensors = [
-        x for x in (cu_seqlens_q, seqused_q, seqused_k, cmp_residual_k) if x is not None
-    ]
-    device = (
-        tensors[0].device
-        if tensors
-        else torch.device("npu", torch.npu.current_device())
-    )
+    tensors = [x for x in (cu_seqlens_q, seqused_q, seqused_k, cmp_residual_k) if x is not None]
+    device = tensors[0].device if tensors else torch.device("npu", torch.npu.current_device())
     if device.type != "npu":
         raise ValueError("metadata sequence inputs must be on NPU")
-    if any(
-        x.dtype != torch.int32 or x.ndim != 1 or x.device != device for x in tensors
-    ):
-        raise ValueError(
-            "sequence inputs must be one-dimensional int32 tensors on one device"
-        )
+    if any(x.dtype != torch.int32 or x.ndim != 1 or x.device != device for x in tensors):
+        raise ValueError("sequence inputs must be one-dimensional int32 tensors on one device")
     batch = (
         cu_seqlens_q.numel() - 1
         if cu_seqlens_q is not None
@@ -478,10 +455,7 @@ def metadata_geometry(
     )
     if batch <= 0 or (batch_size is not None and batch_size != batch):
         raise ValueError("batch_size disagrees with sequence input shapes")
-    if any(
-        x is not None and x.numel() != batch
-        for x in (seqused_q, seqused_k, cmp_residual_k)
-    ):
+    if any(x is not None and x.numel() != batch for x in (seqused_q, seqused_k, cmp_residual_k)):
         raise ValueError("sequence length tensors must have B elements")
     if cu_seqlens_q is None and batch != 1:
         raise ValueError("TND metadata requires cu_seqlens_q for multiple batches")
@@ -519,22 +493,35 @@ def quant_sparse_lightning_indexer_metadata(
     layout_q="TND",
     layout_k="TND",
 ):
-
-    if layout_k == 'TND':
+    if layout_k == "TND":
         if batch_size is not None:
-            raise ValueError('TND metadata infers batch from cu arrays; batch_size must be None')
+            raise ValueError("TND metadata infers batch from cu arrays; batch_size must be None")
         if (num_heads_q, num_heads_k, head_dim, quant_mode, candidate_block_size) != (32, 1, 128, 1, 8):
-            raise ValueError('TND QSLI requires Nq=32, Nk=1, D=128, quant_mode=1, block size=8')
-        if layout_q != 'TND' or int(max_seqlen_q) < -1 or int(max_seqlen_k) < -1:
-            raise ValueError('invalid TND layout or maximum sequence length')
+            raise ValueError("TND QSLI requires Nq=32, Nk=1, D=128, quant_mode=1, block size=8")
+        if layout_q != "TND" or int(max_seqlen_q) < -1 or int(max_seqlen_k) < -1:
+            raise ValueError("invalid TND layout or maximum sequence length")
         batch, effective_k = _tnd_geometry(
-            candidate_block_length, cu_seqlens_q, cu_seqlens_k, seqused_q,
-            seqused_k, cmp_residual_k, topk=topk, mask_mode=mask_mode,
-            cmp_ratio=cmp_ratio)
+            candidate_block_length,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            cmp_residual_k,
+            topk=topk,
+            mask_mode=mask_mode,
+            cmp_ratio=cmp_ratio,
+        )
         return _build_tnd_metadata(
-            candidate_block_length, cu_seqlens_q, seqused_q, effective_k,
-            cmp_residual_k, batch=batch, topk=topk, mask_mode=mask_mode,
-            cmp_ratio=cmp_ratio)
+            candidate_block_length,
+            cu_seqlens_q,
+            seqused_q,
+            effective_k,
+            cmp_residual_k,
+            batch=batch,
+            topk=topk,
+            mask_mode=mask_mode,
+            cmp_ratio=cmp_ratio,
+        )
 
     if quant_mode != 1 or candidate_block_size != 8:
         raise ValueError("QSLI MX4 requires quant_mode=1, candidate block size8")
@@ -558,10 +545,7 @@ def quant_sparse_lightning_indexer_metadata(
         layout_k=layout_k,
         total_query_rows=candidate_block_length.numel(),
     )
-    if (
-        candidate_block_length.dtype != torch.int32
-        or candidate_block_length.ndim not in (1, 2)
-    ):
+    if candidate_block_length.dtype != torch.int32 or candidate_block_length.ndim not in (1, 2):
         raise ValueError("candidate_block_length must be int32 [T] or [T,1]")
     if candidate_block_length.ndim == 2 and candidate_block_length.shape[1] != 1:
         raise ValueError("candidate_block_length must have one KV head")
@@ -590,47 +574,62 @@ __all__ = ["quant_sparse_lightning_indexer_metadata"]
 
 def _sequence(tensor, name, device, count=None):
     if tensor is None or tensor.dtype != torch.int32 or tensor.ndim != 1:
-        raise ValueError(f'{name} must be a one-dimensional int32 tensor')
-    if tensor.device != device or device.type != 'npu' or not tensor.is_contiguous():
-        raise ValueError(f'{name} must be contiguous on the input NPU device')
+        raise ValueError(f"{name} must be a one-dimensional int32 tensor")
+    if tensor.device != device or device.type != "npu" or not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous on the input NPU device")
     if count is not None and tensor.numel() != count:
-        raise ValueError(f'{name} must have {count} entries')
+        raise ValueError(f"{name} must have {count} entries")
 
 
-def _tnd_geometry(lengths, cu_q, cu_k, used_q, used_k, residual, *,
-                  topk, mask_mode, cmp_ratio):
-    if (lengths.ndim != 2 or lengths.shape[1] != 1 or lengths.shape[0] <= 0
-            or lengths.dtype != torch.int32 or lengths.device.type != 'npu'
-            or not lengths.is_contiguous()):
-        raise ValueError('candidate_block_length must be contiguous NPU int32 (T1,1), T1>0')
+def _tnd_geometry(lengths, cu_q, cu_k, used_q, used_k, residual, *, topk, mask_mode, cmp_ratio):
+    if (
+        lengths.ndim != 2
+        or lengths.shape[1] != 1
+        or lengths.shape[0] <= 0
+        or lengths.dtype != torch.int32
+        or lengths.device.type != "npu"
+        or not lengths.is_contiguous()
+    ):
+        raise ValueError("candidate_block_length must be contiguous NPU int32 (T1,1), T1>0")
     device = lengths.device
-    _sequence(cu_q, 'cu_seqlens_q', device)
+    _sequence(cu_q, "cu_seqlens_q", device)
     if cu_q.numel() < 2:
-        raise ValueError('cu_seqlens_q must contain at least two boundaries')
+        raise ValueError("cu_seqlens_q must contain at least two boundaries")
     batch = cu_q.numel() - 1
-    _sequence(cu_k, 'cu_seqlens_k', device, batch + 1)
-    for name, tensor in (('seqused_q', used_q), ('seqused_k', used_k)):
+    _sequence(cu_k, "cu_seqlens_k", device, batch + 1)
+    for name, tensor in (("seqused_q", used_q), ("seqused_k", used_k)):
         if tensor is not None:
             _sequence(tensor, name, device, batch)
     if int(topk) <= 0 or int(mask_mode) not in (0, 3) or not 1 <= int(cmp_ratio) <= 128:
-        raise ValueError('invalid topk, mask_mode or cmp_ratio')
+        raise ValueError("invalid topk, mask_mode or cmp_ratio")
     if int(mask_mode) == 3 and int(cmp_ratio) != 1:
-        _sequence(residual, 'cmp_residual_k', device, batch)
+        _sequence(residual, "cmp_residual_k", device, batch)
     elif residual is not None:
-        raise ValueError('cmp_residual_k requires mask_mode=3 and cmp_ratio!=1')
+        raise ValueError("cmp_residual_k requires mask_mode=3 and cmp_ratio!=1")
     # Boundary values remain a device-side input contract; no CPU read/sync.
     effective_k = used_k if used_k is not None else cu_k[1:] - cu_k[:-1]
     return batch, effective_k
 
 
-def _build_tnd_metadata(lengths, cu_q, used_q, effective_k, residual, *,
-                        batch, topk, mask_mode, cmp_ratio, output_idx_offset=None):
+def _build_tnd_metadata(
+    lengths, cu_q, used_q, effective_k, residual, *, batch, topk, mask_mode, cmp_ratio, output_idx_offset=None
+):
     from types import SimpleNamespace
+
     geometry = SimpleNamespace(shape=(lengths.shape[0], 32), device=lengths.device)
     return build_metadata(
-        geometry, cu_q, used_q, effective_k, residual, lengths,
-        batch=batch, max_tasks=1, capacity=0,
+        geometry,
+        cu_q,
+        used_q,
+        effective_k,
+        residual,
+        lengths,
+        batch=batch,
+        max_tasks=1,
+        capacity=0,
         splits=choose_splits(lengths.shape[0], 16384, int(topk)),
-        mask=int(mask_mode), ratio=int(cmp_ratio), sparse=True,
+        mask=int(mask_mode),
+        ratio=int(cmp_ratio),
+        sparse=True,
         output_idx_offset=output_idx_offset,
     )

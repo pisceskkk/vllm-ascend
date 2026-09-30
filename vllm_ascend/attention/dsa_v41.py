@@ -35,7 +35,7 @@ from vllm_ascend.core.kv_cache_interface import (
     get_storage_block_size,
 )
 from vllm_ascend.device.device_op import DeviceOperator
-from vllm_ascend.ops.dsv41_a5.package_loader import import_packaged_a5_module
+from vllm_ascend.ops.pythondsl import ops as dsv41_ops
 from vllm_ascend.ops.rope_dsv4 import (
     get_cos_and_sin_dsa,
     get_full_cos_and_sin_dsa_for_layer,
@@ -667,7 +667,7 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
         compressor_reqs = max_reqs if build_compressor_metadata else 0
         self._slot_mapping = torch.full((max_tokens,), -1, dtype=torch.int64, device=device)
         self._slot_mapping_2d = torch.full((max_tokens, 2), -1, dtype=torch.int32, device=device)
-        self._flat_slot_mapping = torch.full((max_tokens,), -1, dtype=torch.int32, device=device)
+        self._flat_slot_mapping = torch.full((max_tokens,), -1, dtype=torch.int64, device=device)
         self._seq_lens = torch.zeros(max_reqs, dtype=torch.int32, device=device)
         self._cache_seq_lens = torch.zeros(max_reqs, dtype=torch.int32, device=device)
         self._cmp_residual = torch.zeros(max_reqs, dtype=torch.int32, device=device)
@@ -940,6 +940,7 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
         head_dim = int(_config_value(text_config, "head_dim"))
         index_topk = int(_config_value(text_config, "index_topk"))
         ori_sparse_indices = kwargs.get("ori_sparse_indices")
+        ori_topk_length = None
         noncausal = not bool(getattr(common, "causal", True))
         if noncausal and ori_sparse_indices is None:
             ori_sparse_indices, ori_topk_length = build_dspark_swa_indices(
@@ -952,7 +953,6 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                 num_actual_tokens,
                 use_logical_indices=True,
             )
-        ori_topk_length = None
         if (
             not noncausal
             and ori_sparse_indices is None
@@ -991,8 +991,7 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                     self._a5_smla_metadata.zero_()
                     return
                 length_rows = self._a5_smla_length_rows[:num_actual_tokens]
-                import_packaged_a5_module("cann_ops_transformer.ops.attention.mixed_quant_sparse_flash_mla_dsl")
-                value = torch.ops.cann_ops_transformer.ds41.mixed_quant_sparse_flash_mla_metadata(
+                value = dsv41_ops.mixed_quant_sparse_flash_mla_metadata(
                     length_rows,
                     length_rows,
                     cu_seqlens_q=common.query_start_loc[: num_reqs + 1].int().contiguous(),
@@ -1065,11 +1064,7 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                 build_smla_metadata,
             )
 
-        if (
-            self._build_query_metadata
-            and self._supports_device_ops
-            and cache_kind == "index_k"
-        ):
+        if self._build_query_metadata and self._supports_device_ops and cache_kind == "index_k":
             residual = cmp_residual_buffer
 
             if self._uses_a5_packed_cache:
@@ -1089,8 +1084,7 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                     if num_actual_tokens == 0:
                         self._qli_metadata.zero_()
                         return
-                    import_packaged_a5_module("cann_ops_transformer.ops.attention.quant_lightning_indexer_dsl")
-                    value = torch.ops.cann_ops_transformer.ds41.quant_lightning_indexer_metadata(
+                    value = dsv41_ops.quant_lightning_indexer_metadata(
                         cu_seqlens_q=common.query_start_loc[: num_reqs + 1].int(),
                         seqused_k=coordinates["cache_seq_lens"],
                         cmp_residual_k=residual,
@@ -1158,11 +1152,7 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
             skip_ring_update = bool(kwargs.get("skip_ring_state_update", False))
 
             def build_c2_metadata() -> None:
-                if (
-                    self._uses_a5_packed_cache
-                    and full_source_cos is not None
-                    and full_source_sin is not None
-                ):
+                if self._uses_a5_packed_cache and full_source_cos is not None and full_source_sin is not None:
                     build_c2_ring_metadata(
                         common.query_start_loc,
                         seq_lens,
@@ -1176,12 +1166,8 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                         num_actual_tokens,
                         skip_update=skip_ring_update,
                         ring_metadata_output=ring_meta,
-                        complete_mask_output=self._c2_complete_mask[
-                            :num_input_tokens
-                        ],
-                        source_positions_output=self._c2_source_positions[
-                            :num_input_tokens
-                        ],
+                        complete_mask_output=self._c2_complete_mask[:num_input_tokens],
+                        source_positions_output=self._c2_source_positions[:num_input_tokens],
                         cos_output=self._c2_source_cos[:num_input_tokens],
                         sin_output=self._c2_source_sin[:num_input_tokens],
                     )

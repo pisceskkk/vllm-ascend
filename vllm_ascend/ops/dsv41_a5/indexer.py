@@ -4,14 +4,12 @@
 
 from __future__ import annotations
 
-import torch
-
+from vllm_ascend.ops.pythondsl import ops
 from vllm_ascend.ops.triton.prepare_indexer_indices import (
     prepare_indexer_indices,
 )
 from vllm_ascend.worker.device_metadata import DeviceMetadataStage, wait_for_device_metadata
 
-from .package_loader import import_packaged_a5_module
 from .quantization import mxfp4_quantize_e8m0
 
 
@@ -60,13 +58,6 @@ def _common(query, weights, source_cache, source_metadata, compress_ratio):
     )
 
 
-def _layout_keyword(op) -> str:
-    schema = getattr(op, "_schema", None)
-    if schema is None:
-        schema = op.default._schema
-    return "layout_kv" if "layout_kv" in str(schema) else "layout_k"
-
-
 def _qli(
     query,
     weights,
@@ -84,7 +75,6 @@ def _qli(
     topk_lengths,
     indices_output,
 ):
-    import_packaged_a5_module("cann_ops_transformer.ops.attention.quant_lightning_indexer_dsl")
     q, qs, w, k, ks, common = _common(
         query,
         weights,
@@ -92,8 +82,8 @@ def _qli(
         source_metadata,
         compress_ratio,
     )
-    common[_layout_keyword(torch.ops.cann_ops_transformer.ds41.quant_lightning_indexer)] = "PA_BBND"
-    indices, _, candidate_out, candidate_length = torch.ops.cann_ops_transformer.ds41.quant_lightning_indexer(
+    common["layout_k"] = "PA_BBND"
+    indices, _, candidate_out, candidate_length = ops.quant_lightning_indexer(
         q,
         k,
         w,
@@ -132,7 +122,6 @@ def _qsli(
     topk_lengths,
     indices_output,
 ):
-    import_packaged_a5_module("cann_ops_transformer.ops.attention.quant_sparse_lightning_indexer_dsl")
     if len(source_cache) != 3:
         raise RuntimeError("A5 QSLI requires its source's folded K/scale twin")
     q, qs, w, _, _, common = _common(
@@ -143,7 +132,6 @@ def _qsli(
         compress_ratio,
     )
     common.pop("metadata")
-    ops = torch.ops.cann_ops_transformer.ds41
     metadata = ops.quant_sparse_lightning_indexer_metadata(
         candidate_lengths,
         cu_seqlens_q=common["cu_seqlens_q"],
@@ -164,7 +152,7 @@ def _qsli(
         layout_k="PA_BBND",
     )
     common["metadata"] = metadata
-    common[_layout_keyword(ops.quant_sparse_lightning_indexer)] = "PA_BBND"
+    common["layout_k"] = "PA_BBND"
     indices, _ = ops.quant_sparse_lightning_indexer(
         q,
         source_cache[2].squeeze(2),

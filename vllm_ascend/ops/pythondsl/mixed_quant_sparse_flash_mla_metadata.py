@@ -35,11 +35,10 @@ int32[1024] 张量（FA 9 字段 × AIC_CORE_MAX_NUM + FD 8 字段 × AIV_CORE_M
   FD 始终开启。本移植改用顶部 `SUPPORT_FD` 开关控制（当前 False，见顶部「FD 开关」注释）。
 """
 
-import math
 import tempfile
 import threading
 
-from cannbotdsl.aicpu import GmIn, GmOut, I32, aicpu_kernel, current_raw_stream
+from cannbotdsl.aicpu import I32, GmIn, GmOut, aicpu_kernel, current_raw_stream
 
 # ---- 常量（metadata.h:24-50 / aicpu.h:29-58，逐条照抄）----
 AIC_CORE_MAX_NUM = 36
@@ -48,7 +47,7 @@ MQSMLA_METADATA_TOTAL_SIZE = 1024
 
 FA_METADATA_SIZE = 9
 FD_METADATA_SIZE = 8
-FD_METADATA_BASE = AIC_CORE_MAX_NUM * FA_METADATA_SIZE   # 324
+FD_METADATA_BASE = AIC_CORE_MAX_NUM * FA_METADATA_SIZE  # 324
 # faMetadata(324) + fdMetadata(576) = 900 字之后的首个保留字：存放 fdUsedVecNum
 # （= FD 归约 AIV 数）。消费侧据此统一决定是否执行 grid barrier + FD 归约阶段。
 FD_USED_VEC_NUM_WORD = AIC_CORE_MAX_NUM * FA_METADATA_SIZE + AIV_CORE_MAX_NUM * FD_METADATA_SIZE  # 900
@@ -80,8 +79,8 @@ CMP_KV = True
 NO_MASK = 0
 HAS_MASK = 1
 
-INT64_MAX = 2 ** 63 - 1
-UINT32_MAX = 2 ** 32 - 1
+INT64_MAX = 2**63 - 1
+UINT32_MAX = 2**32 - 1
 
 
 # ---- FD（flash decode）开关（2026-09-19 重新关闭，实验结论见 MQSMLA_FD_OPTIMIZATION_PLAN.md）----
@@ -97,6 +96,7 @@ SUPPORT_FD = False
 
 class _BlockType:
     """aicpu.h:38-44。"""
+
     ORI_NORMAL_BLOCK = 0
     ORI_TAIL_BLOCK = 1
     CMP_NORMAL_BLOCK = 2
@@ -106,6 +106,7 @@ class _BlockType:
 
 class _SparseMode:
     """aicpu.h:46-53。"""
+
     DEFAULT_MASK = 0
     ALL_MASK = 1
     LEFT_UP_CAUSAL = 2
@@ -287,17 +288,34 @@ class SparseFlashMlaMetadataCpuKernel:
     NPU/CPU torch 张量由模块级 `mixed_quant_sparse_flash_mla_metadata()` 负责落地转换。
     """
 
-    def __init__(self, *,
-                 # required attrs（Prepare，aicpu.cpp:51-53）
-                 num_heads_q, num_heads_kv=1, head_dim=512,
-                 # optional attrs（aicpu.cpp:57-76 GetAttrValueOpt）
-                 soc_version="Ascend950", aic_core_num=AIC_CORE_MAX_NUM,
-                 aiv_core_num=AIV_CORE_MAX_NUM, batch_size=0, max_seqlen_q=0,
-                 max_seqlen_ori_kv=0, max_seqlen_cmp_kv=0, ori_topk=0, cmp_topk=0,
-                 cmp_ratio=1, ori_mask_mode=_SparseMode.BAND,
-                 cmp_mask_mode=_SparseMode.RIGHT_DOWN_CAUSAL, ori_win_left=127,
-                 ori_win_right=0, layout_q="BSND", layout_kv="PA_BBND",
-                 has_ori_kv=True, has_cmp_kv=True, is_batch_consistency=False):
+    def __init__(
+        self,
+        *,
+        # required attrs（Prepare，aicpu.cpp:51-53）
+        num_heads_q,
+        num_heads_kv=1,
+        head_dim=512,
+        # optional attrs（aicpu.cpp:57-76 GetAttrValueOpt）
+        soc_version="Ascend950",
+        aic_core_num=AIC_CORE_MAX_NUM,
+        aiv_core_num=AIV_CORE_MAX_NUM,
+        batch_size=0,
+        max_seqlen_q=0,
+        max_seqlen_ori_kv=0,
+        max_seqlen_cmp_kv=0,
+        ori_topk=0,
+        cmp_topk=0,
+        cmp_ratio=1,
+        ori_mask_mode=_SparseMode.BAND,
+        cmp_mask_mode=_SparseMode.RIGHT_DOWN_CAUSAL,
+        ori_win_left=127,
+        ori_win_right=0,
+        layout_q="BSND",
+        layout_kv="PA_BBND",
+        has_ori_kv=True,
+        has_cmp_kv=True,
+        is_batch_consistency=False,
+    ):
         # aicpu.h:336-374 成员默认值，逐条照抄。
         self.num_heads_q_ = int(num_heads_q)
         self.num_heads_kv_ = int(num_heads_kv)
@@ -334,8 +352,7 @@ class SparseFlashMlaMetadataCpuKernel:
         self.support_fd_ = SUPPORT_FD
         self.ori_attention_mode_ = HAS_MASK
         self.cmp_attention_mode_ = HAS_MASK
-        self._type_cost_ = [[0] * _BlockType.BLOCK_MAX_TYPE
-                            for _ in range(_BlockType.BLOCK_MAX_TYPE)]
+        self._type_cost_ = [[0] * _BlockType.BLOCK_MAX_TYPE for _ in range(_BlockType.BLOCK_MAX_TYPE)]
         self.is_split_g_ = False
         self.is_sparse_ori_kv_ = False
         self.is_sparse_cmp_kv_ = False
@@ -345,10 +362,19 @@ class SparseFlashMlaMetadataCpuKernel:
     # Compute / Prepare / 校验（aicpu.cpp:25-417）
     # ------------------------------------------------------------------
 
-    def compute(self, *, cu_seqlens_q=None, cu_seqlens_ori_kv=None,
-                cu_seqlens_cmp_kv=None, seqused_q=None, seqused_ori_kv=None,
-                seqused_cmp_kv=None, cmp_residual_kv=None,
-                ori_topk_length=None, cmp_topk_length=None):
+    def compute(
+        self,
+        *,
+        cu_seqlens_q=None,
+        cu_seqlens_ori_kv=None,
+        cu_seqlens_cmp_kv=None,
+        seqused_q=None,
+        seqused_ori_kv=None,
+        seqused_cmp_kv=None,
+        cmp_residual_kv=None,
+        ori_topk_length=None,
+        cmp_topk_length=None,
+    ):
         """aicpu.cpp:25-34 Compute：Prepare → BalanceSchedule → GenMetadata。
         返回长度 1024 的 int list（= metadata 输出张量的平坦视图）。"""
         self.cu_seqlens_q_ = _as_i32_list(cu_seqlens_q)
@@ -414,24 +440,26 @@ class SparseFlashMlaMetadataCpuKernel:
                     if p[i - 1] > p[i]:
                         raise ValueError(
                             f"The elements in cu_seqlens_q must be in ascending order, "
-                            f"but got cu_seqlens_q[{i - 1}] = {p[i - 1]}, cu_seqlens_q[{i}] = {p[i]}")
+                            f"but got cu_seqlens_q[{i - 1}] = {p[i - 1]}, cu_seqlens_q[{i}] = {p[i]}"
+                        )
         if self.seqused_q_ is not None:
             sq = self.seqused_q_[0]
-            cu_q = self.cu_seqlens_q_[0] if (self.layout_q_ == "TND"
-                                             and self.cu_seqlens_q_ is not None) else None
+            cu_q = self.cu_seqlens_q_[0] if (self.layout_q_ == "TND" and self.cu_seqlens_q_ is not None) else None
             for i in range(batch_size):
                 if sq[i] < 0:
                     raise ValueError(f"The elements in seqused_q should be >= 0, but got seqused_q[{i}] = {sq[i]}")
                 if self.layout_q_ == "BSND" and sq[i] > self.max_seqlen_q_:
                     raise ValueError(
                         f"The elements in seqused_q should not be greater than max_seqlen_q "
-                        f"{self.max_seqlen_q_}, but got seqused_q[{i}] = {sq[i]}")
+                        f"{self.max_seqlen_q_}, but got seqused_q[{i}] = {sq[i]}"
+                    )
                 if cu_q is not None:
                     seq_len = cu_q[i + 1] - cu_q[i]
                     if sq[i] > seq_len:
                         raise ValueError(
                             f"The elements in seqused_q should not be greater than the sequence length "
-                            f"from cu_seqlens_q {seq_len}, but got seqused_q[{i}] = {sq[i]}")
+                            f"from cu_seqlens_q {seq_len}, but got seqused_q[{i}] = {sq[i]}"
+                        )
         if self.has_ori_kv_:
             if self.layout_kv_ == "TND":
                 if self.cu_seqlens_ori_kv_ is not None:
@@ -443,40 +471,50 @@ class SparseFlashMlaMetadataCpuKernel:
                             raise ValueError(
                                 f"The elements in cu_seqlens_ori_kv must be in ascending order, "
                                 f"but got cu_seqlens_ori_kv[{i - 1}] = {p[i - 1]}, "
-                                f"cu_seqlens_ori_kv[{i}] = {p[i]}")
+                                f"cu_seqlens_ori_kv[{i}] = {p[i]}"
+                            )
             if self.seqused_ori_kv_ is not None:
                 sv = self.seqused_ori_kv_[0]
-                cu_ori = self.cu_seqlens_ori_kv_[0] if (self.layout_kv_ == "TND"
-                                                        and self.cu_seqlens_ori_kv_ is not None) else None
+                cu_ori = (
+                    self.cu_seqlens_ori_kv_[0]
+                    if (self.layout_kv_ == "TND" and self.cu_seqlens_ori_kv_ is not None)
+                    else None
+                )
                 for i in range(batch_size):
                     if sv[i] < 0:
                         raise ValueError(
-                            f"The elements in seqused_ori_kv should be >= 0, but got seqused_ori_kv[{i}] = {sv[i]}")
+                            f"The elements in seqused_ori_kv should be >= 0, but got seqused_ori_kv[{i}] = {sv[i]}"
+                        )
                     if self.layout_kv_ == "BSND" and sv[i] > self.max_seqlen_ori_kv_:
                         raise ValueError(
                             f"The elements in seqused_ori_kv should not be greater than "
-                            f"max_seqlen_ori_kv {self.max_seqlen_ori_kv_}, but got seqused_ori_kv[{i}] = {sv[i]}")
+                            f"max_seqlen_ori_kv {self.max_seqlen_ori_kv_}, but got seqused_ori_kv[{i}] = {sv[i]}"
+                        )
                     if cu_ori is not None:
                         seq_len = cu_ori[i + 1] - cu_ori[i]
                         if sv[i] > seq_len:
                             raise ValueError(
                                 f"The elements in seqused_ori_kv should not be greater than the sequence "
-                                f"length from cu_seqlens_ori_kv {seq_len}, but got seqused_ori_kv[{i}] = {sv[i]}")
-            if (self.ori_top_k_ != 0
-                    and self.ori_mask_mode_ == _SparseMode.DEFAULT_MASK
-                    and self.ori_topk_length_ is not None):
+                                f"length from cu_seqlens_ori_kv {seq_len}, but got seqused_ori_kv[{i}] = {sv[i]}"
+                            )
+            if (
+                self.ori_top_k_ != 0
+                and self.ori_mask_mode_ == _SparseMode.DEFAULT_MASK
+                and self.ori_topk_length_ is not None
+            ):
                 sum_of_query_seq = self.get_sum_of_query_seq()
                 data, _shape = self.ori_topk_length_
                 ori_topk_length_size = self._topk_length_size(self.ori_topk_length_)
                 if ori_topk_length_size < sum_of_query_seq:
                     raise ValueError(
                         f"The size of ori_topk_length {ori_topk_length_size} should not be smaller than "
-                        f"the sum of query sequence {sum_of_query_seq}!")
+                        f"the sum of query sequence {sum_of_query_seq}!"
+                    )
                 for i in range(ori_topk_length_size):
                     if data[i] < 0:
                         raise ValueError(
-                            f"The elements in ori_topk_length should be >= 0, "
-                            f"but got ori_topk_length[{i}] = {data[i]}")
+                            f"The elements in ori_topk_length should be >= 0, but got ori_topk_length[{i}] = {data[i]}"
+                        )
         if self.has_cmp_kv_:
             if self.layout_kv_ == "TND":
                 if self.cu_seqlens_cmp_kv_ is not None:
@@ -488,47 +526,58 @@ class SparseFlashMlaMetadataCpuKernel:
                             raise ValueError(
                                 f"The elements in cu_seqlens_cmp_kv must be in ascending order, "
                                 f"but got cu_seqlens_cmp_kv[{i - 1}] = {p[i - 1]}, "
-                                f"cu_seqlens_cmp_kv[{i}] = {p[i]}")
+                                f"cu_seqlens_cmp_kv[{i}] = {p[i]}"
+                            )
             if self.seqused_cmp_kv_ is not None:
                 sv = self.seqused_cmp_kv_[0]
-                cu_cmp = self.cu_seqlens_cmp_kv_[0] if (self.layout_kv_ == "TND"
-                                                        and self.cu_seqlens_cmp_kv_ is not None) else None
+                cu_cmp = (
+                    self.cu_seqlens_cmp_kv_[0]
+                    if (self.layout_kv_ == "TND" and self.cu_seqlens_cmp_kv_ is not None)
+                    else None
+                )
                 for i in range(batch_size):
                     if sv[i] < 0:
                         raise ValueError(
-                            f"The elements in seqused_cmp_kv should be >= 0, but got seqused_cmp_kv[{i}] = {sv[i]}")
+                            f"The elements in seqused_cmp_kv should be >= 0, but got seqused_cmp_kv[{i}] = {sv[i]}"
+                        )
                     if self.layout_kv_ == "BSND" and sv[i] > self.max_seqlen_cmp_kv_:
                         raise ValueError(
                             f"The elements in seqused_cmp_kv should not be greater than "
-                            f"max_seqlen_cmp_kv {self.max_seqlen_cmp_kv_}, but got seqused_cmp_kv[{i}] = {sv[i]}")
+                            f"max_seqlen_cmp_kv {self.max_seqlen_cmp_kv_}, but got seqused_cmp_kv[{i}] = {sv[i]}"
+                        )
                     if cu_cmp is not None:
                         seq_len = cu_cmp[i + 1] - cu_cmp[i]
                         if sv[i] > seq_len:
                             raise ValueError(
                                 f"The elements in seqused_cmp_kv should not be greater than the sequence "
-                                f"length from cu_seqlens_cmp_kv {seq_len}, but got seqused_cmp_kv[{i}] = {sv[i]}")
+                                f"length from cu_seqlens_cmp_kv {seq_len}, but got seqused_cmp_kv[{i}] = {sv[i]}"
+                            )
             if self.cmp_residual_kv_ is not None:
                 cr = self.cmp_residual_kv_[0]
                 for i in range(batch_size):
                     if cr[i] < 0 or cr[i] >= self.cmp_ratio_:
                         raise ValueError(
                             f"The elements in cmp_residual_kv should be in [0, cmpRatio_({self.cmp_ratio_})), "
-                            f"but got cmp_residual_kv[{i}] = {cr[i]}")
-            if (self.cmp_top_k_ != 0
-                    and self.cmp_mask_mode_ == _SparseMode.DEFAULT_MASK
-                    and self.cmp_topk_length_ is not None):
+                            f"but got cmp_residual_kv[{i}] = {cr[i]}"
+                        )
+            if (
+                self.cmp_top_k_ != 0
+                and self.cmp_mask_mode_ == _SparseMode.DEFAULT_MASK
+                and self.cmp_topk_length_ is not None
+            ):
                 sum_of_query_seq = self.get_sum_of_query_seq()
                 data, _shape = self.cmp_topk_length_
                 cmp_topk_length_size = self._topk_length_size(self.cmp_topk_length_)
                 if cmp_topk_length_size < sum_of_query_seq:
                     raise ValueError(
                         f"The size of cmp_topk_length {cmp_topk_length_size} should not be smaller than "
-                        f"the sum of query sequence {sum_of_query_seq}!")
+                        f"the sum of query sequence {sum_of_query_seq}!"
+                    )
                 for i in range(cmp_topk_length_size):
                     if data[i] < 0:
                         raise ValueError(
-                            f"The elements in cmp_topk_length should be >= 0, "
-                            f"but got cmp_topk_length[{i}] = {data[i]}")
+                            f"The elements in cmp_topk_length should be >= 0, but got cmp_topk_length[{i}] = {data[i]}"
+                        )
 
     def _calc_ori_mask_mode(self):
         """aicpu.cpp:369-384。"""
@@ -603,17 +652,21 @@ class SparseFlashMlaMetadataCpuKernel:
 
     def get_ori_topk_length(self, bs_stride):
         """aicpu.cpp:470-480。"""
-        if (self.ori_top_k_ != 0
-                and self.ori_mask_mode_ == _SparseMode.DEFAULT_MASK
-                and self.ori_topk_length_ is not None):
+        if (
+            self.ori_top_k_ != 0
+            and self.ori_mask_mode_ == _SparseMode.DEFAULT_MASK
+            and self.ori_topk_length_ is not None
+        ):
             return _u32(self.ori_topk_length_[0][bs_stride])
         return _u32(self.ori_top_k_)
 
     def get_cmp_topk_length(self, bs_stride):
         """aicpu.cpp:482-492。"""
-        if (self.cmp_top_k_ != 0
-                and self.cmp_mask_mode_ == _SparseMode.DEFAULT_MASK
-                and self.cmp_topk_length_ is not None):
+        if (
+            self.cmp_top_k_ != 0
+            and self.cmp_mask_mode_ == _SparseMode.DEFAULT_MASK
+            and self.cmp_topk_length_ is not None
+        ):
             return _u32(self.cmp_topk_length_[0][bs_stride])
         return _u32(self.cmp_top_k_)
 
@@ -668,27 +721,28 @@ class SparseFlashMlaMetadataCpuKernel:
         for b_idx in range(self.batch_size_):
             s1_size = self.get_s1_seq_size(b_idx)
             split_info.s1_g_base_num[b_idx] = _u32(
-                (s1_size * self.group_size_ + (self.m_base_size_ - 1)) // self.m_base_size_)
-            split_info.s1_g_tail_size[b_idx] = _u32(
-                (s1_size * self.group_size_) % self.m_base_size_)
+                (s1_size * self.group_size_ + (self.m_base_size_ - 1)) // self.m_base_size_
+            )
+            split_info.s1_g_tail_size[b_idx] = _u32((s1_size * self.group_size_) % self.m_base_size_)
             if self.has_ori_kv_:
                 cur_ori_s2_size = self.get_ori_s2_seq_size(b_idx)
                 split_info.ori_s2_base_num[b_idx] = _u32(
-                    (cur_ori_s2_size + self.s2_base_size_ - 1) // self.s2_base_size_)
+                    (cur_ori_s2_size + self.s2_base_size_ - 1) // self.s2_base_size_
+                )
             if self.has_cmp_kv_:
                 cur_cmp_s2_size = self.get_cmp_s2_seq_size(b_idx)
                 split_info.cmp_s2_base_num[b_idx] = _u32(
-                    (cur_cmp_s2_size + self.s2_base_size_ - 1) // self.s2_base_size_)
+                    (cur_cmp_s2_size + self.s2_base_size_ - 1) // self.s2_base_size_
+                )
             if split_info.s1_g_base_num[b_idx] != 0 and (
-                    split_info.ori_s2_base_num[b_idx] != 0
-                    or split_info.cmp_s2_base_num[b_idx] != 0):
+                split_info.ori_s2_base_num[b_idx] != 0 or split_info.cmp_s2_base_num[b_idx] != 0
+            ):
                 split_info.is_kv_seq_all_zero = False
 
     def _calc_ori_pre_token_left_up(self, s1_size, s2_size):
         """aicpu.cpp:593-601。"""
         if self.ori_mask_mode_ == _SparseMode.BAND:
-            return INT64_MAX if self.ori_pre_token_ == INT64_MAX \
-                else s1_size - s2_size + self.ori_pre_token_
+            return INT64_MAX if self.ori_pre_token_ == INT64_MAX else s1_size - s2_size + self.ori_pre_token_
         return self.ori_pre_token_
 
     def _calc_ori_next_token_left_up(self, s1_size, s2_size):
@@ -699,15 +753,13 @@ class SparseFlashMlaMetadataCpuKernel:
         if mode == _SparseMode.RIGHT_DOWN_CAUSAL:
             return s2_size - s1_size
         if mode == _SparseMode.BAND:
-            return INT64_MAX if self.ori_next_token_ == INT64_MAX \
-                else s2_size - s1_size + self.ori_next_token_
+            return INT64_MAX if self.ori_next_token_ == INT64_MAX else s2_size - s1_size + self.ori_next_token_
         return self.ori_next_token_
 
     def _calc_cmp_pre_token_left_up(self, s1_size, s2_size):
         """aicpu.cpp:622-630。"""
         if self.cmp_mask_mode_ == _SparseMode.BAND:
-            return INT64_MAX if self.cmp_pre_token_ == INT64_MAX \
-                else s1_size - s2_size + self.cmp_pre_token_
+            return INT64_MAX if self.cmp_pre_token_ == INT64_MAX else s1_size - s2_size + self.cmp_pre_token_
         return self.cmp_pre_token_
 
     def _calc_cmp_next_token_left_up(self, s1_size, s2_size):
@@ -718,8 +770,7 @@ class SparseFlashMlaMetadataCpuKernel:
         if mode == _SparseMode.RIGHT_DOWN_CAUSAL:
             return s2_size - s1_size
         if mode == _SparseMode.BAND:
-            return INT64_MAX if self.cmp_next_token_ == INT64_MAX \
-                else s2_size - s1_size + self.cmp_next_token_
+            return INT64_MAX if self.cmp_next_token_ == INT64_MAX else s2_size - s1_size + self.cmp_next_token_
         return self.cmp_next_token_
 
     def _ori_calc_cost(self, basic_m, basic_s2):
@@ -734,40 +785,55 @@ class SparseFlashMlaMetadataCpuKernel:
         align_s2 = (basic_s2 + 63) // 64
         return COST_WEIGHT_M * align_m + COST_WEIGHT_S2 * align_s2
 
-    def _calc_cost_table(self, s1_g_tail_size, reduction_block_size, ori_s2_tail_size,
-                         cmp_s2_tail_size):
+    def _calc_cost_table(self, s1_g_tail_size, reduction_block_size, ori_s2_tail_size, cmp_s2_tail_size):
         """aicpu.cpp:669-698 CalcCostTable（写 self._type_cost_）。"""
         tc = self._type_cost_
         if self.has_ori_kv_:
             tc[_BlockType.ORI_NORMAL_BLOCK][_BlockType.ORI_NORMAL_BLOCK] = (
                 self._ori_calc_cost(self.m_base_size_, reduction_block_size)
                 if self.is_batch_consistency_
-                else self._ori_calc_cost(self.m_base_size_, self.s2_base_size_))
+                else self._ori_calc_cost(self.m_base_size_, self.s2_base_size_)
+            )
             tc[_BlockType.ORI_TAIL_BLOCK][_BlockType.ORI_NORMAL_BLOCK] = (
-                0 if s1_g_tail_size == 0 else
-                (self._ori_calc_cost(s1_g_tail_size, reduction_block_size)
-                 if self.is_batch_consistency_
-                 else self._ori_calc_cost(s1_g_tail_size, self.s2_base_size_)))
+                0
+                if s1_g_tail_size == 0
+                else (
+                    self._ori_calc_cost(s1_g_tail_size, reduction_block_size)
+                    if self.is_batch_consistency_
+                    else self._ori_calc_cost(s1_g_tail_size, self.s2_base_size_)
+                )
+            )
             tc[_BlockType.ORI_NORMAL_BLOCK][_BlockType.ORI_TAIL_BLOCK] = (
-                0 if ori_s2_tail_size == 0 else self._ori_calc_cost(self.m_base_size_, ori_s2_tail_size))
+                0 if ori_s2_tail_size == 0 else self._ori_calc_cost(self.m_base_size_, ori_s2_tail_size)
+            )
             tc[_BlockType.ORI_TAIL_BLOCK][_BlockType.ORI_TAIL_BLOCK] = (
-                0 if (s1_g_tail_size == 0 or ori_s2_tail_size == 0)
-                else self._ori_calc_cost(s1_g_tail_size, ori_s2_tail_size))
+                0
+                if (s1_g_tail_size == 0 or ori_s2_tail_size == 0)
+                else self._ori_calc_cost(s1_g_tail_size, ori_s2_tail_size)
+            )
         if self.has_cmp_kv_:
             tc[_BlockType.CMP_NORMAL_BLOCK][_BlockType.CMP_NORMAL_BLOCK] = (
                 self._cmp_calc_cost(self.m_base_size_, reduction_block_size)
                 if self.is_batch_consistency_
-                else self._cmp_calc_cost(self.m_base_size_, self.s2_base_size_))
+                else self._cmp_calc_cost(self.m_base_size_, self.s2_base_size_)
+            )
             tc[_BlockType.CMP_TAIL_BLOCK][_BlockType.CMP_NORMAL_BLOCK] = (
-                0 if s1_g_tail_size == 0 else
-                (self._cmp_calc_cost(s1_g_tail_size, reduction_block_size)
-                 if self.is_batch_consistency_
-                 else self._cmp_calc_cost(s1_g_tail_size, self.s2_base_size_)))
+                0
+                if s1_g_tail_size == 0
+                else (
+                    self._cmp_calc_cost(s1_g_tail_size, reduction_block_size)
+                    if self.is_batch_consistency_
+                    else self._cmp_calc_cost(s1_g_tail_size, self.s2_base_size_)
+                )
+            )
             tc[_BlockType.CMP_NORMAL_BLOCK][_BlockType.CMP_TAIL_BLOCK] = (
-                0 if cmp_s2_tail_size == 0 else self._cmp_calc_cost(self.m_base_size_, cmp_s2_tail_size))
+                0 if cmp_s2_tail_size == 0 else self._cmp_calc_cost(self.m_base_size_, cmp_s2_tail_size)
+            )
             tc[_BlockType.CMP_TAIL_BLOCK][_BlockType.CMP_TAIL_BLOCK] = (
-                0 if (s1_g_tail_size == 0 or cmp_s2_tail_size == 0)
-                else self._cmp_calc_cost(s1_g_tail_size, cmp_s2_tail_size))
+                0
+                if (s1_g_tail_size == 0 or cmp_s2_tail_size == 0)
+                else self._cmp_calc_cost(s1_g_tail_size, cmp_s2_tail_size)
+            )
 
     def _calc_s2_token_range(self, s1_g_idx, batch_cache, is_cmp_kv):
         """aicpu.cpp:700-758 CalcS2TokenRange：返回 (first, last) int64 对。"""
@@ -782,8 +848,7 @@ class SparseFlashMlaMetadataCpuKernel:
         if not has_mask:
             return (0, s2_size - 1)
         s1_g_first_token = s1_g_idx * self.m_base_size_
-        s1_g_last_token = min(s1_g_first_token + self.m_base_size_,
-                              batch_cache.s1_size * self.group_size_) - 1
+        s1_g_last_token = min(s1_g_first_token + self.m_base_size_, batch_cache.s1_size * self.group_size_) - 1
         if self.is_s1g_:
             s1_first_token = s1_g_first_token // self.group_size_
             s1_last_token = s1_g_last_token // self.group_size_
@@ -796,12 +861,18 @@ class SparseFlashMlaMetadataCpuKernel:
                 s1_last_token = batch_cache.s1_size
         if not is_cmp_kv:
             s2_first_token = s1_first_token - batch_cache.ori_pre_token_left_up
-            s2_last_token = (INT64_MAX if batch_cache.ori_next_token_left_up == INT64_MAX
-                             else s1_last_token + batch_cache.ori_next_token_left_up)
+            s2_last_token = (
+                INT64_MAX
+                if batch_cache.ori_next_token_left_up == INT64_MAX
+                else s1_last_token + batch_cache.ori_next_token_left_up
+            )
         else:
             s2_first_token = s1_first_token - batch_cache.cmp_pre_token_left_up
-            s2_last_token = (INT64_MAX if batch_cache.cmp_next_token_left_up == INT64_MAX
-                             else s1_last_token + batch_cache.cmp_next_token_left_up)
+            s2_last_token = (
+                INT64_MAX
+                if batch_cache.cmp_next_token_left_up == INT64_MAX
+                else s1_last_token + batch_cache.cmp_next_token_left_up
+            )
         return (s2_first_token, s2_last_token)
 
     def _calc_batch_cache(self, b_idx, split_context, batch_cache):
@@ -811,15 +882,19 @@ class SparseFlashMlaMetadataCpuKernel:
         if self.has_ori_kv_:
             batch_cache.ori_s2_size = self.get_ori_s2_seq_size(b_idx)
             batch_cache.ori_pre_token_left_up = self._calc_ori_pre_token_left_up(
-                batch_cache.s1_size, batch_cache.ori_s2_size)
+                batch_cache.s1_size, batch_cache.ori_s2_size
+            )
             batch_cache.ori_next_token_left_up = self._calc_ori_next_token_left_up(
-                batch_cache.s1_size, batch_cache.ori_s2_size)
+                batch_cache.s1_size, batch_cache.ori_s2_size
+            )
         if self.has_cmp_kv_:
             batch_cache.cmp_revert_s2_size = self.get_revert_s2_size(b_idx)
             batch_cache.cmp_pre_token_left_up = self._calc_cmp_pre_token_left_up(
-                batch_cache.s1_size, batch_cache.cmp_revert_s2_size)
+                batch_cache.s1_size, batch_cache.cmp_revert_s2_size
+            )
             batch_cache.cmp_next_token_left_up = self._calc_cmp_next_token_left_up(
-                batch_cache.s1_size, batch_cache.cmp_revert_s2_size)
+                batch_cache.s1_size, batch_cache.cmp_revert_s2_size
+            )
 
     def _calc_ori_s1g_cache(self, s1g_cache, split_info):
         """aicpu.cpp:779-809。"""
@@ -833,25 +908,31 @@ class SparseFlashMlaMetadataCpuKernel:
             cur_ori_tail_s2_num = 1 if s1g_cache.ori_s2_tail_size != 0 else 0
             cur_ori_normal_s2_num = s1g_cache.ori_s1_g_block - cur_ori_tail_s2_num
             tc = self._type_cost_
-            if (s1g_cache.s1_g_idx == split_info.s1_g_base_num[s1g_cache.b_idx] - 1
-                    and split_info.s1_g_tail_size[s1g_cache.b_idx] != 0):
+            if (
+                s1g_cache.s1_g_idx == split_info.s1_g_base_num[s1g_cache.b_idx] - 1
+                and split_info.s1_g_tail_size[s1g_cache.b_idx] != 0
+            ):
                 s1g_cache.ori_s1_g_cost = (
                     tc[_BlockType.ORI_TAIL_BLOCK][_BlockType.ORI_NORMAL_BLOCK] * cur_ori_normal_s2_num
-                    + tc[_BlockType.ORI_TAIL_BLOCK][_BlockType.ORI_TAIL_BLOCK] * cur_ori_tail_s2_num)
+                    + tc[_BlockType.ORI_TAIL_BLOCK][_BlockType.ORI_TAIL_BLOCK] * cur_ori_tail_s2_num
+                )
                 s1g_cache.ori_s1_g_last_block_cost = (
-                    tc[_BlockType.ORI_TAIL_BLOCK][_BlockType.ORI_TAIL_BLOCK] if cur_ori_tail_s2_num > 0
-                    else tc[_BlockType.ORI_TAIL_BLOCK][_BlockType.ORI_NORMAL_BLOCK])
-                s1g_cache.ori_s1_g_normal_block_cost = (
-                    tc[_BlockType.ORI_TAIL_BLOCK][_BlockType.ORI_NORMAL_BLOCK])
+                    tc[_BlockType.ORI_TAIL_BLOCK][_BlockType.ORI_TAIL_BLOCK]
+                    if cur_ori_tail_s2_num > 0
+                    else tc[_BlockType.ORI_TAIL_BLOCK][_BlockType.ORI_NORMAL_BLOCK]
+                )
+                s1g_cache.ori_s1_g_normal_block_cost = tc[_BlockType.ORI_TAIL_BLOCK][_BlockType.ORI_NORMAL_BLOCK]
             else:
                 s1g_cache.ori_s1_g_cost = (
                     tc[_BlockType.ORI_NORMAL_BLOCK][_BlockType.ORI_NORMAL_BLOCK] * cur_ori_normal_s2_num
-                    + tc[_BlockType.ORI_NORMAL_BLOCK][_BlockType.ORI_TAIL_BLOCK] * cur_ori_tail_s2_num)
+                    + tc[_BlockType.ORI_NORMAL_BLOCK][_BlockType.ORI_TAIL_BLOCK] * cur_ori_tail_s2_num
+                )
                 s1g_cache.ori_s1_g_last_block_cost = (
-                    tc[_BlockType.ORI_NORMAL_BLOCK][_BlockType.ORI_TAIL_BLOCK] if cur_ori_tail_s2_num > 0
-                    else tc[_BlockType.ORI_NORMAL_BLOCK][_BlockType.ORI_NORMAL_BLOCK])
-                s1g_cache.ori_s1_g_normal_block_cost = (
-                    tc[_BlockType.ORI_NORMAL_BLOCK][_BlockType.ORI_NORMAL_BLOCK])
+                    tc[_BlockType.ORI_NORMAL_BLOCK][_BlockType.ORI_TAIL_BLOCK]
+                    if cur_ori_tail_s2_num > 0
+                    else tc[_BlockType.ORI_NORMAL_BLOCK][_BlockType.ORI_NORMAL_BLOCK]
+                )
+                s1g_cache.ori_s1_g_normal_block_cost = tc[_BlockType.ORI_NORMAL_BLOCK][_BlockType.ORI_NORMAL_BLOCK]
 
     def _calc_cmp_s1g_cache(self, s1g_cache, split_info):
         """aicpu.cpp:811-841。"""
@@ -865,33 +946,42 @@ class SparseFlashMlaMetadataCpuKernel:
             cur_cmp_tail_s2_num = 1 if s1g_cache.cmp_s2_tail_size != 0 else 0
             cur_cmp_normal_s2_num = s1g_cache.cmp_s1_g_block - cur_cmp_tail_s2_num
             tc = self._type_cost_
-            if (s1g_cache.s1_g_idx == split_info.s1_g_base_num[s1g_cache.b_idx] - 1
-                    and split_info.s1_g_tail_size[s1g_cache.b_idx] != 0):
+            if (
+                s1g_cache.s1_g_idx == split_info.s1_g_base_num[s1g_cache.b_idx] - 1
+                and split_info.s1_g_tail_size[s1g_cache.b_idx] != 0
+            ):
                 s1g_cache.cmp_s1_g_cost = (
                     tc[_BlockType.CMP_TAIL_BLOCK][_BlockType.CMP_NORMAL_BLOCK] * cur_cmp_normal_s2_num
-                    + tc[_BlockType.CMP_TAIL_BLOCK][_BlockType.CMP_TAIL_BLOCK] * cur_cmp_tail_s2_num)
+                    + tc[_BlockType.CMP_TAIL_BLOCK][_BlockType.CMP_TAIL_BLOCK] * cur_cmp_tail_s2_num
+                )
                 s1g_cache.cmp_s1_g_last_block_cost = (
-                    tc[_BlockType.CMP_TAIL_BLOCK][_BlockType.CMP_TAIL_BLOCK] if cur_cmp_tail_s2_num > 0
-                    else tc[_BlockType.CMP_TAIL_BLOCK][_BlockType.CMP_NORMAL_BLOCK])
-                s1g_cache.cmp_s1_g_normal_block_cost = (
-                    tc[_BlockType.CMP_TAIL_BLOCK][_BlockType.CMP_NORMAL_BLOCK])
+                    tc[_BlockType.CMP_TAIL_BLOCK][_BlockType.CMP_TAIL_BLOCK]
+                    if cur_cmp_tail_s2_num > 0
+                    else tc[_BlockType.CMP_TAIL_BLOCK][_BlockType.CMP_NORMAL_BLOCK]
+                )
+                s1g_cache.cmp_s1_g_normal_block_cost = tc[_BlockType.CMP_TAIL_BLOCK][_BlockType.CMP_NORMAL_BLOCK]
             else:
                 s1g_cache.cmp_s1_g_cost = (
                     tc[_BlockType.CMP_NORMAL_BLOCK][_BlockType.CMP_NORMAL_BLOCK] * cur_cmp_normal_s2_num
-                    + tc[_BlockType.CMP_NORMAL_BLOCK][_BlockType.CMP_TAIL_BLOCK] * cur_cmp_tail_s2_num)
+                    + tc[_BlockType.CMP_NORMAL_BLOCK][_BlockType.CMP_TAIL_BLOCK] * cur_cmp_tail_s2_num
+                )
                 s1g_cache.cmp_s1_g_last_block_cost = (
-                    tc[_BlockType.CMP_NORMAL_BLOCK][_BlockType.CMP_TAIL_BLOCK] if cur_cmp_tail_s2_num > 0
-                    else tc[_BlockType.CMP_NORMAL_BLOCK][_BlockType.CMP_NORMAL_BLOCK])
-                s1g_cache.cmp_s1_g_normal_block_cost = (
-                    tc[_BlockType.CMP_NORMAL_BLOCK][_BlockType.CMP_NORMAL_BLOCK])
+                    tc[_BlockType.CMP_NORMAL_BLOCK][_BlockType.CMP_TAIL_BLOCK]
+                    if cur_cmp_tail_s2_num > 0
+                    else tc[_BlockType.CMP_NORMAL_BLOCK][_BlockType.CMP_NORMAL_BLOCK]
+                )
+                s1g_cache.cmp_s1_g_normal_block_cost = tc[_BlockType.CMP_NORMAL_BLOCK][_BlockType.CMP_NORMAL_BLOCK]
 
     def _calc_ori_block_range(self, ori_s2_token_range, batch_cache, s1g_cache):
         """aicpu.cpp:843-868。"""
         ori_s2_first_token = ori_s2_token_range[0]
         ori_s2_last_token = ori_s2_token_range[1]
         s1g_cache.ori_s2_start = 0
-        if (ori_s2_first_token >= batch_cache.ori_s2_size or ori_s2_last_token < 0
-                or ori_s2_last_token < ori_s2_first_token):
+        if (
+            ori_s2_first_token >= batch_cache.ori_s2_size
+            or ori_s2_last_token < 0
+            or ori_s2_last_token < ori_s2_first_token
+        ):
             s1g_cache.ori_s2_end = 0
             s1g_cache.ori_s2_tail_size = 0
         else:
@@ -903,9 +993,11 @@ class SparseFlashMlaMetadataCpuKernel:
             s1g_cache.act_ori_s2_size = (
                 min(ori_s2_last_token - ori_s2_first_token + 1, ori_topk_size)
                 if self.is_sparse_ori_kv_
-                else ori_s2_last_token - ori_s2_first_token + 1)
-            s1g_cache.ori_s2_end = (0 if s1g_cache.act_ori_s2_size == 0
-                                    else (s1g_cache.act_ori_s2_size - 1) // self.s2_base_size_ + 1)
+                else ori_s2_last_token - ori_s2_first_token + 1
+            )
+            s1g_cache.ori_s2_end = (
+                0 if s1g_cache.act_ori_s2_size == 0 else (s1g_cache.act_ori_s2_size - 1) // self.s2_base_size_ + 1
+            )
             s1g_cache.ori_s2_tail_size = s1g_cache.act_ori_s2_size % self.s2_base_size_
 
     def _calc_cmp_block_range(self, cmp_revert_s2_token_range, batch_cache, s1g_cache):
@@ -913,22 +1005,25 @@ class SparseFlashMlaMetadataCpuKernel:
         cmp_revert_s2_first_token = cmp_revert_s2_token_range[0]
         cmp_revert_s2_last_token = cmp_revert_s2_token_range[1]
         s1g_cache.cmp_s2_start = s1g_cache.ori_s2_end
-        if (cmp_revert_s2_first_token >= batch_cache.cmp_revert_s2_size
-                or cmp_revert_s2_last_token < 0
-                or cmp_revert_s2_last_token < cmp_revert_s2_first_token):
+        if (
+            cmp_revert_s2_first_token >= batch_cache.cmp_revert_s2_size
+            or cmp_revert_s2_last_token < 0
+            or cmp_revert_s2_last_token < cmp_revert_s2_first_token
+        ):
             s1g_cache.cmp_s2_end = s1g_cache.cmp_s2_start
             s1g_cache.cmp_s2_tail_size = 0
         else:
-            cmp_revert_s2_first_token = _clip(cmp_revert_s2_first_token, 0,
-                                              batch_cache.cmp_revert_s2_size - 1)
-            cmp_revert_s2_last_token = _clip(cmp_revert_s2_last_token, 0,
-                                             batch_cache.cmp_revert_s2_size - 1)
+            cmp_revert_s2_first_token = _clip(cmp_revert_s2_first_token, 0, batch_cache.cmp_revert_s2_size - 1)
+            cmp_revert_s2_last_token = _clip(cmp_revert_s2_last_token, 0, batch_cache.cmp_revert_s2_size - 1)
             if (cmp_revert_s2_last_token + 1) // self.cmp_ratio_ == 0:
                 s1g_cache.cmp_s2_end = s1g_cache.cmp_s2_start
                 s1g_cache.cmp_s2_tail_size = 0
                 return
-            cmp_s2_first_token = (0 if (cmp_revert_s2_first_token + 1) // self.cmp_ratio_ == 0
-                                  else (cmp_revert_s2_first_token + 1) // self.cmp_ratio_ - 1)
+            cmp_s2_first_token = (
+                0
+                if (cmp_revert_s2_first_token + 1) // self.cmp_ratio_ == 0
+                else (cmp_revert_s2_first_token + 1) // self.cmp_ratio_ - 1
+            )
             cmp_s2_last_token = (cmp_revert_s2_last_token + 1) // self.cmp_ratio_ - 1
             s1_idx = self.get_s1_idx(batch_cache.s1_size, s1g_cache.s1_g_idx)
             bs_stride = self.get_bs_stride(s1g_cache.b_idx, s1_idx)
@@ -936,10 +1031,13 @@ class SparseFlashMlaMetadataCpuKernel:
             s1g_cache.act_cmp_s2_size = (
                 min(cmp_s2_last_token - cmp_s2_first_token + 1, cmp_topk_size)
                 if self.is_sparse_cmp_kv_
-                else cmp_s2_last_token - cmp_s2_first_token + 1)
-            s1g_cache.cmp_s2_end = (s1g_cache.cmp_s2_start if s1g_cache.act_cmp_s2_size == 0
-                                    else s1g_cache.cmp_s2_start
-                                    + (s1g_cache.act_cmp_s2_size - 1) // self.s2_base_size_ + 1)
+                else cmp_s2_last_token - cmp_s2_first_token + 1
+            )
+            s1g_cache.cmp_s2_end = (
+                s1g_cache.cmp_s2_start
+                if s1g_cache.act_cmp_s2_size == 0
+                else s1g_cache.cmp_s2_start + (s1g_cache.act_cmp_s2_size - 1) // self.s2_base_size_ + 1
+            )
             s1g_cache.cmp_s2_tail_size = s1g_cache.act_cmp_s2_size % self.s2_base_size_
 
     def _gather_ori_and_cmp_cache(self, s1g_cache):
@@ -992,29 +1090,37 @@ class SparseFlashMlaMetadataCpuKernel:
         if self.is_batch_consistency_:
             act_total_s2_size = s1g_cache.act_ori_s2_size + s1g_cache.act_cmp_s2_size
             s1g_cache.reduction_block_size = (
-                (act_total_s2_size // BATCH_CONSISTENCY_MAX_REDUCTION_PARTS
-                 + self.s2_base_size_ - 1) // self.s2_base_size_ * self.s2_base_size_)
-            s1g_cache.reduction_block_size = (self.s2_base_size_
-                                              if s1g_cache.reduction_block_size == 0
-                                              else s1g_cache.reduction_block_size)
-            s1g_cache.ori_s2_end = (0 if s1g_cache.act_ori_s2_size == 0
-                                    else (s1g_cache.act_ori_s2_size - 1)
-                                    // s1g_cache.reduction_block_size + 1)
+                (act_total_s2_size // BATCH_CONSISTENCY_MAX_REDUCTION_PARTS + self.s2_base_size_ - 1)
+                // self.s2_base_size_
+                * self.s2_base_size_
+            )
+            s1g_cache.reduction_block_size = (
+                self.s2_base_size_ if s1g_cache.reduction_block_size == 0 else s1g_cache.reduction_block_size
+            )
+            s1g_cache.ori_s2_end = (
+                0
+                if s1g_cache.act_ori_s2_size == 0
+                else (s1g_cache.act_ori_s2_size - 1) // s1g_cache.reduction_block_size + 1
+            )
             s1g_cache.ori_s2_tail_size = s1g_cache.act_ori_s2_size % s1g_cache.reduction_block_size
-            s1g_cache.cmp_s2_end = (s1g_cache.cmp_s2_start if s1g_cache.act_cmp_s2_size == 0
-                                    else s1g_cache.cmp_s2_start
-                                    + (s1g_cache.act_cmp_s2_size - 1)
-                                    // s1g_cache.reduction_block_size + 1)
+            s1g_cache.cmp_s2_end = (
+                s1g_cache.cmp_s2_start
+                if s1g_cache.act_cmp_s2_size == 0
+                else s1g_cache.cmp_s2_start + (s1g_cache.act_cmp_s2_size - 1) // s1g_cache.reduction_block_size + 1
+            )
             s1g_cache.cmp_s2_tail_size = s1g_cache.act_cmp_s2_size % s1g_cache.reduction_block_size
-        self._calc_cost_table(split_info.s1_g_tail_size[s1g_cache.b_idx],
-                              s1g_cache.reduction_block_size, s1g_cache.ori_s2_tail_size,
-                              s1g_cache.cmp_s2_tail_size)
+        self._calc_cost_table(
+            split_info.s1_g_tail_size[s1g_cache.b_idx],
+            s1g_cache.reduction_block_size,
+            s1g_cache.ori_s2_tail_size,
+            s1g_cache.cmp_s2_tail_size,
+        )
         self._calc_ori_s1g_cache(s1g_cache, split_info)
         self._calc_cmp_s1g_cache(s1g_cache, split_info)
         self._gather_ori_and_cmp_cache(s1g_cache)
-        s1g_cache.s2_loop = (
-            (s1g_cache.act_ori_s2_size + self.s2_base_size_ - 1) // self.s2_base_size_
-            + (s1g_cache.act_cmp_s2_size + self.s2_base_size_ - 1) // self.s2_base_size_)
+        s1g_cache.s2_loop = (s1g_cache.act_ori_s2_size + self.s2_base_size_ - 1) // self.s2_base_size_ + (
+            s1g_cache.act_cmp_s2_size + self.s2_base_size_ - 1
+        ) // self.s2_base_size_
 
     def _calc_batch_cost(self, b_idx, split_context, cost_info):
         """aicpu.cpp:1000-1045。"""
@@ -1089,28 +1195,26 @@ class SparseFlashMlaMetadataCpuKernel:
             update_batch = True
             update_s1g = True
         if update_batch:
-            self._calc_batch_cache(assign_context.cur_b_idx, split_context,
-                                   assign_context.batch_cache)
+            self._calc_batch_cache(assign_context.cur_b_idx, split_context, assign_context.batch_cache)
             assign_context.bn2_cost = cost_info.bn2_cost_of_each_batch[assign_context.cur_b_idx]
             assign_context.bn2_block = cost_info.bn2_block_of_each_batch[assign_context.cur_b_idx]
             assign_context.bn2_s2_loop = cost_info.bn2_s2_loop_of_each_batch[assign_context.cur_b_idx]
         if update_s1g:
-            self._calc_s1g_cache(assign_context.cur_s1g_idx, split_context,
-                                 assign_context.batch_cache, assign_context.s1g_cache)
-            assign_context.cur_s2_idx = (assign_context.s1g_cache.ori_s2_start
-                                         if self.support_fd_ else 0)
+            self._calc_s1g_cache(
+                assign_context.cur_s1g_idx, split_context, assign_context.batch_cache, assign_context.s1g_cache
+            )
+            assign_context.cur_s2_idx = assign_context.s1g_cache.ori_s2_start if self.support_fd_ else 0
 
     def _assign_by_batch(self, split_context, assign_context):
         """aicpu.cpp:1116-1153。"""
         if assign_context.is_finished:
             return
         cost_info = split_context.cost_info
-        while (assign_context.bn2_cost == 0
-               or _is_within_tolerance(
-                   assign_context.core_cache.cost_limit,
-                   cost_info.bn2_last_block_cost_of_each_batch[assign_context.cur_b_idx]
-                   // FA_TOLERANCE_RATIO,
-                   assign_context.core_cache.cost + assign_context.bn2_cost)):
+        while assign_context.bn2_cost == 0 or _is_within_tolerance(
+            assign_context.core_cache.cost_limit,
+            cost_info.bn2_last_block_cost_of_each_batch[assign_context.cur_b_idx] // FA_TOLERANCE_RATIO,
+            assign_context.core_cache.cost + assign_context.bn2_cost,
+        ):
             assign_context.core_cache.cost += assign_context.bn2_cost
             assign_context.core_cache.block += assign_context.bn2_block
             assign_context.core_cache.s2_loop += assign_context.bn2_s2_loop
@@ -1122,14 +1226,14 @@ class SparseFlashMlaMetadataCpuKernel:
                 return
             if assign_context.cur_bn2_idx // self.num_heads_kv_ != assign_context.cur_b_idx:
                 assign_context.cur_b_idx = assign_context.cur_bn2_idx // self.num_heads_kv_
-                self._calc_batch_cache(assign_context.cur_b_idx, split_context,
-                                       assign_context.batch_cache)
+                self._calc_batch_cache(assign_context.cur_b_idx, split_context, assign_context.batch_cache)
             assign_context.bn2_cost = cost_info.bn2_cost_of_each_batch[assign_context.cur_b_idx]
             assign_context.bn2_block = cost_info.bn2_block_of_each_batch[assign_context.cur_b_idx]
             assign_context.bn2_s2_loop = cost_info.bn2_s2_loop_of_each_batch[assign_context.cur_b_idx]
             assign_context.cur_s1g_idx = 0
-            self._calc_s1g_cache(assign_context.cur_s1g_idx, split_context,
-                                 assign_context.batch_cache, assign_context.s1g_cache)
+            self._calc_s1g_cache(
+                assign_context.cur_s1g_idx, split_context, assign_context.batch_cache, assign_context.s1g_cache
+            )
             assign_context.cur_s2_idx = assign_context.s1g_cache.s2_start
 
     def _assign_by_row(self, split_context, assign_context):
@@ -1137,25 +1241,33 @@ class SparseFlashMlaMetadataCpuKernel:
         if assign_context.is_finished:
             return
         while _is_within_tolerance(
-                assign_context.core_cache.cost_limit,
-                assign_context.s1g_cache.s1_g_last_block_cost // FA_TOLERANCE_RATIO,
-                assign_context.core_cache.cost + assign_context.s1g_cache.s1_g_cost):
+            assign_context.core_cache.cost_limit,
+            assign_context.s1g_cache.s1_g_last_block_cost // FA_TOLERANCE_RATIO,
+            assign_context.core_cache.cost + assign_context.s1g_cache.s1_g_cost,
+        ):
             assign_context.core_cache.cost += assign_context.s1g_cache.s1_g_cost
             assign_context.core_cache.block += assign_context.s1g_cache.s1_g_block
             assign_context.core_cache.s2_loop += assign_context.s1g_cache.s2_loop
-            assign_context.bn2_cost = (assign_context.bn2_cost - assign_context.s1g_cache.s1_g_cost
-                                       if assign_context.bn2_cost > assign_context.s1g_cache.s1_g_cost
-                                       else 0)
-            assign_context.bn2_block = (assign_context.bn2_block - assign_context.s1g_cache.s1_g_block
-                                        if assign_context.bn2_block > assign_context.s1g_cache.s1_g_block
-                                        else 0)
-            assign_context.bn2_s2_loop = (assign_context.bn2_s2_loop - assign_context.s1g_cache.s2_loop
-                                          if assign_context.bn2_s2_loop > assign_context.s1g_cache.s2_loop
-                                          else 0)
+            assign_context.bn2_cost = (
+                assign_context.bn2_cost - assign_context.s1g_cache.s1_g_cost
+                if assign_context.bn2_cost > assign_context.s1g_cache.s1_g_cost
+                else 0
+            )
+            assign_context.bn2_block = (
+                assign_context.bn2_block - assign_context.s1g_cache.s1_g_block
+                if assign_context.bn2_block > assign_context.s1g_cache.s1_g_block
+                else 0
+            )
+            assign_context.bn2_s2_loop = (
+                assign_context.bn2_s2_loop - assign_context.s1g_cache.s2_loop
+                if assign_context.bn2_s2_loop > assign_context.s1g_cache.s2_loop
+                else 0
+            )
             while True:
                 assign_context.cur_s1g_idx += 1
-                self._calc_s1g_cache(assign_context.cur_s1g_idx, split_context,
-                                     assign_context.batch_cache, assign_context.s1g_cache)
+                self._calc_s1g_cache(
+                    assign_context.cur_s1g_idx, split_context, assign_context.batch_cache, assign_context.s1g_cache
+                )
                 if assign_context.s1g_cache.s1_g_block != 0:
                     break
             assign_context.cur_s2_idx = assign_context.s1g_cache.s2_start
@@ -1192,9 +1304,11 @@ class SparseFlashMlaMetadataCpuKernel:
             return
         cur_cost = self._calc_cur_block_cost(assign_context)
         cur_s2_loop = self._calc_cur_block_s2_loop(assign_context)
-        while _is_within_tolerance(assign_context.core_cache.cost_limit,
-                                   cur_cost // FA_TOLERANCE_RATIO,
-                                   assign_context.core_cache.cost + cur_cost):
+        while _is_within_tolerance(
+            assign_context.core_cache.cost_limit,
+            cur_cost // FA_TOLERANCE_RATIO,
+            assign_context.core_cache.cost + cur_cost,
+        ):
             assign_context.core_cache.cost += cur_cost
             assign_context.core_cache.block += 1
             assign_context.core_cache.s2_loop += cur_s2_loop
@@ -1203,10 +1317,12 @@ class SparseFlashMlaMetadataCpuKernel:
             assign_context.s1g_cache.s1_g_cost = assign_context.s1g_cache.s1_g_cost - cur_cost
             assign_context.bn2_block = _u32(assign_context.bn2_block - 1)
             assign_context.s1g_cache.s1_g_block = _u32(assign_context.s1g_cache.s1_g_block - 1)
-            assign_context.bn2_s2_loop = (assign_context.bn2_s2_loop - cur_s2_loop
-                                          if assign_context.bn2_s2_loop > cur_s2_loop else 0)
-            assign_context.s1g_cache.s2_loop = (assign_context.s1g_cache.s2_loop - cur_s2_loop
-                                                if assign_context.s1g_cache.s2_loop > cur_s2_loop else 0)
+            assign_context.bn2_s2_loop = (
+                assign_context.bn2_s2_loop - cur_s2_loop if assign_context.bn2_s2_loop > cur_s2_loop else 0
+            )
+            assign_context.s1g_cache.s2_loop = (
+                assign_context.s1g_cache.s2_loop - cur_s2_loop if assign_context.s1g_cache.s2_loop > cur_s2_loop else 0
+            )
             cur_cost = self._calc_cur_block_cost(assign_context)
             cur_s2_loop = self._calc_cur_block_s2_loop(assign_context)
 
@@ -1222,12 +1338,14 @@ class SparseFlashMlaMetadataCpuKernel:
         assign_context.cur_s2_idx += 1
         assign_context.bn2_cost = assign_context.bn2_cost - cur_cost
         assign_context.bn2_block = _u32(assign_context.bn2_block - 1)
-        assign_context.bn2_s2_loop = (assign_context.bn2_s2_loop - cur_s2_loop
-                                      if assign_context.bn2_s2_loop > cur_s2_loop else 0)
+        assign_context.bn2_s2_loop = (
+            assign_context.bn2_s2_loop - cur_s2_loop if assign_context.bn2_s2_loop > cur_s2_loop else 0
+        )
         assign_context.s1g_cache.s1_g_cost = assign_context.s1g_cache.s1_g_cost - cur_cost
         assign_context.s1g_cache.s1_g_block = _u32(assign_context.s1g_cache.s1_g_block - 1)
-        assign_context.s1g_cache.s2_loop = (assign_context.s1g_cache.s2_loop - cur_s2_loop
-                                            if assign_context.s1g_cache.s2_loop > cur_s2_loop else 0)
+        assign_context.s1g_cache.s2_loop = (
+            assign_context.s1g_cache.s2_loop - cur_s2_loop if assign_context.s1g_cache.s2_loop > cur_s2_loop else 0
+        )
         self._update_cursor(split_context, assign_context)
 
     def _is_need_record_fd_info(self, assign_context, split_res):
@@ -1236,8 +1354,10 @@ class SparseFlashMlaMetadataCpuKernel:
             return False
         if assign_context.cur_kv_split_part <= 1:
             return False
-        if (assign_context.cur_bn2_idx == split_res.bn2_end[assign_context.cur_core_idx - 1]
-                and assign_context.cur_s1g_idx == split_res.gs1_end[assign_context.cur_core_idx - 1]):
+        if (  # noqa: SIM103
+            assign_context.cur_bn2_idx == split_res.bn2_end[assign_context.cur_core_idx - 1]
+            and assign_context.cur_s1g_idx == split_res.gs1_end[assign_context.cur_core_idx - 1]
+        ):
             return False
         return True
 
@@ -1247,8 +1367,10 @@ class SparseFlashMlaMetadataCpuKernel:
             return True
         if split_res.s2_end[assign_context.cur_core_idx - 1] == 0:
             return True
-        if (assign_context.cur_bn2_idx != split_res.bn2_end[assign_context.cur_core_idx - 1]
-                or assign_context.cur_s1g_idx != split_res.gs1_end[assign_context.cur_core_idx - 1]):
+        if (  # noqa: SIM103
+            assign_context.cur_bn2_idx != split_res.bn2_end[assign_context.cur_core_idx - 1]
+            or assign_context.cur_s1g_idx != split_res.gs1_end[assign_context.cur_core_idx - 1]
+        ):
             return True
         return False
 
@@ -1261,7 +1383,8 @@ class SparseFlashMlaMetadataCpuKernel:
         cur_fd_s1g_size = (
             s1_size * self.group_size_ - split_s1g_idx * self.m_base_size_
             if split_s1g_idx == split_info.s1_g_base_num[split_b_idx] - 1
-            else self.m_base_size_)
+            else self.m_base_size_
+        )
         result.max_s2_split_num = max(result.max_s2_split_num, assign_context.cur_kv_split_part)
         result.fd_res.fd_bn2_idx[result.num_of_fd_head] = result.bn2_end[assign_context.cur_core_idx - 1]
         result.fd_res.fd_m_idx[result.num_of_fd_head] = result.gs1_end[assign_context.cur_core_idx - 1]
@@ -1274,9 +1397,9 @@ class SparseFlashMlaMetadataCpuKernel:
         """aicpu.cpp:1342-1397。"""
         cost_info = split_context.cost_info
         result.first_fd_data_workspace_idx[assign_context.cur_core_idx] = (
-            assign_context.pre_fd_data_num + assign_context.cur_kv_split_part - 1)
-        avg_cost = _i64_div(assign_context.unassigned_cost,
-                            self.aic_core_num_ - assign_context.cur_core_idx)
+            assign_context.pre_fd_data_num + assign_context.cur_kv_split_part - 1
+        )
+        avg_cost = _i64_div(assign_context.unassigned_cost, self.aic_core_num_ - assign_context.cur_core_idx)
         assign_context.core_cache = _CoreCache()
         if not self.support_fd_:
             assign_context.core_cache.cost_limit = max(avg_cost, cost_info.max_s1g_cost)
@@ -1299,15 +1422,17 @@ class SparseFlashMlaMetadataCpuKernel:
             self._record_fd_info(split_context, assign_context, result)
             assign_context.pre_fd_data_num += assign_context.cur_kv_split_part
             assign_context.cur_kv_split_part = 1
-        if (assign_context.cur_s2_idx > assign_context.s1g_cache.s2_start
-                and assign_context.cur_s2_idx <= assign_context.s1g_cache.s2_end):
+        if (
+            assign_context.cur_s2_idx > assign_context.s1g_cache.s2_start
+            and assign_context.cur_s2_idx <= assign_context.s1g_cache.s2_end
+        ):
             if self.is_batch_consistency_:
                 if self._is_first_reduction_block(assign_context, result):
                     assign_context.cur_kv_split_part += 1
                 else:
                     assign_context.cur_kv_split_part += (
-                        result.s2_end[assign_context.cur_core_idx]
-                        - result.s2_end[assign_context.cur_core_idx - 1])
+                        result.s2_end[assign_context.cur_core_idx] - result.s2_end[assign_context.cur_core_idx - 1]
+                    )
                 self.remained_block_num_ = assign_context.s1g_cache.s1_g_block
             else:
                 assign_context.cur_kv_split_part += 1
@@ -1326,10 +1451,10 @@ class SparseFlashMlaMetadataCpuKernel:
         assign_context.bn2_cost = cost_info.bn2_cost_of_each_batch[assign_context.cur_b_idx]
         assign_context.bn2_block = cost_info.bn2_block_of_each_batch[assign_context.cur_b_idx]
         assign_context.bn2_s2_loop = cost_info.bn2_s2_loop_of_each_batch[assign_context.cur_b_idx]
-        self._calc_batch_cache(assign_context.cur_b_idx, split_context,
-                               assign_context.batch_cache)
-        self._calc_s1g_cache(assign_context.cur_s1g_idx, split_context,
-                             assign_context.batch_cache, assign_context.s1g_cache)
+        self._calc_batch_cache(assign_context.cur_b_idx, split_context, assign_context.batch_cache)
+        self._calc_s1g_cache(
+            assign_context.cur_s1g_idx, split_context, assign_context.batch_cache, assign_context.s1g_cache
+        )
         assign_context.cur_s2_idx = assign_context.s1g_cache.s2_start
         for i in range(self.aic_core_num_):
             if result.max_cost > cost_limit:
@@ -1355,8 +1480,7 @@ class SparseFlashMlaMetadataCpuKernel:
                 split_res.fd_res.fd_m_num[cur_core_index] = split_res.fd_res.fd_m_size[i]
                 cur_core_index += 1
                 continue
-            cur_fd_vector_num = (split_res.fd_res.fd_s2_split_num[i]
-                                 * split_res.fd_res.fd_m_size[i]) // average_load
+            cur_fd_vector_num = (split_res.fd_res.fd_s2_split_num[i] * split_res.fd_res.fd_m_size[i]) // average_load
             cur_fd_vector_num = max(1, cur_fd_vector_num)
             cur_ave_m_size = (split_res.fd_res.fd_m_size[i] + cur_fd_vector_num - 1) // cur_fd_vector_num
             cur_fd_vector_num = (split_res.fd_res.fd_m_size[i] + cur_ave_m_size - 1) // cur_ave_m_size
@@ -1365,8 +1489,10 @@ class SparseFlashMlaMetadataCpuKernel:
                 split_res.fd_res.fd_idx[cur_core_index] = i
                 split_res.fd_res.fd_m_start[cur_core_index] = vid * cur_ave_m_size
                 split_res.fd_res.fd_m_num[cur_core_index] = (
-                    cur_ave_m_size if vid < cur_fd_vector_num - 1
-                    else split_res.fd_res.fd_m_size[i] - vid * cur_ave_m_size)
+                    cur_ave_m_size
+                    if vid < cur_fd_vector_num - 1
+                    else split_res.fd_res.fd_m_size[i] - vid * cur_ave_m_size
+                )
                 cur_core_index += 1
             empty_vector_num -= cur_fd_vector_num - 1
         split_res.fd_res.fd_used_vec_num = cur_core_index
@@ -1449,10 +1575,8 @@ class SparseFlashMlaMetadataCpuKernel:
                 fa(2 * i + 1, FA_BN2_END_INDEX, split_res.bn2_end[i])
                 fa(2 * i + 1, FA_M_END_INDEX, split_res.gs1_end[i])
                 fa(2 * i + 1, FA_S2_END_INDEX, split_res.s2_end[i])
-                fa(2 * i, FA_FIRST_FD_DATA_WORKSPACE_IDX_INDEX,
-                   split_res.first_fd_data_workspace_idx[i])
-                fa(2 * i + 1, FA_FIRST_FD_DATA_WORKSPACE_IDX_INDEX,
-                   split_res.first_fd_data_workspace_idx[i])
+                fa(2 * i, FA_FIRST_FD_DATA_WORKSPACE_IDX_INDEX, split_res.first_fd_data_workspace_idx[i])
+                fa(2 * i + 1, FA_FIRST_FD_DATA_WORKSPACE_IDX_INDEX, split_res.first_fd_data_workspace_idx[i])
         else:
             for i in range(self.aic_core_num_):
                 if i >= split_res.used_core_num:
@@ -1465,8 +1589,7 @@ class SparseFlashMlaMetadataCpuKernel:
                 fa(i, FA_BN2_END_INDEX, split_res.bn2_end[i])
                 fa(i, FA_M_END_INDEX, split_res.gs1_end[i])
                 fa(i, FA_S2_END_INDEX, split_res.s2_end[i])
-                fa(i, FA_FIRST_FD_DATA_WORKSPACE_IDX_INDEX,
-                   split_res.first_fd_data_workspace_idx[i])
+                fa(i, FA_FIRST_FD_DATA_WORKSPACE_IDX_INDEX, split_res.first_fd_data_workspace_idx[i])
         for i in range(self.aiv_core_num_):
             if i >= split_res.fd_res.fd_used_vec_num:
                 fd(i, FD_CORE_ENABLE_INDEX, 0)
@@ -1528,6 +1651,7 @@ def _as_i32_list(tensor):
     if isinstance(tensor, tuple) and len(tensor) == 2:
         return tensor
     import torch
+
     if isinstance(tensor, torch.Tensor):
         data = tensor.detach().cpu().to(torch.int32).flatten().tolist()
         return (data, tuple(tensor.shape))
@@ -1545,6 +1669,7 @@ def _resolve_device_core_nums(aic_core_num=None, aiv_core_num=None, device=None)
     if aic_core_num is not None and aiv_core_num is not None:
         return int(aic_core_num), int(aiv_core_num)
     import torch
+
     if device is None:
         device = torch.npu.current_device()
     props = torch.npu.get_device_properties(device)
@@ -1562,6 +1687,7 @@ def _resolve_device_core_nums(aic_core_num=None, aiv_core_num=None, device=None)
 def _get_cube_core_num(device=None):
     """Return the cube-core count of the active NPU (same source as the consumer)."""
     import torch
+
     return int(torch.npu.get_device_properties(device).cube_core_num)
 
 
@@ -1637,8 +1763,8 @@ def _get_compiled_metadata():
         if _METADATA_COMPILED is None:
             _METADATA_DIRECTORY = tempfile.TemporaryDirectory(prefix="mqsmla_metadata_aicpu_")
             _METADATA_COMPILED = compile_aicpu_kernel(
-                _mqsmla_metadata_kernel, workdir=_METADATA_DIRECTORY.name,
-                launch_mode="interface")
+                _mqsmla_metadata_kernel, workdir=_METADATA_DIRECTORY.name, launch_mode="interface"
+            )
         return _METADATA_COMPILED
 
 
@@ -1674,11 +1800,14 @@ def mixed_quant_sparse_flash_mla_metadata(
     """
     import torch
 
-    for name, value in (("ori_topk_length", ori_topk_length),
-                        ("cmp_topk_length", cmp_topk_length)):
-        if (not isinstance(value, torch.Tensor) or value.dtype != torch.int32
-                or value.dim() != 2 or value.shape[1] != num_heads_kv
-                or value.shape[0] <= 0):
+    for name, value in (("ori_topk_length", ori_topk_length), ("cmp_topk_length", cmp_topk_length)):
+        if (
+            not isinstance(value, torch.Tensor)
+            or value.dtype != torch.int32
+            or value.dim() != 2
+            or value.shape[1] != num_heads_kv
+            or value.shape[0] <= 0
+        ):
             raise ValueError(f"{name} must be an int32 tensor of shape [T1, N2]")
         if not value.is_contiguous():
             raise ValueError(f"{name} must be contiguous (flat AICPU indexing)")
@@ -1703,8 +1832,7 @@ def mixed_quant_sparse_flash_mla_metadata(
         cu_q = torch.tensor([0, rows], dtype=torch.int32, device=device)
     else:
         cu_q = cu_seqlens_q
-        if (cu_q.dtype != torch.int32 or cu_q.dim() != 1 or cu_q.numel() < 2
-                or cu_q.device != device):
+        if cu_q.dtype != torch.int32 or cu_q.dim() != 1 or cu_q.numel() < 2 or cu_q.device != device:
             raise ValueError("cu_seqlens_q must be a 1-D int32 tensor on the same device")
         if not cu_q.is_contiguous():
             raise ValueError("cu_seqlens_q must be contiguous")
@@ -1713,8 +1841,12 @@ def mixed_quant_sparse_flash_mla_metadata(
     compiled = _get_compiled_metadata()
     with torch.npu.device(device):
         metadata = torch.empty(MQSMLA_METADATA_TOTAL_SIZE, dtype=torch.int32, device=device)
-        compiled.launch(current_raw_stream(device.index),
-                        metadata=metadata.data_ptr(),
-                        cu_q=cu_q.data_ptr(),
-                        rows=rows, blocks=blocks, batch=batch)
+        compiled.launch(
+            current_raw_stream(device.index),
+            metadata=metadata.data_ptr(),
+            cu_q=cu_q.data_ptr(),
+            rows=rows,
+            blocks=blocks,
+            batch=batch,
+        )
     return metadata

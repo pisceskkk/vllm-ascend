@@ -1,23 +1,47 @@
-# DeepSeek V4.1 A5 PythonDSL sources
+# DSV4.1 PythonDSL operators
 
-These six files are copied without functional edits from the 2026-09-23
-operator delivery used for the A5 QLI, QSLI, and MQSMLA integration:
+Import `vllm_ascend.ops.pythondsl.ops` to register these PyTorch operators:
 
-- `mixed_quant_sparse_flash_mla.py`, `quant_lightning_indexer_dsl.py`, and
-  `quant_sparse_lightning_indexer_dsl.py` come from
-  `cannbot_arena_net_ops-0.1.0-cp311-cp311-linux_aarch64.whl`.
-- `mixed_quant_sparse_flash_mla_metadata.py`,
-  `quant_lightning_indexer_metadata_dsl.py` and
-  `quant_sparse_lightning_indexer_metadata_dsl.py` come from the matching
-  installed 0923 CANN transformer payload.
+- `vllm_ascend::mixed_quant_sparse_flash_mla` and its metadata operator.
+- `vllm_ascend::quant_lightning_indexer` and its metadata operator.
+- `vllm_ascend::quant_sparse_lightning_indexer` and its metadata operator.
 
-The transformer wrappers still provide the Torch operator schemas.  For the
-near-term A5 test, the package loader defaults to the installed arena net-ops
-wheel and `CANNBOTDSL_NATIVE_BINARY_MODE=prefer`.  These copies remain in the
-repository for a later source-only experiment: set
-`DSV41_A5_DSL_SOURCE=local` and `CANNBOTDSL_NATIVE_BINARY_MODE=off` to select
-them explicitly.  The source-only path was validated separately but is not
-the default in the `vllm_0300` image.
+The implementations are the in-tree PythonDSL sources from the 2026-09-23
+DSV4.1 delivery. They require the compatible `cannbotdsl` compiler/runtime
+and an Ascend A5 toolchain. Neither `cannbot-arena-net-ops` nor
+`cann_ops_transformer` is imported. Registration and FakeTensor execution do
+not import the compiler; the first real call compiles the kernel during warmup.
+No exported wheel binaries or alternate operator namespaces are used.
 
-Before changing these copies, compare against the operator team's delivery
-and preserve its licensing terms.
+The imported CANN sources retain their source notices. The CANN Open Software
+License Agreement Version 2.0 text is included in [LICENSE](LICENSE), copied
+from the source `cann-recipes-infer/ops/LICENSE`; references to that agreement
+refer to this local copy rather than the repository's top-level Apache license.
+
+QLI and QSLI consume packed E2M1 data with E8M0 scales. QSLI's paged cache
+contains eight key rows followed by eight scale rows in each 544-byte group.
+Mixed attention consumes the separate 544-byte MXFP8/BF16-scale and 320-byte
+MXFP4/BF16-scale cache rows. All three metadata operators return INT32[1024].
+Supply device prefix sums, sequence lengths, and metadata explicitly in model
+execution; optional sequence defaults are for standalone use.
+
+The indexers use `min(32, device Cube core count)` workers for both metadata
+scheduling and kernel launch. The limit of 32 is the workspace/tuning capacity,
+not a device assumption: a 32-core A5 keeps 32 workers, and a 28-core A5 uses 28.
+The fused LD merge contains a global barrier, so every launched worker must fit
+in one resident wave. Device properties are cached on the host during warmup;
+choosing the worker count does not read a device tensor or synchronize a stream.
+
+The source kernels retain their compiler allocation and synchronization order.
+Some DSL buffer declarations intentionally have no subsequent Python reference;
+the AICPU `zeros` expression is a compiler intrinsic. Local lint annotations
+preserve those statements. The attention kernel also retains the delivery's
+FP4 cast lowering shim required by the compatible compiler. Native-wheel export
+registration and profiling switches are omitted; address vectorization retains
+its default enabled state and shape-based fallback.
+
+Numerical tests are in `tests/e2e/nightly/single_node/ops/singlecard_ops/`:
+`test_dsv41_triton.py` covers metadata, quantization, cache writes and folding;
+`test_dsv41_dsl.py` runs the registered operators, metadata-to-indexer and
+writer-to-attention paths, independent numerical references, and attention
+graph replay. These require an A5 and the freshly built native cache writer.

@@ -6,8 +6,6 @@ from __future__ import annotations
 
 import torch
 
-from vllm_ascend.ops.project_ops import get_project_op
-
 
 def apply_partial_rotary_inplace(
     x: torch.Tensor,
@@ -23,7 +21,7 @@ def apply_partial_rotary_inplace(
         work = work.unsqueeze(-2)
     if work.ndim == 3:
         work = work.unsqueeze(1)
-    get_project_op("inplace_partial_rotary_mul")(
+    torch.ops._C_ascend.inplace_partial_rotary_mul(
         work,
         cos,
         -sin if inverse else sin,

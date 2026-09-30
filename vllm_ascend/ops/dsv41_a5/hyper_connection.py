@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Qualified A5 mHC operator adapters."""
+"""A5 mHC operator adapters."""
 
 from __future__ import annotations
 
 import torch
-
-from vllm_ascend.ops.project_ops import get_project_op
 
 
 def hc_pre(
@@ -21,9 +19,7 @@ def hc_pre(
     norm_eps: float,
     hc_eps: float,
 ):
-    import custom_ops  # noqa: F401, PLC0415  # Registers torch.ops.custom.*.
-
-    return torch.ops.custom.npu_hc_pre_v2(
+    return torch.ops._C_ascend.npu_hc_pre_v3(
         x,
         hc_fn,
         hc_scale,
@@ -42,7 +38,7 @@ def hc_post(
     post: torch.Tensor,
     comb: torch.Tensor,
 ) -> torch.Tensor:
-    return get_project_op("npu_hc_post")(
+    return torch.ops._C_ascend.npu_hc_post(
         x.unsqueeze(0),
         residual.unsqueeze(0),
         post.unsqueeze(0),

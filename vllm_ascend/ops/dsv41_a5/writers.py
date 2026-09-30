@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Qualified A5 cache writers."""
+"""A5 cache writers."""
 
 from __future__ import annotations
 
@@ -18,8 +18,6 @@ def write_attention_cache(
     *,
     kind: str,
 ) -> None:
-    import custom_ops  # noqa: F401, PLC0415  # Registers torch.ops.custom.*.
-
     if kind == "cmp":
         cache_arg = cache
         group_size = 16
@@ -30,7 +28,7 @@ def write_attention_cache(
         quant_mode = "mxfp8_bf16"
     else:
         raise ValueError(f"unsupported A5 cache kind: {kind}")
-    torch.ops.custom.kv_compress_epilog_v2(
+    torch.ops._C_ascend.kv_compress_epilog_v2(
         cache_arg,
         values.contiguous(),
         flat_slots.contiguous(),

@@ -24,97 +24,10 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.ops.fused_moe.router.grouped_topk_router import AscendGroupedTopKRouter
+from vllm_ascend.utils import load_custom_op_library
 
 DEEPSEEK_V4_IMAGE_SENTINEL_BASE_ID = 129257
 DEEPSEEK_V4_IMAGE_SENTINEL_COUNT = 5
-
-
-def select_deepseek_v4_vision_experts_packaged(
-    router_logits: torch.Tensor,
-    input_ids: torch.Tensor,
-    tid2eid: torch.Tensor | None,
-    bias_vl: torch.Tensor,
-    text_bias: torch.Tensor | None,
-    top_k: int,
-    renormalize: bool,
-    routed_scaling_factor: float = 1.0,
-    image_sentinel_lo: int = DEEPSEEK_V4_IMAGE_SENTINEL_BASE_ID,
-    k_group: int = 1,
-    group_count: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """A5 wheel ABI: mask image rows, then merge dynamic and hash routes."""
-    if not renormalize:
-        raise ValueError("custom npu_moe_gating_top_k always normalizes sqrt-softplus weights")
-    import custom_ops  # noqa: F401, PLC0415  # Registers torch.ops.custom.*.
-
-    image_hi = image_sentinel_lo + DEEPSEEK_V4_IMAGE_SENTINEL_COUNT
-    image_mask = (input_ids >= image_sentinel_lo) & (input_ids < image_hi)
-    common = dict(
-        k_group=k_group,
-        group_count=group_count,
-        routed_scaling_factor=routed_scaling_factor,
-        eps=1e-20,
-        group_select_mode=1,
-        renorm=0,
-        norm_type=2,
-        out_flag=False,
-    )
-    dynamic_weights, dynamic_ids, _ = torch.ops.custom.npu_moe_gating_top_k(
-        router_logits,
-        top_k,
-        bias=text_bias,
-        additional_bias=bias_vl,
-        additional_token_mask=image_mask,
-        **common,
-    )
-    if tid2eid is None:
-        return dynamic_weights, dynamic_ids
-
-    hash_weights, hash_ids, _ = torch.ops.custom.npu_moe_gating_top_k(
-        router_logits,
-        top_k,
-        bias=text_bias,
-        input_ids=input_ids,
-        tid2eid=tid2eid,
-        additional_bias=bias_vl,
-        additional_token_mask=image_mask,
-        **common,
-    )
-    return (
-        torch.where(image_mask.unsqueeze(-1), dynamic_weights, hash_weights),
-        torch.where(image_mask.unsqueeze(-1), dynamic_ids, hash_ids),
-    )
-
-
-def select_deepseek_v4_hash_experts_packaged(
-    router_logits: torch.Tensor,
-    input_ids: torch.Tensor | None,
-    tid2eid: torch.Tensor | None,
-    text_bias: torch.Tensor | None,
-    top_k: int,
-    routed_scaling_factor: float = 1.0,
-    k_group: int = 1,
-    group_count: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Use the installed A5 custom_ops wheel for text-only/hash routing."""
-    import custom_ops  # noqa: F401, PLC0415  # Registers torch.ops.custom.*.
-
-    topk_weights, topk_ids, _ = torch.ops.custom.npu_moe_gating_top_k(
-        router_logits,
-        top_k,
-        bias=text_bias,
-        input_ids=input_ids,
-        tid2eid=tid2eid,
-        k_group=k_group,
-        group_count=group_count,
-        routed_scaling_factor=routed_scaling_factor,
-        eps=1e-20,
-        group_select_mode=1,
-        renorm=0,
-        norm_type=2,
-        out_flag=False,
-    )
-    return topk_weights, topk_ids
 
 
 def select_deepseek_v4_vision_experts(
@@ -135,6 +48,8 @@ def select_deepseek_v4_vision_experts(
     ``tid2eid`` lookup used by the text-only model, while image rows use the
     checkpoint's ``bias_vl`` with the sqrt-softplus router scores.
     """
+    # Native routing performs this normalization inside the operator.
+    input_ids = torch.where(input_ids == -1, 0, input_ids)
     scores = torch.nn.functional.softplus(router_logits).sqrt()
     image_hi = image_sentinel_lo + DEEPSEEK_V4_IMAGE_SENTINEL_COUNT
     image_mask = (input_ids >= image_sentinel_lo) & (input_ids < image_hi)
@@ -206,6 +121,15 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
         self.tid2eid = tid2eid
         self.bias_vl = bias_vl
         self.image_sentinel_lo = image_sentinel_lo
+        profile = get_current_hardware_profile()
+        if (
+            scoring_func == "sqrtsoftplus"
+            and profile.supports(HardwareCapability.MOE_GATING_TOP_K_HASH_VISION)
+            and not profile.supports(HardwareCapability.RUNTIME_CUSTOM_OPS)
+        ):
+            # A5 skips the worker's global custom-op loader. V4 routers also
+            # need this native op without constructing a V4.1 backend first.
+            load_custom_op_library()
 
     def is_fused_supported(
         self,
@@ -245,14 +169,10 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
         num_expert_group = self.num_expert_group if self.num_expert_group is not None else 1
         renorm = int(self.renormalize)
         if self.scoring_func == "sqrtsoftplus":
-            packaged_a5 = get_current_hardware_profile().supports(HardwareCapability.MOE_GATING_TOP_K_PACKAGED_A5)
             if self.tid2eid is not None or self.bias_vl is not None:
                 if input_ids is None:
                     raise ValueError("DeepSeek V4 vision/hash MoE routing requires input_ids.")
-                # Packaged A5 vision-only routing needs IDs only for its
-                # external mask. Other paths retain the int64 ID ABI.
-                if self.tid2eid is not None or not packaged_a5:
-                    input_ids = input_ids.to(torch.int64)
+                input_ids = input_ids.to(torch.int64)
                 tid2eid_ones = self.tid2eid.to(torch.int32) if self.tid2eid is not None else None
                 if _EXTRA_CTX.moe_comm_type == MoECommType.ALLGATHER:
                     prepare_finalize = _EXTRA_CTX.moe_comm_method.prepare_finalize
@@ -265,31 +185,9 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                     # ids. Apply the identical TP chunk only when communication
                     # has not already aligned ids with local router rows.
                     input_ids = sequence_parallel_chunk(input_ids.reshape(-1, 1)).reshape(-1)
-                input_ids = torch.where(input_ids == -1, 0, input_ids)
             else:
                 input_ids = None
                 tid2eid_ones = None
-            if packaged_a5:
-                bias_vl = self.bias_vl
-                if bias_vl is not None and bias_vl.dtype != router_logits.dtype:
-                    bias_vl = bias_vl.to(router_logits.dtype)
-                text_bias = self.e_score_correction_bias
-                if text_bias is not None and text_bias.dtype != router_logits.dtype:
-                    text_bias = text_bias.to(router_logits.dtype)
-                if bias_vl is None:
-                    topk_weights, topk_ids = select_deepseek_v4_hash_experts_packaged(
-                        router_logits, input_ids, tid2eid_ones, text_bias, self.top_k,
-                        self.routed_scaling_factor, topk_group, num_expert_group,
-                    )
-                else:
-                    topk_weights, topk_ids = select_deepseek_v4_vision_experts_packaged(
-                        router_logits, input_ids, tid2eid_ones, bias_vl, text_bias,
-                        self.top_k, self.renormalize, self.routed_scaling_factor,
-                        self.image_sentinel_lo, topk_group, num_expert_group,
-                    )
-                return topk_weights.to(torch.float32), topk_ids.to(
-                    torch.int32 if indices_type is None else indices_type
-                )
             fused_vision_hash = self.bias_vl is not None and get_current_hardware_profile().supports(
                 HardwareCapability.MOE_GATING_TOP_K_HASH_VISION
             )
