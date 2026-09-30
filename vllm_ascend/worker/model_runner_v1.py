@@ -3322,21 +3322,46 @@ class NPUModelRunner(GPUModelRunner):
         prepare_engram = getattr(self.model, "prepare_engram_inputs", None)
         engram_overlap_stream = None
         if prepare_engram is not None:
+            overlap_enabled = (
+                get_ascend_config().multistream_engram_overlap
+                and (
+                    forward_context.cudagraph_runtime_mode == CUDAGraphMode.NONE
+                    and self.model.engram_multistream_supported
+                    or forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+                    and self.model.engram_graph_multistream_supported
+                )
+            )
+            full_graph_overlap = overlap_enabled and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
             capturing = (
                 getattr(self, "_engram_capture_active", False)
                 or getattr(forward_context, "capturing", False)
                 or torch.npu.is_current_stream_capturing()
             )
             if capturing:
-                model_inputs.update(self.model.prepare_engram_graph_inputs(num_tokens_padded))
-            elif (
-                get_ascend_config().multistream_engram_overlap
-                and forward_context.cudagraph_runtime_mode == CUDAGraphMode.NONE
-                and self.model.engram_multistream_supported
-            ):
-                # Hashing and local row fetch do not read hidden states. Keep
-                # TP collectives on the model stream at each layer entrance.
+                if full_graph_overlap:
+                    model_inputs.update(
+                        self.model.prepare_engram_overlap_graph_inputs(
+                            num_tokens_padded, forward_context.batch_descriptor, prime=True
+                        )
+                    )
+                else:
+                    model_inputs.update(self.model.prepare_engram_graph_inputs(num_tokens_padded))
+            elif overlap_enabled:
+                # Hash/row fetch do not read hidden states. Local-table TP
+                # gathers stay at the consumer. For sharded DP with TP1, the
+                # Engram DP exchanges run here on their own communicator;
+                # graph MoE collectives use the separate EP communicator.
                 main_stream = torch.npu.current_stream()
+                # Allocate fixed buffers before switching streams. External
+                # events bind the graph's wait/reset tasks to this producer;
+                # ordinary eager events must not be captured as graph inputs.
+                graph_inputs = (
+                    self.model.prepare_engram_overlap_graph_inputs(
+                        num_tokens_padded, forward_context.batch_descriptor
+                    )
+                    if full_graph_overlap
+                    else None
+                )
                 engram_overlap_stream = getattr(self, "_engram_overlap_stream", None)
                 if engram_overlap_stream is None:
                     engram_overlap_stream = torch.npu.Stream(device=input_ids.device)
@@ -3351,12 +3376,18 @@ class NPUModelRunner(GPUModelRunner):
                         tensor.record_stream(engram_overlap_stream)
                 try:
                     with torch.npu.stream(engram_overlap_stream):
+                        prepare_overlap = (
+                            self.model.prepare_engram_graph_overlap_inputs
+                            if full_graph_overlap else self.model.prepare_engram_local_inputs
+                        )
                         model_inputs.update(
-                            self.model.prepare_engram_local_inputs(
+                            prepare_overlap(
                                 input_ids,
                                 positions,
                                 lookback,
                                 **device_inputs,
+                                graph_inputs=graph_inputs,
+                                padded_tokens=num_tokens_padded,
                             )
                         )
                 except Exception:

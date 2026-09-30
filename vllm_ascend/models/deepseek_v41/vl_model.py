@@ -235,6 +235,16 @@ class AscendDeepseekV41ForCausalLM(
     def engram_multistream_supported(self) -> bool:
         return self.language_model.engram_multistream_supported
 
+    @property
+    def engram_graph_multistream_supported(self) -> bool:
+        return self.language_model.engram_graph_multistream_supported
+
+    def prepare_engram_overlap_graph_inputs(self, padded_tokens, batch_descriptor, *, prime=False):
+        return self.language_model.prepare_engram_overlap_graph_inputs(padded_tokens, batch_descriptor, prime=prime)
+
+    def prepare_engram_graph_overlap_inputs(self, *args, **kwargs):
+        return self.language_model.prepare_engram_graph_overlap_inputs(*args, **kwargs)
+
     def prepare_engram_local_inputs(
         self,
         input_ids,
@@ -243,6 +253,9 @@ class AscendDeepseekV41ForCausalLM(
         query_start_loc=None,
         slot_mapping=None,
         block_table=None,
+        *,
+        graph_inputs=None,
+        padded_tokens=None,
     ):
         return self.language_model.prepare_engram_local_inputs(
             input_ids,
@@ -251,6 +264,8 @@ class AscendDeepseekV41ForCausalLM(
             query_start_loc,
             slot_mapping,
             block_table,
+            graph_inputs=graph_inputs,
+            padded_tokens=padded_tokens,
         )
 
     @property

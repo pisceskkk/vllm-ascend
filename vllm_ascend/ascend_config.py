@@ -484,6 +484,8 @@ class AscendConfig:
     # ---- user-input switches: bool/int/list/str, auto type validation ----
     enable_cpu_binding: bool = True
     multistream_dsv4_dsa_overlap: bool = True
+    # Engram hash/lookup overlap for eager local tables and FULL graphs.
+    # Sharded DP graph overlap also supports TP1; DP+TP remains synchronous.
     multistream_engram_overlap: bool = False
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False

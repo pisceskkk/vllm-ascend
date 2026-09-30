@@ -87,6 +87,7 @@ from .engram.embedding import (
     AscendParallelEngramEmbedding,
     preflight_engram_checkpoint,
 )
+from .engram.graph_inputs import EngramGraphInputs, wait_engram_event
 from .engram.layer import AscendEngram
 from .engram.parallel import gather_engram_hashes, get_engram_dp_size
 from .indexer import DeepseekV41Indexer
@@ -1048,6 +1049,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                 self.layers[layer_id].engram.embed_tokens = embed
         self.engram_hash = None
         self._engram_input_buffers = None
+        self._engram_local_graph_inputs = None
         self._engram_max_tokens = max(
             vllm_config.scheduler_config.max_num_batched_tokens,
             vllm_config.compilation_config.max_cudagraph_capture_size or 0,
@@ -1087,6 +1089,10 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         local_only=False,
         mask_ready_event=None,
         ready_events=None,
+        local_output_buffers=None,
+        full_output_buffers=None,
+        mask_output_buffer=None,
+        padded_tokens=None,
     ):
         """Hash on device with upstream NgramHashState, then look up head shards.
 
@@ -1125,6 +1131,14 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         )
         hashes = None
         mask = torch.empty(0, dtype=torch.bool, device=device)
+
+        def publish_mask():
+            if mask_output_buffer is not None:
+                mask_output_buffer[: mask.numel()].copy_(mask)
+                mask_output_buffer[mask.numel() : padded_tokens].zero_()
+            if mask_ready_event is not None:
+                mask_ready_event.record(torch.npu.current_stream())
+
         if hashing:
             assert hash_state is not None
             image_token_id = config.image_token_id
@@ -1133,8 +1147,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             # The mask is independent of the hash and table lookups. Let the
             # main stream use it while the auxiliary stream continues routing.
             mask = ~dead
-            if mask_ready_event is not None:
-                mask_ready_event.record(torch.npu.current_stream())
+            publish_mask()
             if lookback_token_ids is None:
                 lookback_token_ids = input_ids.new_full((query_start_loc.numel() - 1, hash_state.lookback_depth), -1)
             hashes = hash_state(
@@ -1150,10 +1163,9 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         elif participates:
             assert hash_state is not None
             hashes, mask = hash_state.dummy_hashes(input_ids)
-            if mask_ready_event is not None:
-                mask_ready_event.record(torch.npu.current_stream())
-        elif mask_ready_event is not None:
-            mask_ready_event.record(torch.npu.current_stream())
+            publish_mask()
+        else:
+            publish_mask()
         lookups = {}
         tables = [self.layers[layer_id].engram.embed_tokens for layer_id in config.engram_layer_ids]
         if participates:
@@ -1162,29 +1174,54 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             gathered = gather_engram_hashes(hashes, dp_shared_memory=self.engram_dp_shared_memory)
             for slot, (layer_id, table) in enumerate(zip(config.engram_layer_ids, tables)):
                 if local_only:
-                    lookups[layer_id] = table.embed_local_rows(gathered[:, slot])
+                    if local_output_buffers is None:
+                        lookups[layer_id] = table.embed_local_rows(gathered[:, slot])
+                    else:
+                        buffer = local_output_buffers[layer_id]
+                        rows = gathered.shape[0]
+                        table.lookup(gathered[:, slot].contiguous(), buffer[:rows])
+                        buffer[rows:padded_tokens].zero_()
+                        lookups[layer_id] = buffer
                 else:
                     lookups[layer_id] = table.embed_gathered(gathered[:, slot], hashes.shape[0]).flatten(1)
+                    if full_output_buffers is not None:
+                        values = lookups[layer_id]
+                        buffer = full_output_buffers[layer_id]
+                        buffer[: values.shape[0]].copy_(values)
+                        buffer[values.shape[0] : padded_tokens].zero_()
+                        lookups[layer_id] = buffer
                 if ready_events is not None:
                     ready_events[layer_id].record(torch.npu.current_stream())
         else:
             for layer_id, table in zip(config.engram_layer_ids, tables):
-                lookups[layer_id] = torch.empty(
-                    (0, table.part_n_hash_cols, table.dim)
-                    if local_only
-                    else (0, table.n_hash_cols * table.dim),
-                    dtype=torch.bfloat16,
-                    device=device,
-                )
+                output_buffers = local_output_buffers if local_only else full_output_buffers
+                if output_buffers is not None:
+                    buffer = output_buffers[layer_id]
+                    buffer[:padded_tokens].zero_()
+                    lookups[layer_id] = buffer
+                else:
+                    lookups[layer_id] = torch.empty(
+                        (0, table.part_n_hash_cols, table.dim) if local_only else (0, table.n_hash_cols * table.dim),
+                        dtype=torch.bfloat16,
+                        device=device,
+                    )
                 if ready_events is not None:
                     ready_events[layer_id].record(torch.npu.current_stream())
-        return lookups, mask.to(positions.device)
+        return lookups, mask.to(positions.device) if mask_output_buffer is None else mask_output_buffer
 
     @property
     def engram_multistream_supported(self) -> bool:
         # DP-sharded tables need per-step DP collectives. Keep all collectives
         # on the main stream and overlap only a local or shared table lookup.
         return self.has_engram and (self.engram_dp_shared_memory or get_engram_dp_size() == 1)
+
+    @property
+    def engram_graph_multistream_supported(self) -> bool:
+        # TP1: Engram's DP device communicator is separate from MoE's EP
+        # communicator; all Engram collectives retain their producer order.
+        # For sharded DP+TP, TP gathers would share the attention communicator,
+        # so keep that combination synchronous until its order is validated.
+        return self.has_engram and (self.engram_multistream_supported or get_tensor_model_parallel_world_size() == 1)
 
     def prepare_engram_local_inputs(
         self,
@@ -1194,12 +1231,19 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         query_start_loc=None,
         slot_mapping=None,
         block_table=None,
+        *,
+        graph_inputs=None,
+        padded_tokens=None,
     ):
         """Submit hash and local lookups; return per-layer completion events."""
         if not self.engram_multistream_supported:
             raise RuntimeError("Engram local lookup overlap requires an unsharded DP table")
-        mask_ready = torch.npu.Event()
-        ready = {layer: torch.npu.Event() for layer in self.config.engram_layer_ids}
+        mask_ready = torch.npu.Event() if graph_inputs is None else graph_inputs["engram_mask_ready_event"]
+        ready = (
+            {layer: torch.npu.Event() for layer in self.config.engram_layer_ids}
+            if graph_inputs is None
+            else graph_inputs["engram_ready_events"]
+        )
         local_rows, mask = self.prepare_engram(
             input_ids,
             positions,
@@ -1210,13 +1254,58 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             local_only=True,
             mask_ready_event=mask_ready,
             ready_events=ready,
+            local_output_buffers=None if graph_inputs is None else graph_inputs["engram_local_rows"],
+            mask_output_buffer=None if graph_inputs is None else graph_inputs["engram_mask"],
+            padded_tokens=padded_tokens,
         )
         return {
             "engram_local_rows": local_rows,
             "engram_mask": mask,
             "engram_mask_ready_event": mask_ready,
             "engram_ready_events": ready,
+            "engram_graph_events": graph_inputs is not None,
         }
+
+    def prepare_engram_overlap_graph_inputs(self, padded_tokens, batch_descriptor, *, prime=False):
+        """Bind graph waits to fixed rows; producer work stays outside."""
+        if not self.engram_graph_multistream_supported:
+            raise RuntimeError("Engram graph overlap requires a local table or TP1")
+        if padded_tokens > self._engram_max_tokens:
+            raise ValueError("Engram graph input exceeds the allocated token capacity")
+        if self._engram_local_graph_inputs is None:
+            tables = {layer: self.layers[layer].engram.embed_tokens for layer in self.config.engram_layer_ids}
+            self._engram_local_graph_inputs = EngramGraphInputs(
+                tables,
+                self._engram_max_tokens,
+                self.engram_rotation.device,
+                full_rows=not self.engram_multistream_supported,
+            )
+        return self._engram_local_graph_inputs.bindings(batch_descriptor, prime=prime)
+
+    def prepare_engram_graph_overlap_inputs(
+        self, input_ids, positions, lookback_token_ids, *, graph_inputs, padded_tokens, **device_inputs
+    ):
+        if "engram_local_rows" in graph_inputs:
+            return self.prepare_engram_local_inputs(
+                input_ids,
+                positions,
+                lookback_token_ids,
+                **device_inputs,
+                graph_inputs=graph_inputs,
+                padded_tokens=padded_tokens,
+            )
+        self.prepare_engram(
+            input_ids,
+            positions,
+            lookback_token_ids,
+            **device_inputs,
+            full_output_buffers=graph_inputs["engram_lookups"],
+            mask_output_buffer=graph_inputs["engram_mask"],
+            mask_ready_event=graph_inputs["engram_mask_ready_event"],
+            ready_events=graph_inputs["engram_ready_events"],
+            padded_tokens=padded_tokens,
+        )
+        return graph_inputs
 
     def prepare_engram_inputs(
         self,
@@ -1285,6 +1374,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         engram_local_rows=None,
         engram_mask_ready_event=None,
         engram_ready_events=None,
+        engram_graph_events=False,
     ):
         use_sequence_parallel = getattr(self, "use_sequence_parallel", False)
         hidden_states = inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
@@ -1297,7 +1387,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         self.shared_attention_state.reset()
         full_num_tokens = positions.shape[0]
         if engram_mask_ready_event is not None:
-            torch.npu.current_stream().wait_event(engram_mask_ready_event)
+            wait_engram_event(engram_mask_ready_event, engram_graph_events)
         # Slice capacity-sized graph buffers before SP splits the token axis.
         token_mask = token_mask[:full_num_tokens]
         lookups = {layer_idx: lookup[:full_num_tokens] for layer_idx, lookup in lookups.items()}
@@ -1311,7 +1401,6 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             hidden_states = sp_shard(hidden_states)
             input_ids = sp_shard(input_ids)
             token_mask = sp_shard(token_mask)
-            lookups = {layer_idx: sp_shard(lookup) for layer_idx, lookup in lookups.items()}
         hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
         pre_mix = hidden_states.new_zeros(hidden_states.shape[0], self.hc_mult, dtype=torch.float32)
         pre_mix[:, 0] = 1.0
@@ -1328,8 +1417,9 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                 aux_hidden_states.append(aux_hidden_state)
             if layer.engram is not None and token_mask.numel():
                 n = hidden_states.shape[0]
+                if engram_ready_events is not None:
+                    wait_engram_event(engram_ready_events[layer.layer_idx], engram_graph_events)
                 if engram_local_rows is not None:
-                    torch.npu.current_stream().wait_event(engram_ready_events[layer.layer_idx])
                     lookup = layer.engram.embed_tokens.finish_local_rows(
                         engram_local_rows[layer.layer_idx], full_num_tokens
                     ).flatten(1)
@@ -1338,8 +1428,11 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                     lookup = lookup[:n]
                 else:
                     # Graph captures keep lookup buffers at static capacity;
-                    # the model's actual token dimension remains dynamic.
-                    lookup = lookups[layer.layer_idx][:n]
+                    # SP includes a copy, so it must follow the producer wait.
+                    lookup = lookups[layer.layer_idx]
+                    if use_sequence_parallel:
+                        lookup = sp_shard(lookup)
+                    lookup = lookup[:n]
                 active_mask = token_mask[:n]
                 hidden_states[:n] = layer.engram(
                     hidden_states[:n],
@@ -1421,6 +1514,13 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
     def engram_multistream_supported(self) -> bool:
         return self.model.engram_multistream_supported
 
+    @property
+    def engram_graph_multistream_supported(self) -> bool:
+        return self.model.engram_graph_multistream_supported
+
+    def prepare_engram_graph_overlap_inputs(self, *args, **kwargs):
+        return self.model.prepare_engram_graph_overlap_inputs(*args, **kwargs)
+
     def prepare_engram_local_inputs(
         self,
         input_ids,
@@ -1429,6 +1529,9 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
         query_start_loc=None,
         slot_mapping=None,
         block_table=None,
+        *,
+        graph_inputs=None,
+        padded_tokens=None,
     ):
         return self.model.prepare_engram_local_inputs(
             input_ids,
@@ -1437,7 +1540,12 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
             query_start_loc,
             slot_mapping,
             block_table,
+            graph_inputs=graph_inputs,
+            padded_tokens=padded_tokens,
         )
+
+    def prepare_engram_overlap_graph_inputs(self, padded_tokens, batch_descriptor, *, prime=False):
+        return self.model.prepare_engram_overlap_graph_inputs(padded_tokens, batch_descriptor, prime=prime)
 
     def prepare_engram_graph_inputs(self, padded_tokens=None):
         return self.model.prepare_engram_graph_inputs(padded_tokens)
@@ -1454,6 +1562,7 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
         engram_local_rows=None,
         engram_mask_ready_event=None,
         engram_ready_events=None,
+        engram_graph_events=False,
     ):
         return self.model(
             input_ids,
@@ -1466,6 +1575,7 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
             engram_local_rows=engram_local_rows,
             engram_mask_ready_event=engram_mask_ready_event,
             engram_ready_events=engram_ready_events,
+            engram_graph_events=engram_graph_events,
         )
 
     @property
