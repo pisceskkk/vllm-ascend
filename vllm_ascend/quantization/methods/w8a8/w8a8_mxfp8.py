@@ -630,7 +630,11 @@ class AscendW8A8MXFP8DSDynamicLinearMethod(AscendW8A8MXFP8DynamicLinearMethod):
         layer.weight_scale.data = layer.weight_scale.data.repeat_interleave(input_repeat, dim=1)
         layer.weight_scale.data = layer.weight_scale.data.repeat_interleave(self.block_size, dim=0)
         n_dim, k_dim = layer.weight_scale.data.shape
-        layer.weight_scale.data = layer.weight_scale.data.reshape(n_dim, k_dim // 2, 2)
+        # MX scales are packed in pairs. TP shards can contain an odd number
+        # of 32-element groups, so retain the tail and pad the unused pair.
+        if k_dim % 2:
+            layer.weight_scale.data = F.pad(layer.weight_scale.data, (0, 1), value=0)
+        layer.weight_scale.data = layer.weight_scale.data.reshape(n_dim, (k_dim + 1) // 2, 2)
         layer.weight.data = layer.weight.data.transpose(0, 1)
         layer.weight_scale.data = layer.weight_scale.data.transpose(0, 1)
 
