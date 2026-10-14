@@ -94,7 +94,6 @@ from vllm_ascend.utils import (
     lmhead_tp_pad_rows,
     set_potential_max_tokens,
     should_skip_allreduce_across_dp_group,
-    vllm_version_is,
 )
 from vllm_ascend.worker.device_metadata import DeviceMetadataExecutor, TargetDeviceMetadata
 from vllm_ascend.worker.utils import disable_compilation
@@ -710,10 +709,12 @@ class NPUModelRunner(GPUModelRunner):
             finally:
                 self.max_num_tokens = global_max_num_tokens
 
-    if vllm_version_is("0.30.0"):
+    # SHA-built wheels may report a dev version unrelated to their API.
+    # Select the PD helper contract from the upstream request-state fields.
+    if "decode_graph_eligible" not in BatchReqState._fields:
 
         def _pd_uniform_decode_token_count(self, batch_state: BatchReqState) -> int | None:
-            # vLLM 0.30.0 keys the helper on has_prefill.
+            # The release request-state contract keys the helper on has_prefill.
             return vllm_model_runner.get_uniform_decode_token_count(
                 len(batch_state.req_ids),
                 batch_state.num_tokens,

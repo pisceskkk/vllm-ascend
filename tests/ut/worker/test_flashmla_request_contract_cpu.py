@@ -31,8 +31,8 @@ def _compile(nodes, scope):
     exec(compile(ast.fix_missing_locations(module), __file__, "exec"), scope)
 
 
-@pytest.fixture
-def contract():
+@pytest.fixture(params=("0.30.0", "0.30.0+empty", "0.1.dev1+gced6857af.empty"))
+def contract(request):
     spec = find_spec("vllm")
     if spec is None or spec.origin is None:
         pytest.skip("requires the source of the tested vLLM lane")
@@ -54,17 +54,12 @@ def contract():
         scope,
     )
     main_contract = "decode_graph_eligible" in scope["BatchReqState"]._fields
-    for name, source, owner, base in (
-        ("Parent", upstream, "GPUModelRunner", ""),
-        ("Candidate", candidate, "NPUModelRunner", "(Parent)"),
-    ):
-        cls = ast.parse(f"class {name}{base}: pass").body[0]
-        assert isinstance(cls, ast.ClassDef)
-        cls.body = [_node(source, "gather_batch_req_state", owner)]
-        _compile([cls], scope)
+    # Execute the production selector instead of choosing a branch in this
+    # fixture. A SHA-built release wheel must retain its has_prefill ABI.
+    scope["vllm_version_is"] = lambda target: request.param.split("+")[0] == target
     scope["vllm_model_runner"] = SimpleNamespace(get_uniform_decode_token_count=scope["get_uniform_decode_token_count"])
     override = _node(candidate, "NPUModelRunner")
-    version_split = next(
+    contract_split = next(
         n
         for n in override.body
         if isinstance(n, ast.If)
@@ -72,9 +67,16 @@ def contract():
             isinstance(child, ast.FunctionDef) and child.name == "_pd_uniform_decode_token_count" for child in n.body
         )
     )
-    pd_helper = (version_split.orelse if main_contract else version_split.body)[0]
-    _compile([pd_helper], scope)
-    scope["Candidate"]._pd_uniform_decode_token_count = scope["_pd_uniform_decode_token_count"]
+    for name, source, owner, base in (
+        ("Parent", upstream, "GPUModelRunner", ""),
+        ("Candidate", candidate, "NPUModelRunner", "(Parent)"),
+    ):
+        cls = ast.parse(f"class {name}{base}: pass").body[0]
+        assert isinstance(cls, ast.ClassDef)
+        cls.body = [_node(source, "gather_batch_req_state", owner)]
+        if name == "Candidate":
+            cls.body.insert(0, contract_split)
+        _compile([cls], scope)
 
     def gather(rows, *, external=True, pd=False, dummy=False):
         # row = request id, computed prompt tokens, scheduled tokens, draft count.
