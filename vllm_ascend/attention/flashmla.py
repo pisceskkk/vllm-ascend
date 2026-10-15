@@ -288,6 +288,9 @@ class FlashMLAMetadataBuilder:
         self.max_num_reqs = max_num_reqs
         self.buffers: dict[tuple, FlashMLADecode] = {}
         self.attn_mask = attn_mask
+        # Refresh inline by default. flashmla_metadata_scope() temporarily sets
+        # defer=True and binds an executor to schedule refreshes with buffer-reuse
+        # dependencies, then restores both fields on exit.
         self.defer = False
         self.executor: DeviceMetadataExecutor | None = None
         self.tasks: tuple[DeviceMetadataTask, ...] = ()
