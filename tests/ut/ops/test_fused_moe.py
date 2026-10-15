@@ -1158,12 +1158,15 @@ def _make_shared_expert_events():
         (QuantType.W4A8, True, False, SharedExpertMLPPath.A8_INT_FUSED),
         (QuantType.W4A8MXFP, True, False, SharedExpertMLPPath.A8_MXFP_FUSED),
         # These schemes retain their registered linear implementation.
-        (QuantType.W8A8MXFP, True, False, SharedExpertMLPPath.LINEAR_WRAPPER),
+        (QuantType.W8A8MXFP, True, False, SharedExpertMLPPath.W8A8_MXFP_LINEAR),
         (QuantType.W8A8FP, True, False, SharedExpertMLPPath.LINEAR_WRAPPER),
         (QuantType.W4A4MXFP, True, False, SharedExpertMLPPath.LINEAR_WRAPPER),
         (QuantType.NONE, False, False, SharedExpertMLPPath.LINEAR_WRAPPER),
         # LoRA must not bypass the linear wrappers even for A8 quantization.
         (QuantType.W8A8, True, True, SharedExpertMLPPath.LINEAR_WRAPPER),
+        (QuantType.W8A8MXFP, True, True, SharedExpertMLPPath.LINEAR_WRAPPER),
+        # W8A8MXFP also preserves both linears before scales are initialized.
+        (QuantType.W8A8MXFP, False, False, SharedExpertMLPPath.W8A8_MXFP_LINEAR),
         # A partially initialized quant layer must fail closed to wrappers.
         (QuantType.W8A8, False, False, SharedExpertMLPPath.LINEAR_WRAPPER),
     ],
@@ -1502,7 +1505,7 @@ def test_linear_wrapper_prepares_gate_input_before_router_stage(monkeypatch):
     gate_up_proj = SimpleNamespace(quant_method=SimpleNamespace(quant_method=quant_scheme), mxfp8_tp_padding=(1, 1))
     down_proj = SimpleNamespace(quant_method=SimpleNamespace(quant_method=quant_scheme))
     shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
-    shared_experts.layer = SimpleNamespace(gate_up_proj=gate_up_proj, down_proj=down_proj)
+    shared_experts.layer = SimpleNamespace(gate_up_proj=gate_up_proj, down_proj=down_proj, act_fn=MagicMock())
     shared_experts.multistream_overlap = True
     shared_experts.quant_type = QuantType.W8A8MXFP
     shared_experts.lora_context = None
@@ -2950,13 +2953,14 @@ def test_runner_keeps_mega_moe_activation_with_each_layer(monkeypatch):
     assert second.routed_experts.mega_moe_activation_kwargs is second_kwargs
 
 
-def test_runner_sets_precast_fp32_weight(monkeypatch):
-    """Init sets precast so load materializes weight_fp32."""
+def test_runner_preserves_gate_weight_dtype(monkeypatch):
+    """The runner must not force the gate to materialize an FP32 weight."""
     gate = SimpleNamespace(weight=torch.randn(8, 4, dtype=torch.float16))
     runner = _stub_moe_runner_init(monkeypatch, gate=gate)
 
     assert runner._gate is gate
-    assert gate.precast_fp32_weight is True
+    assert not hasattr(gate, "precast_fp32_weight")
+    assert gate.weight.dtype == torch.float16
     assert not hasattr(gate, "weight_fp32")
 
 
@@ -2974,7 +2978,7 @@ def test_runner_skips_precast_without_internal_router(monkeypatch):
 
 
 def test_forward_impl_uses_gate_weight_fp32(monkeypatch):
-    """Hot path only reads gate.weight_fp32; judgment lives in __init__."""
+    """The hot path uses an existing gate.weight_fp32 when provided."""
     runner = AscendMoERunner.__new__(AscendMoERunner)
     nn.Module.__init__(runner)
     hidden_states = torch.randn(2, 4, dtype=torch.float16)
@@ -3011,6 +3015,53 @@ def test_forward_impl_uses_gate_weight_fp32(monkeypatch):
     runner.routed_experts.forward_impl.assert_called_once_with(
         hidden_states=hidden_states,
         router_logits=recomputed_logits,
+        input_ids=None,
+    )
+
+
+def test_forward_impl_routes_gate_without_weight_fp32(monkeypatch):
+    """Gates without weight_fp32 (no forced fp32 conversion) route through
+    the gate's own forward, letting AscendGateLinear self-manage precision."""
+    runner = AscendMoERunner.__new__(AscendMoERunner)
+    nn.Module.__init__(runner)
+    hidden_states = torch.randn(2, 4, dtype=torch.bfloat16)
+    # vllm#51838 wiring: internal-router models pass hidden_states as the
+    # router_logits placeholder.
+    router_logits = hidden_states
+    gate_logits = torch.randn(2, 3, dtype=torch.float32)
+    routed_out = torch.randn(2, 4)
+    # spec restricts attribute access to the real class surface: a bare
+    # MagicMock auto-creates weight_fp32, which would flip the runner into
+    # the forced-fp32 branch.
+    gate = MagicMock(spec=AscendGateLinear, return_value=(gate_logits, None))
+
+    runner._gate = gate
+    runner.gate = gate
+    runner.ascend_shared_experts = None
+    runner.routed_experts = SimpleNamespace(forward_impl=MagicMock(return_value=routed_out))
+    runner._sequence_parallel_context = MagicMock(return_value=nullcontext())
+    monkeypatch.setattr(
+        fused_moe_module.F,
+        "linear",
+        MagicMock(side_effect=AssertionError("fp32 F.linear path must not run")),
+    )
+
+    result = runner._forward_impl(
+        hidden_states,
+        router_logits,
+        shared_experts_input=None,
+        input_ids=None,
+    )
+
+    assert result is routed_out
+    gate.assert_called_once()
+    # mock's argument equality is unreliable for torch tensors on some
+    # Python versions (tensor.__eq__ returns a Tensor, not a bool);
+    # compare by identity instead.
+    assert gate.call_args[0][0] is hidden_states
+    runner.routed_experts.forward_impl.assert_called_once_with(
+        hidden_states=hidden_states,
+        router_logits=gate_logits,
         input_ids=None,
     )
 
