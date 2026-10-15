@@ -144,6 +144,12 @@ def runtime(monkeypatch):
         "vllm.forward_context", BatchDescriptor=object, get_forward_context=Mock(), is_forward_context_available=Mock()
     )
     tasks = load("vllm_ascend.worker.device_metadata", "vllm_ascend/worker/device_metadata.py")
+
+    def rope(positions):
+        values = positions[:, None, None, None].expand(-1, 1, 1, 64).to(torch.bfloat16)
+        return values, -values
+
+    install("vllm_ascend.ops.rotary_embedding", get_cos_and_sin_mla=rope)
     api = load("vllm_ascend.attention.flashmla", "vllm_ascend/attention/flashmla.py")
 
     def schedule(lengths, *, cu_seqlens_q, seqused_q, **kwargs):
@@ -158,17 +164,10 @@ def runtime(monkeypatch):
 
     attention_op = Mock(side_effect=attention)
     monkeypatch.setattr(
-        api.FlashMLAAdapter,
+        api.FlashMLAImpl,
         "load",
         classmethod(lambda cls, config: cls(config, attention_op, metadata_op)),
     )
-
-    def rope(positions):
-        values = positions[:, None, None, None].expand(-1, 1, 1, 64).to(torch.bfloat16)
-        return values, -values
-
-    install("vllm_ascend.ops.rotary_embedding", get_cos_and_sin_mla=rope)
-    metadata = load("flashmla_dcp_metadata_under_test", "vllm_ascend/attention/flashmla_metadata.py")
 
     def builder(*, size=8, rank=0, interleave=1, heads=8, dtype=torch.float16, use_rope=False):
         impl = SimpleNamespace(
@@ -180,7 +179,7 @@ def runtime(monkeypatch):
             dcp_rank=rank,
             vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=interleave)),
         )
-        return metadata.FlashMLAMetadataBuilder(
+        return api.FlashMLAMetadataBuilder(
             impl, torch.device("cpu"), 8, torch.triu(torch.ones(2048, 2048, dtype=torch.int8), diagonal=1)
         )
 

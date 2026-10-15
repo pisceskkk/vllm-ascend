@@ -37,10 +37,11 @@ from vllm_ascend.attention.context_parallel.common_cp import (
 from vllm_ascend.attention.flashmla import (
     FLASHMLA_QK_DIM,
     FLASHMLA_V_DIM,
+    FlashMLADecode,
+    FlashMLAMetadataBuilder,
     get_flashmla_ops,
     split_flashmla_requests,
 )
-from vllm_ascend.attention.flashmla_metadata import FlashMLADecode, FlashMLAMetadataBuilder
 from vllm_ascend.attention.utils import (
     MLA_FLASH_SUPPORTED_Q_HEADS,
     MLAPO_MAX_SUPPORTED_TOKENS,
