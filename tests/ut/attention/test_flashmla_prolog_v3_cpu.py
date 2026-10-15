@@ -95,16 +95,20 @@ def test_dspark_normalizes_token_fused_views_before_selecting_writer(enabled):
         impl.exec_context_kv_prolog_v3.assert_not_called()
 
 
-@pytest.mark.parametrize("dcp,causal", [(False, True), (False, False), (True, True), (True, False)])
+@pytest.mark.parametrize(
+    "dcp,causal,speculative",
+    [(False, True, False), (False, False, True), (True, True, True), (True, False, True), (True, True, False)],
+)
 @pytest.mark.parametrize("heads", [8, 12])
-def test_external_forward_reuses_upstream_dcp_prolog(dcp, causal, heads):
+def test_external_forward_reuses_upstream_dcp_prolog(dcp, causal, speculative, heads):
+    split = dcp and causal and speculative
     history, raw = fused_cache()
     before = raw.clone()
     slots = torch.tensor([0, 128, -1, -1])
     tokens = slots.numel()
     flash = SimpleNamespace(
         slots=slots,
-        current=object() if dcp and causal else None,
+        current=object() if split else None,
         query=torch.empty(tokens, heads, 576),
         adapter=SimpleNamespace(attention=Mock(return_value=(torch.ones(heads, tokens, 512), None))),
         block_table=object(),
@@ -190,7 +194,7 @@ def test_external_forward_reuses_upstream_dcp_prolog(dcp, causal, heads):
 
     def prolog(hidden, cos, sin, dest, indices, *, quantize_query):
         assert quantize_query
-        torch.testing.assert_close(indices, torch.arange(tokens) if dcp and causal else slots)
+        torch.testing.assert_close(indices, torch.arange(tokens) if split else slots)
         keys = torch.arange(tokens).float()[:, None, None].expand(tokens, 1, 512) + 2
         scatter(key=keys, value=keys[..., :64] + 10, key_cache=dest[0], value_cache=dest[1], slot_mapping=indices)
         q, pe = torch.ones(tokens, 16, 512), torch.ones(tokens, 16, 64)
@@ -228,7 +232,7 @@ def test_external_forward_reuses_upstream_dcp_prolog(dcp, causal, heads):
     assert consumed.k.untyped_storage().data_ptr() == history.untyped_storage().data_ptr()
     if dcp:
         impl._dcp_all_gather_fragments.assert_called_once()
-    if dcp and causal:
+    if split:
         # Row 2 is valid but nonlocal; row 3 is padding. Both are excluded
         # from local history; the complete current chunk remains available.
         torch.testing.assert_close(consumed.current_k_nope[:, 0, 0], torch.arange(tokens).float() + 2)

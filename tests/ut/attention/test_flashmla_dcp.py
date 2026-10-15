@@ -169,7 +169,7 @@ def runtime(monkeypatch):
         classmethod(lambda cls, config: cls(config, attention_op, metadata_op)),
     )
 
-    def builder(*, size=8, rank=0, interleave=1, heads=8, dtype=torch.float16, use_rope=False):
+    def builder(*, size=8, rank=0, interleave=1, heads=8, dtype=torch.float16, use_rope=False, speculative=True):
         impl = SimpleNamespace(
             num_heads=heads,
             scale=0.125,
@@ -177,7 +177,10 @@ def runtime(monkeypatch):
             use_mla_rope=use_rope,
             dcp_size=size,
             dcp_rank=rank,
-            vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=interleave)),
+            vllm_config=SimpleNamespace(
+                parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=interleave),
+                speculative_config=SimpleNamespace(method="dspark") if speculative else None,
+            ),
         )
         return api.FlashMLAMetadataBuilder(
             impl, torch.device("cpu"), 8, torch.triu(torch.ones(2048, 2048, dtype=torch.int8), diagonal=1)
@@ -256,16 +259,19 @@ def common(lengths, queries, *, tokens=None, causal=True):
 
 
 @pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("speculative", [True, False])
 @pytest.mark.parametrize("interleave", [1, 4, 128])
 @pytest.mark.parametrize("rank", [0, 1, 7])
-def test_visibility_uses_global_history_before_sharding(runtime, causal, interleave, rank):
-    builder = runtime.builder(rank=rank, interleave=interleave)
-    lengths, queries = [1031, 3, 132, 0], [4, 3, 2, 1]
+def test_visibility_uses_global_history_before_sharding(runtime, causal, speculative, interleave, rank):
+    builder = runtime.builder(rank=rank, interleave=interleave, speculative=speculative)
+    split = causal and speculative
+    lengths = [1031, 3, 132, 0]
+    queries = [4, 3, 2, 1] if speculative else [1, 1, 1, 1]
     inputs = common(lengths, queries, tokens=16, causal=causal)
-    flash = builder.build(inputs, 4, 10, False)
+    flash = builder.build(inputs, 4, sum(queries), False)
     expected = []
     for length, query in zip(lengths, queries):
-        visible = max(0, length - query) if causal else length
+        visible = max(0, length - query) if split else length
         expected.append(sum(token // interleave % 8 == rank for token in range(visible)))
     assert flash.cache_lens[:4].tolist() == expected
     assert not flash.cache_lens[4:].any()
@@ -273,7 +279,7 @@ def test_visibility_uses_global_history_before_sharding(runtime, causal, interle
     assert flash.adapter.config.mask_mode == 0
     assert flash.adapter.config.return_softmax_lse
     torch.testing.assert_close(flash.schedule, torch.cat((flash.cache_lens, flash.cu, flash.used_q)))
-    if causal:
+    if split:
         assert flash.current is not None
         assert flash.current.query.shape == (16, 8, 576)
         assert flash.current.slots.tolist() == [0, 1, 2, 3, 128, 129, 130, 256, 257] + [-1] * 7
@@ -324,6 +330,45 @@ def test_two_schedules_refresh_after_rejection_without_changing_graph_addresses(
     assert not torch.equal(flash.current.schedule, previous_current)
 
 
+@pytest.mark.parametrize("speculative", [False, True])
+@pytest.mark.parametrize("rank", [0, 1, 7])
+def test_single_token_replay_keeps_configured_split_and_buffer_addresses(runtime, monkeypatch, speculative, rank):
+    builder = runtime.builder(rank=rank, speculative=speculative, use_rope=True)
+    inputs = common([9, 1], [1, 1], tokens=4)
+    flash = builder.build(inputs, 2, 2, False, retain_for_graph=True)
+    assert (flash.current is not None) is speculative
+    pointers = addresses(flash)
+    schedule = flash.schedule.clone()
+    runtime.metadata_op.reset_mock()
+    builder.defer = True
+    assert builder.build(inputs, 2, 2, False) is flash
+    (task,) = builder.take_tasks()
+    inputs.seq_lens.copy_(torch.tensor([17, 0]))
+    inputs.positions.add_(8)
+    torch.testing.assert_close(flash.schedule, schedule)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("device metadata refresh must not read back tensors")
+
+    with monkeypatch.context() as patch:
+        for method in ("item", "tolist", "cpu", "numpy", "__bool__"):
+            patch.setattr(torch.Tensor, method, forbidden)
+        task.run()
+
+    visible = 16 if speculative else 17
+    expected_length = sum(token % 8 == rank for token in range(visible))
+    assert flash.cache_lens.tolist() == [expected_length, 0, 0, 0, 0]
+    assert flash.used_q.tolist() == [1, 0, 0, 0, 0]
+    assert flash.token_live.tolist() == [True, False, False, False]
+    assert flash.adapter.config.num_heads == 64
+    assert flash.adapter.config.mask_mode == 0
+    assert flash.adapter.config.return_softmax_lse
+    assert runtime.metadata_op.call_count == (2 if speculative else 1)
+    assert addresses(flash) == pointers
+    assert (flash.current is not None) is speculative
+    torch.testing.assert_close(flash.schedule, torch.cat((flash.cache_lens, flash.cu, flash.used_q)))
+
+
 def test_current_pages_cross_physical_blocks_and_eager_does_not_retain(runtime):
     builder = runtime.builder()
     flash = builder.build(common([260, 133], [130, 129]), 2, 259, True)
@@ -343,30 +388,33 @@ def test_dcp_one_keeps_original_single_attention_contract(runtime, causal):
     assert not flash.adapter.config.return_softmax_lse
 
 
-@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("causal,speculative", [(True, True), (False, True), (True, False), (False, False)])
 @pytest.mark.parametrize("interleave", [1, 4, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("capturing", [False, True])
 def test_forward_matches_dense_with_strided_history_and_empty_ranks(
-    runtime, monkeypatch, causal, interleave, dtype, capturing
+    runtime, monkeypatch, causal, speculative, interleave, dtype, capturing
 ):
     runtime.context.capturing = capturing
     torch.manual_seed(41)
     size, local_heads, tokens = 8, 8, 5
-    queries = [3, 1]
+    split = causal and speculative
+    queries = [3, 1] if speculative else [1, 1]
     histories = [257, 0]
     lengths = [history + query for history, query in zip(histories, queries)]
     keys = [torch.randn(length, 576, dtype=dtype) * 0.2 for length in lengths]
     query = torch.randn(tokens, size * local_heads, 576, dtype=dtype) * 0.2
     current_kv = torch.zeros(tokens, 1, 576, dtype=dtype)
-    current_kv[:3, 0] = keys[0][-3:]
-    current_kv[3, 0] = keys[1][-1]
+    start = 0
+    for sequence, qlen in zip(keys, queries):
+        current_kv[start : start + qlen, 0] = sequence[-qlen:]
+        start += qlen
     flashes, caches, partials = [], [], []
     for rank in range(size):
-        builder = runtime.builder(rank=rank, interleave=interleave, dtype=dtype)
+        builder = runtime.builder(rank=rank, interleave=interleave, dtype=dtype, speculative=speculative)
         inputs = common(lengths, queries, tokens=tokens, causal=causal)
         inputs.block_table_tensor.copy_(torch.tensor([[1, 3, 5], [2, 4, 6]]))
-        flash = builder.build(inputs, 2, 4, False)
+        flash = builder.build(inputs, 2, sum(queries), False)
         # Nonzero storage offset and padding between physical pages.
         stride = 128 * 576 + 32
         backing = torch.full((8 * stride + 64,), 17.0, dtype=dtype)
@@ -423,9 +471,9 @@ def test_forward_matches_dense_with_strided_history_and_empty_ranks(
         monkeypatch.setattr(torch.ops.vllm, "dcp_a2a_fused", exchange, raising=False)
 
         def combine(recv, head_dim, *, scatter_dim, local_output=None, local_lse=None):
-            assert runtime.events[-1] == (("wait", "main", "attn") if causal else ("exchange", "main"))
-            assert (local_output is not None) == causal
-            assert (local_lse is not None) == causal
+            assert runtime.events[-1] == (("wait", "main", "attn") if split else ("exchange", "main"))
+            assert (local_output is not None) == split
+            assert (local_lse is not None) == split
             runtime.events.append(("merge", runtime.active_stream[0]))
             return combine_outputs(
                 recv, head_dim, scatter_dim=scatter_dim, local_output=local_output, local_lse=local_lse
@@ -453,12 +501,13 @@ def test_forward_matches_dense_with_strided_history_and_empty_ranks(
         preprocessed = SimpleNamespace(
             ql_nope=query[..., :512],
             q_pe=query[..., 512:],
-            current_k_nope=current_kv[..., :512] if causal else None,
-            current_k_pe=current_kv[..., 512:] if causal else None,
+            current_k_nope=current_kv[..., :512] if split else None,
+            current_k_pe=current_kv[..., 512:] if split else None,
         )
         cache, backing, snapshot = caches[rank]
         runtime.events.clear()
         runtime.recorded_streams.clear()
+        runtime.attention_op.reset_mock()
         # Production external metadata has no FIA CPU length mirrors.
         decode = SimpleNamespace(cp_history_seq_len=None, actual_seq_lengths_q=None)
         result = runtime.forward(impl, preprocessed, cache, SimpleNamespace(external_flashmla=flash, decode=decode))
@@ -466,7 +515,8 @@ def test_forward_matches_dense_with_strided_history_and_empty_ranks(
         impl._run_dcp_mtp_split_attention_op.assert_not_called()
         combined.assert_called_once()
         impl._v_up_proj_batch_major.assert_called_once()
-        if causal:
+        assert runtime.attention_op.call_count == (2 if split else 1)
+        if split:
             assert runtime.events == [
                 ("history", "main"),
                 ("record", "main"),
@@ -502,7 +552,7 @@ def test_forward_matches_dense_with_strided_history_and_empty_ranks(
         torch.testing.assert_close(result.double(), expected[:, owned], atol=tolerance, rtol=0.02)
         assert torch.equal(result[-1], torch.zeros_like(result[-1]))
         assert torch.equal(backing, snapshot)  # Forward never repacks or writes persistent history.
-        cache_call = runtime.attention_op.call_args_list[-2 if causal else -1]
+        cache_call = runtime.attention_op.call_args_list[-2 if split else -1]
         assert cache_call.args[1] is cache
     runtime.scope["get_graph_params"].assert_not_called()
     runtime.scope["torch_npu"]._npu_fused_infer_attention_score_get_max_workspace.assert_not_called()
@@ -699,7 +749,8 @@ def test_causal_target_and_noncausal_draft_do_not_share_schedules(runtime):
     assert target.cache_lens[0] == 1 and draft.cache_lens[0] == 2
 
 
-def test_current_kv_requirement_uses_external_split_metadata(runtime):
+@pytest.mark.parametrize("speculative", [False, True])
+def test_current_kv_requirement_uses_external_split_metadata(runtime, speculative):
     fallback = Mock(return_value=True)
     scope = {"AscendMLAMetadata": object, "use_history_current_split_decode": fallback, "_EXTRA_CTX": runtime.context}
     requires = load_method(
@@ -707,8 +758,8 @@ def test_current_kv_requirement_uses_external_split_metadata(runtime):
     )
     impl = SimpleNamespace(speculative_config=None)
     for causal in (True, False):
-        flash = runtime.builder().build(common([9], [2], causal=causal), 1, 2, False)
-        assert requires(impl, SimpleNamespace(external_flashmla=flash)) is causal
+        flash = runtime.builder(speculative=speculative).build(common([9], [1], causal=causal), 1, 1, False)
+        assert requires(impl, SimpleNamespace(external_flashmla=flash)) is (causal and speculative)
     fallback.assert_not_called()
     assert requires(impl, SimpleNamespace(external_flashmla=None))
     fallback.assert_called_once()

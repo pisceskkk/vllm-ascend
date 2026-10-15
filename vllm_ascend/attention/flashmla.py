@@ -270,6 +270,10 @@ class FlashMLAMetadataBuilder:
     def __init__(self, impl, device: torch.device, max_num_reqs: int, attn_mask: torch.Tensor):
         self.dcp_size = getattr(impl, "dcp_size", 1)
         self.dcp_rank = getattr(impl, "dcp_rank", 0)
+        # Keep the DCP execution structure fixed across capture and replay.
+        # Ordinary decode reads current KV from its owning rank's cache;
+        # speculative causal queries need the replicated current chunk.
+        self.use_spec_decode = impl.vllm_config.speculative_config is not None
         self.cp_interleave = impl.vllm_config.parallel_config.cp_kv_cache_interleave_size if self.dcp_size > 1 else 1
         adapter = FlashMLAImpl.load(FlashMLAConfig(impl.num_heads, impl.scale, return_softmax_lse=self.dcp_size > 1))
         self.current_adapter = adapter
@@ -318,7 +322,7 @@ class FlashMLAMetadataBuilder:
             cos=torch.empty(rope_shape, dtype=self.dtype, device=self.device) if self.use_rope else None,
             sin=torch.empty(rope_shape, dtype=self.dtype, device=self.device) if self.use_rope else None,
         )
-        if self.dcp_size > 1 and causal:
+        if self.dcp_size > 1 and causal and self.use_spec_decode:
             # As in split DCP attention, each rank retains every current row.
             # Only persistent history writes use the runner's rank-owned slots.
             block_columns = (tokens + FLASHMLA_BLOCK_SIZE - 1) // FLASHMLA_BLOCK_SIZE
@@ -382,7 +386,7 @@ class FlashMLAMetadataBuilder:
             lengths = common.seq_lens[:num_decodes]
             if flash.current is not None:
                 # Remove the query globally before interleave-aware sharding.
-                # Noncausal draft queries instead see the entire local sequence.
+                # Ordinary decode and noncausal draft see the entire local sequence.
                 lengths = (lengths - flash.used_q[:num_decodes]).clamp_min(0)
             if self.dcp_size > 1:
                 lengths = get_dcp_local_seq_lens(
