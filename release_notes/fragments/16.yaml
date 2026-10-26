@@ -1,0 +1,5 @@
+pr: 16
+entries:
+  - category: bugfix
+    text: Fixed integer-quantized shared experts selecting Situ fusion on unsupported hardware.
+    model: kimi-k3
