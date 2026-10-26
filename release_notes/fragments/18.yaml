@@ -1,0 +1,5 @@
+pr: 18
+entries:
+  - category: bugfix
+    text: Fixed Kimi K3 MLA cache release during Model Runner V2 shutdown.
+    model: kimi-k3
