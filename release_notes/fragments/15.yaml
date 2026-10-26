@@ -1,0 +1,5 @@
+pr: 15
+entries:
+  - category: bugfix
+    text: Fixed packed weight layout and scale grouping for per-channel W4A8 Kimi K3 Situ experts on 950.
+    model: kimi-k3
