@@ -969,3 +969,33 @@ def test_oproj_tp_enable_requires_weight_sharding(size, enabled):
     config = SimpleNamespace(finegrained_tp_config=SimpleNamespace(oproj_tensor_parallel_size=size))
     with mock.patch("vllm_ascend.utils.get_ascend_config", return_value=config):
         assert utils.oproj_tp_enable() is enabled
+
+
+@pytest.mark.parametrize("prefix_caching,chunked_prefill", [(False, False), (True, False), (False, True), (True, True)])
+@pytest.mark.parametrize("user_specified", [False, True])
+@pytest.mark.parametrize("block_size,xlite", [(64, False), (256, True)])
+def test_refresh_block_size_respects_explicit_choice(
+    prefix_caching, chunked_prefill, user_specified, block_size, xlite
+):
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=block_size,
+            user_specified_block_size=user_specified,
+            enable_prefix_caching=prefix_caching,
+        ),
+        scheduler_config=SimpleNamespace(enable_chunked_prefill=chunked_prefill),
+        model_config=SimpleNamespace(is_hybrid=False, hf_config=SimpleNamespace(model_type="llama")),
+        speculative_config=None,
+    )
+    ascend_config = SimpleNamespace(xlite_graph_config=SimpleNamespace(enabled=xlite))
+    with (
+        mock.patch("vllm_ascend.utils.is_c8_mxfp_kv_quant", return_value=False),
+        mock.patch("vllm_ascend.utils.get_ascend_config", return_value=ascend_config),
+    ):
+        utils.refresh_block_size(config)
+    expected = block_size
+    if not user_specified and (prefix_caching or chunked_prefill):
+        expected = 128
+    if xlite and expected > 128:
+        expected = 128
+    assert config.cache_config.block_size == expected
