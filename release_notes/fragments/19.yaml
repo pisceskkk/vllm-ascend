@@ -1,0 +1,4 @@
+pr: 19
+entries:
+  - category: bugfix
+    text: Preserved explicit KV block sizes when applying prefix-cache and chunked-prefill defaults while retaining backend constraints.
