@@ -2228,7 +2228,7 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
 
     # DualChunkSwap expands each prefill into at most two local rows.
     _request_capacity_factor: ClassVar[int] = 2
-    _local_metadata_builder_cls = dsa_v1.AscendDSAMetadataBuilder
+    _global_metadata_builder_cls = dsa_v1.AscendDSAMetadataBuilder
 
     def __init__(
         self,
@@ -2243,7 +2243,7 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
             vllm_config,
             device,
         )
-        self._global_metadata_builder = self._local_metadata_builder_cls(
+        self._global_metadata_builder = self._global_metadata_builder_cls(
             kv_cache_spec,
             layer_names,
             vllm_config,
@@ -2617,25 +2617,25 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
 class AscendDSAPCPStateMetadataBuilder(AscendDSAPCPMetadataBuilder, dsa_v1.AscendDSAStateMetadataBuilder):
     """PCP layout handling with the state backend's metadata requirements."""
 
-    _local_metadata_builder_cls = dsa_v1.AscendDSAStateMetadataBuilder
+    _global_metadata_builder_cls = dsa_v1.AscendDSAStateMetadataBuilder
 
 
 class AscendDSAPCPSWAMetadataBuilder(AscendDSAPCPMetadataBuilder, dsa_v1.AscendDSASWAMetadataBuilder):
     """PCP layout handling with the swa backend's metadata requirements."""
 
-    _local_metadata_builder_cls = dsa_v1.AscendDSASWAMetadataBuilder
+    _global_metadata_builder_cls = dsa_v1.AscendDSASWAMetadataBuilder
 
 
 class AscendDSAPCPAttentionMetadataBuilder(AscendDSAPCPMetadataBuilder, dsa_v1.AscendDSAAttentionMetadataBuilder):
     """PCP layout handling with the attention backend's metadata requirements."""
 
-    _local_metadata_builder_cls = dsa_v1.AscendDSAAttentionMetadataBuilder
+    _global_metadata_builder_cls = dsa_v1.AscendDSAAttentionMetadataBuilder
 
 
 class AscendDSAPCPIndexerMetadataBuilder(AscendDSAPCPMetadataBuilder, dsa_v1.AscendDSAIndexerMetadataBuilder):
     """PCP layout handling with the indexer backend's metadata requirements."""
 
-    _local_metadata_builder_cls = dsa_v1.AscendDSAIndexerMetadataBuilder
+    _global_metadata_builder_cls = dsa_v1.AscendDSAIndexerMetadataBuilder
 
 
 class AscendDSAPCPImpl(dsa_v1.AscendDSAImpl):
