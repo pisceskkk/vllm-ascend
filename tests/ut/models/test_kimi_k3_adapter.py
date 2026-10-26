@@ -735,3 +735,17 @@ def test_k3_dspark_pp_mapper_keeps_frozen_embed_but_drops_heads(monkeypatch):
         "context_proj.weight",
     ):
         assert pp_mapper._map_name(name) == upstream_mapper._map_name(name)
+
+
+def test_kimi_mla_runner_shutdown_clears_owned_cache():
+    from vllm.v1.worker.utils import clear_layer_kv_caches
+
+    wrapper = kimi_k3.AscendKimiMLAAttention.__new__(kimi_k3.AscendKimiMLAAttention)
+    nn.Module.__init__(wrapper)
+    owner = SimpleNamespace(impl=SimpleNamespace(), kv_cache=torch.ones(2, 3))
+    wrapper.mla_attn = SimpleNamespace(mla_attn=owner)
+    clear_layer_kv_caches([wrapper])
+    assert owner.kv_cache.numel() == 0
+    owner.kv_cache = [torch.ones(2, 3), torch.ones(2, 3)]
+    clear_layer_kv_caches([wrapper])
+    assert owner.kv_cache == []
