@@ -2441,6 +2441,8 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
         full_graph_mode: bool = False,
         update_cache: bool = True,
     ) -> dsa_v1.AscendDSAMetadata:
+        # Cooperative dispatch reaches the concrete role's request builder.
+        # PCP only supplies the local layout and whether it owns cache writes.
         # A captured graph still runs its padded queries, so their metadata
         # must be refreshed even when this rank owns no tokens.
         if local_common_attn_metadata.query_start_loc_cpu[-1] > 0:
