@@ -265,6 +265,20 @@
 #    Future Plan:
 #       Remove once upstream exposes the PD role to the coordinator or
 #       removes the EAGLE last-block drop for verified prompt blocks.
+#   3. `vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator`
+#    Why:
+#       The Ascend hybrid constructor predates HiSparse source/indexer roles
+#       and would put host source pages into the ordinary device block pool.
+#    How:
+#       Delegate HiSparse configurations to the original upstream factory,
+#       preserving its host pool, specialized managers and prefix semantics.
+#       Forward num_hash_lookahead_tokens to both native and Ascend hybrid
+#       coordinators so newer scheduler hash boundaries are retained.
+#    Related PR (if no, explain why):
+#       No upstream PR; this is an Ascend factory integration for HiSparse.
+#    Future Plan:
+#       Remove this bypass with the Ascend hybrid coordinator patch once its
+#       PD behavior is covered by the upstream coordinator.
 #
 # ** 10. File: platform/patch_kv_cache_utils.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1532,6 +1546,8 @@
 #       and use a scoped `TorchFunctionMode` to route only `index_fill_` through
 #       `DeviceOperator`. The A5 adaptor temporarily implements it with the
 #       equivalent `scatter_` operation; other hardware keeps the native path.
+#       Install only while the old allocator exists. Newer upstream versions
+#       use a Triton allocator without torch.compile or index_fill_.
 #    Related PR (if no, explain why):
 #       https://github.com/vllm-project/vllm/pull/47808
 #    Future Plan:

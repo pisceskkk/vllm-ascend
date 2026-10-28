@@ -29,6 +29,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
+    KVCacheGroupRole,
     KVCacheSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
@@ -117,6 +118,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         max_in_flight_tokens: int | None = None,
         scheduler_block_size: int | None = None,
         num_prefill_lookahead: int = 0,
+        num_hash_lookahead_tokens: int = 0,
         allow_partial_hash_hits: bool = True,
     ):
         # Keep pcp_world_size in this patched constructor for compatibility
@@ -155,6 +157,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             hash_block_size=hash_block_size,
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
+            num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
@@ -514,12 +517,33 @@ def get_kv_cache_coordinator(  # type: ignore[misc]
     eagle_attn_layer_names: list[str] | None = None,
     metrics_collector: KVCacheMetricsCollector | None = None,
     num_prefill_lookahead: int = 0,
+    num_hash_lookahead_tokens: int = 0,
     allow_partial_hash_hits: bool = True,
 ) -> KVCacheCoordinator:
     # Keep pcp_world_size in this patched function for upstream call
     # compatibility; platform validation guarantees that it is one.
     del pcp_world_size
     token_budget = _select_kv_token_budget(max_model_len, max_in_flight_tokens)
+    if any(group.role == KVCacheGroupRole.HISPARSE_SOURCE for group in kv_cache_config.kv_cache_groups):
+        # HiSparse owns the source/resident/hot manager roles. Its common Core
+        # coordinator also owns their prefix and residency semantics; the Ascend
+        # hybrid overrides below target other cache layouts.
+        return _orig_get_kv_cache_coordinator(
+            kv_cache_config=kv_cache_config,
+            max_model_len=max_model_len,
+            max_in_flight_tokens=token_budget,
+            use_eagle=use_eagle,
+            enable_caching=enable_caching,
+            enable_kv_cache_events=enable_kv_cache_events,
+            dcp_world_size=dcp_world_size,
+            pcp_world_size=1,
+            scheduler_block_size=scheduler_block_size,
+            hash_block_size=hash_block_size,
+            metrics_collector=metrics_collector,
+            num_prefill_lookahead=num_prefill_lookahead,
+            num_hash_lookahead_tokens=num_hash_lookahead_tokens,
+            allow_partial_hash_hits=allow_partial_hash_hits,
+        )
     hybrid_kwargs = dict(
         kv_cache_config=kv_cache_config,
         max_model_len=max_model_len,
@@ -534,6 +558,7 @@ def get_kv_cache_coordinator(  # type: ignore[misc]
         max_in_flight_tokens=token_budget,
         scheduler_block_size=scheduler_block_size,
         num_prefill_lookahead=num_prefill_lookahead,
+        num_hash_lookahead_tokens=num_hash_lookahead_tokens,
     )
     # vLLM main (#54736) added allow_partial_hash_hits.
     hybrid_kwargs["allow_partial_hash_hits"] = allow_partial_hash_hits
@@ -569,6 +594,7 @@ def get_kv_cache_coordinator(  # type: ignore[misc]
         orig_kwargs["max_in_flight_tokens"] = token_budget
         orig_kwargs["scheduler_block_size"] = scheduler_block_size
         orig_kwargs["num_prefill_lookahead"] = num_prefill_lookahead
+        orig_kwargs["num_hash_lookahead_tokens"] = num_hash_lookahead_tokens
         orig_kwargs["allow_partial_hash_hits"] = allow_partial_hash_hits
         return _orig_get_kv_cache_coordinator(**orig_kwargs)
 
