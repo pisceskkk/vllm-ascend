@@ -1,5 +1,8 @@
 pr: 19109
 entries:
+  - category: bugfix
+    text: Model Runner V2 refreshes pooled token and block ID buffers after NumPy concatenation when using the explicit host-to-device copy fallback on vLLM main.
+    hardware: [950, 910_93]
   - category: feature
     text: Added experimental HiSparse host KV caching for sparse MLA on Ascend 950 and 910_93 with Model Runner V2, BF16 indexer KV and unquantized main KV. Host pools are allocated separately for each worker rank.
     hardware: [950, 910_93]

@@ -1506,8 +1506,11 @@
 #       ASCEND NPUs do not support UVA yet, so we need to wrap it in vLLM.
 #    How：
 #       make UvaBuffer a dummy class, mimic the interface of vllm UvaBuffer.
+#       Track direct NumPy concatenation into pooled buffers so the explicit
+#       H2D fallback refreshes token and block IDs for main's staged writer.
 #    Future Plan:
-#       Remove this patch when NPU support UVA.
+#       Remove the pooled-write override when upstream exposes dirty-range
+#       tracking for direct host writes; remove the wrapper when NPU supports UVA.
 #
 # ** 31. File: worker/patch_v2/patch_dspark.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

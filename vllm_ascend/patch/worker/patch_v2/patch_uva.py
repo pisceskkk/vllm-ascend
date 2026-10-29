@@ -207,3 +207,23 @@ class UvaBufferWrapper:
 
 
 vllm.v1.worker.gpu.buffer_utils.UvaBuffer = UvaBufferWrapper
+
+
+def copy_chunks_to_uva(self, chunks, n: int) -> torch.Tensor:
+    """Track NumPy's direct writes before exposing a fallback device buffer.
+
+    Main's staged writer concatenates into a NumPy slice, bypassing the
+    monitored array's __setitem__. Without marking that prefix, fallback
+    buffers retain stale device contents, including token IDs and block IDs.
+    Keep the upstream allocation-free concatenation and buffer retirement.
+    """
+    buf = self._next_buf(n)
+    destination = buf._np if isinstance(buf, UvaBufferWrapper) else buf.np
+    np.concatenate(chunks, out=destination[:n], casting="unsafe")
+    if isinstance(buf, UvaBufferWrapper) and not buf._use_real_uva:
+        buf._modified_indices.update(range(n))
+    return buf.uva(n)
+
+
+if hasattr(vllm.v1.worker.gpu.buffer_utils.UvaBufferPool, "copy_chunks_to_uva"):
+    vllm.v1.worker.gpu.buffer_utils.UvaBufferPool.copy_chunks_to_uva = copy_chunks_to_uva
