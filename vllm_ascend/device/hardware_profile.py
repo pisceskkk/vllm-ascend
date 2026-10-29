@@ -221,6 +221,13 @@ class WeightLayoutPolicy(Enum):
     FORCE_NZ = auto()
 
 
+class HiSparseIndexingPolicy(Enum):
+    """Select the efficient HiSparse index preparation implementation."""
+
+    TRITON = auto()
+    NATIVE = auto()
+
+
 @dataclass(frozen=True, slots=True)
 class HardwareProfile:
     """Immutable semantic contracts registered for one SoC family.
@@ -243,6 +250,7 @@ class HardwareProfile:
     quantization_backend_family: QuantizationBackendFamily
     # Independent, additive contracts queried with ``supports``.
     capabilities: frozenset[HardwareCapability]
+    hisparse_indexing_policy: HiSparseIndexingPolicy = HiSparseIndexingPolicy.TRITON
 
     def supports(self, capability: HardwareCapability) -> bool:
         """Return whether the exact documented ``capability`` contract is available."""
@@ -309,6 +317,7 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
             weight_layout_policy=WeightLayoutPolicy.CONFIGURABLE,
             moe_comm_policy=MoECommPolicy.FUSED_OR_CAPACITY,
             quantization_backend_family=QuantizationBackendFamily.STANDARD,
+            hisparse_indexing_policy=HiSparseIndexingPolicy.NATIVE,
             capabilities=_A3_CAPABILITIES
             | {
                 HardwareCapability.CANN_MEGAMOE,

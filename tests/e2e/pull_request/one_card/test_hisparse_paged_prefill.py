@@ -9,11 +9,11 @@ import torch
 import torch_npu  # noqa: F401
 
 
-@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("queries,capture", [(10, False), (10, True), (130, False)])
 @pytest.mark.parametrize("mixed", [False, True])
 @pytest.mark.parametrize("strided", [False, True])
 @pytest.mark.parametrize("resident", [False, True])
-def test_paged_prefill_reference(capture, mixed, strided, resident):
+def test_paged_prefill_reference(queries, capture, mixed, strided, resident):
     if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith(("Ascend950", "Ascend910_93")):
         pytest.skip("HiSparse SFA integration requires Ascend 950 or 910_93")
     torch.npu.set_device(0)
@@ -27,7 +27,7 @@ def test_paged_prefill_reference(capture, mixed, strided, resident):
     torch.manual_seed(79)
     device, latent, rope, heads, topk = "npu:0", 512, 64, 8, 2048
     decode = 2 if mixed else 0
-    queries, padding = 10, 5
+    padding = 5
     source = torch.randn(6, 128, latent + rope).bfloat16()
     if strided:
         backing = torch.empty(6, 2, 128, latent + rope, dtype=torch.bfloat16, device=device)
@@ -42,7 +42,7 @@ def test_paged_prefill_reference(capture, mixed, strided, resident):
     table_cpu = torch.tensor([[4, 1, 0], [3, 5, 2]], dtype=torch.int32)
     table = table_cpu.to(device)
     lengths = [130, 265]
-    counts = [3, 7]
+    counts = [3, queries - 3]
     ends = torch.tensor(([0, 1, 2] if mixed else [0]) + [decode + 3, decode + queries], dtype=torch.int32)
     seq_lens = torch.tensor(([1, 1] if mixed else []) + lengths, dtype=torch.int32)
     indices = torch.full((decode + queries + padding, topk), -1, dtype=torch.int32)
@@ -244,7 +244,9 @@ def test_packed_sfa_reference(dtype, heads):
 
 
 @pytest.mark.parametrize("selection_lengths", [False, True])
-@pytest.mark.parametrize("rows,topk,capture", [(0, 128, False), (1, 128, False), (129, 2048, True), (129, 3072, False)])
+@pytest.mark.parametrize(
+    "rows,topk,capture", [(0, 128, False), (1, 128, False), (129, 2048, False), (129, 2048, True), (129, 3072, False)]
+)
 def test_prefill_index_preparation(rows, topk, capture, selection_lengths):
     if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith(("Ascend950", "Ascend910_93")):
         pytest.skip("HiSparse prefill preparation requires Ascend 950 or 910_93")

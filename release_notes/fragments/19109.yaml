@@ -12,3 +12,6 @@ entries:
   - category: bugfix
     text: HiSparse keeps CPU thread affinity without migrating registered host KV pools during worker warmup, avoiding long NUMA migration scans of pinned pages.
     hardware: [950, 910_93]
+  - category: performance
+    text: HiSparse on Ascend 910_93 uses vectorized device sort and gather for large prefill index compaction and state-aware hot-cache invalidation, avoiding scalar scans proportional to prompt length.
+    hardware: [910_93]

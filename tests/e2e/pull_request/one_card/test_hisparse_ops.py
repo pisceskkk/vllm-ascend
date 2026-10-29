@@ -507,6 +507,32 @@ def test_plan_gather_and_written_slot_invalidation():
         mapping.close()
 
 
+@pytest.mark.parametrize("tokens", [0, 1, 16, 1024])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_invalidate_written_state_isolation(tokens, dtype):
+    torch.manual_seed(89)
+    initial = torch.randint(-1, 16384, (16, 10240), dtype=torch.int32)
+    states = torch.randperm(16, dtype=torch.int32)
+    states[1], states[2] = -1, 17
+    requests = torch.randint(-2, 18, (tokens,), dtype=torch.int32)
+    written = torch.randint(-1, 16384, (tokens,), dtype=dtype)
+    if tokens >= 16:
+        # Duplicate writes, negative sentinels and equal values in other states.
+        requests[:4] = torch.tensor([0, 0, 3, -1])
+        written[:4] = torch.tensor([7, 7, -1, 7], dtype=dtype)
+        initial[:, 0] = 7
+        if dtype == torch.int64:
+            written[4] = 1 << 33
+    expected = initial.clone()
+    for request, value in zip(requests.tolist(), written.tolist()):
+        if 0 <= request < states.numel() and 0 <= states[request] < initial.shape[0] and value >= 0:
+            row = expected[states[request]]
+            row.masked_fill_(row.to(torch.int64) == value, -1)
+    actual = initial.to("npu")
+    HiSparseNPUOps.hisparse_invalidate_written_slots(actual, states.to("npu"), requests.to("npu"), written.to("npu"))
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
 def test_upstream_prefill_staging_plan():
     from vllm.v1.hisparse.runtime import build_hisparse_prefill_staging_plan
 

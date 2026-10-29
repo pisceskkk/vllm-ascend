@@ -15,6 +15,7 @@ import mmap
 import torch
 from vllm.triton_utils import triton
 
+from vllm_ascend.device.hardware_profile import HiSparseIndexingPolicy, get_current_hardware_profile
 from vllm_ascend.ops.triton.hisparse import (
     assign_residency_kernel,
     classify_residency_kernel,
@@ -554,6 +555,14 @@ class HiSparseNPUOps:
         region = device_global_indices.size(1)
         if region == 0:
             return
+        if (
+            written_slots.numel() >= 16
+            and get_current_hardware_profile().hisparse_indexing_policy == HiSparseIndexingPolicy.NATIVE
+        ):
+            _invalidate_written_slots_native(
+                device_global_indices, request_state_indices, req_id_per_token, written_slots
+            )
+            return
         invalidate_kernel[(written_slots.numel(), triton.cdiv(region, 256))](
             device_global_indices,
             request_state_indices,
@@ -565,6 +574,63 @@ class HiSparseNPUOps:
             BLOCK=256,
             multibuffer=False,
         )
+
+
+def _invalidate_written_slots_native(device_global_indices, request_state_indices, requests, written):
+    """Search written (state, slot) pairs once per hot entry, entirely on NPU.
+
+    The per-written-token Triton scan lowers to scalar work on Arch22. Sorting
+    exact int64 keys avoids rescanning every hot row for every prompt token.
+    State is part of the key: equal slots belonging to another request must
+    not invalidate this row. Small writes retain the lower-overhead kernel.
+    """
+    num_requests = request_state_indices.numel()
+    if not num_requests or not device_global_indices.numel():
+        return
+    written = written.to(torch.int64)
+    states = request_state_indices.index_select(0, requests.clamp(0, num_requests - 1))
+    valid = (
+        (requests >= 0)
+        & (requests < num_requests)
+        & (states >= 0)
+        & (states < device_global_indices.shape[0])
+        & (written >= 0)
+        & (written < 2147483648)
+    )
+    keys = torch.where(valid, (states.to(torch.int64) << 32) | written.to(torch.int64), 9223372036854775807)
+    sorted_keys = keys.sort().values
+    state_ids = torch.arange(device_global_indices.shape[0], dtype=torch.int64, device=written.device)
+    targets = (state_ids[:, None] << 32) | device_global_indices.to(torch.int64)
+    positions = torch.searchsorted(sorted_keys, targets).clamp(max=sorted_keys.numel() - 1)
+    matches = (device_global_indices >= 0) & (sorted_keys[positions] == targets)
+    device_global_indices.masked_fill_(matches, -1)
+
+
+def _prepare_prefill_attention_native(
+    logical, requests, query_starts, seq_lens, table, query_offset, request_offset, selection_lengths
+):
+    """Stable compaction through vectorized CANN sort and gather kernels."""
+    rows, topk = logical.shape
+    context_ends = (
+        seq_lens.index_select(0, requests)
+        - query_starts.index_select(0, requests + 1)
+        + torch.arange(1, rows + 1, dtype=torch.int32, device=logical.device)
+        + query_offset
+    )
+    valid = (logical >= 0) & (logical < context_ends[:, None])
+    # Unique position keys preserve order and duplicate multiplicity. Values
+    # are exact in FP32 for the bounded top-k routed here; invalid lanes sort
+    # behind every valid lane and become the trailing negative padding.
+    positions = torch.arange(topk, dtype=torch.float32, device=logical.device)
+    keys = positions + (~valid).to(torch.float32) * topk
+    selected = torch.where(valid, logical, -1).gather(1, keys.sort(dim=-1).indices)
+    lengths = valid.sum(dim=-1, dtype=torch.int32) if selection_lengths else context_ends
+    return (
+        selected[:, None, :],
+        torch.arange(1, rows + 1, dtype=torch.int32, device=logical.device),
+        lengths.clamp_min(1),
+        table.index_select(0, requests - request_offset),
+    )
 
 
 def prepare_prefill_attention(
@@ -590,6 +656,14 @@ def prepare_prefill_attention(
     _check_tensor(table, "table", device, (torch.int32,), ndim=2, contiguous=False)
     if table.stride(1) != 1 or topk <= 0 or table.shape[1] <= 0:
         raise ValueError("HiSparse prefill requires nonempty top-k and dense table columns")
+    if (
+        rows >= 16
+        and topk <= 8388608
+        and get_current_hardware_profile().hisparse_indexing_policy == HiSparseIndexingPolicy.NATIVE
+    ):
+        return _prepare_prefill_attention_native(
+            logical, requests, query_starts, seq_lens, table, query_offset, request_offset, selection_lengths
+        )
     selected = torch.empty((rows, topk), dtype=torch.int32, device=device)
     query_ends = torch.empty((rows,), dtype=torch.int32, device=device)
     valid_lengths = torch.empty_like(query_ends)
