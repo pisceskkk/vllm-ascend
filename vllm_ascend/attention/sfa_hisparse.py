@@ -11,7 +11,7 @@ from vllm.v1.hisparse.runtime import HiSparsePrefillStagingPlan, build_hisparse_
 from vllm.v1.worker.workspace import current_workspace_manager
 
 from vllm_ascend.attention.sfa_v1 import AscendSFAImpl, AscendSFAMetadata, AscendSFAMetadataBuilder
-from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, get_current_hardware_profile
+from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 
 # Bound the temporary D2D packing workspace independently of prefill length.
 _ATTENTION_CHUNK_ROWS = 32
@@ -103,7 +103,7 @@ class AscendHiSparseImpl(AscendSFAImpl):
         )
         self._kv_staging_capacity = (max_rows + 127) // 128 * 128
         self._packed_resident_supported = (
-            get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
+            get_current_hardware_profile().supports(HardwareCapability.SFA_PACKED_KV)
             and self.kv_lora_rank == 512
             and self.qk_rope_head_dim == 64
         )
@@ -295,6 +295,7 @@ class AscendHiSparseImpl(AscendSFAImpl):
                 table,
                 0,
                 0,
+                selection_lengths=get_current_hardware_profile().supports(HardwareCapability.SFA_SELECTION_LENGTHS),
             )
             packed = cache.view.attention_cache.unsqueeze(2)
             result = torch.ops._C_ascend.npu_sparse_flash_attention(
@@ -365,6 +366,7 @@ class AscendHiSparseImpl(AscendSFAImpl):
                 staged_table[:, :table_width],
                 num_decode,
                 metadata.num_decodes,
+                selection_lengths=get_current_hardware_profile().supports(HardwareCapability.SFA_SELECTION_LENGTHS),
             )
             result = torch.ops._C_ascend.npu_sparse_flash_attention(
                 query=ql_nope[num_decode:query_end],

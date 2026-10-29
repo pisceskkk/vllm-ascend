@@ -22,6 +22,7 @@ from vllm_ascend.ops.triton.hisparse import (
     gather_rows_kernel,
     invalidate_kernel,
     pack_attention_rows_kernel,
+    pack_unaligned_attention_rows_kernel,
     partition_residency_kernel,
     prepare_prefill_attention_kernel,
     prepare_residency_kernel,
@@ -566,12 +567,15 @@ class HiSparseNPUOps:
         )
 
 
-def prepare_prefill_attention(logical, requests, query_starts, seq_lens, table, query_offset, request_offset):
+def prepare_prefill_attention(
+    logical, requests, query_starts, seq_lens, table, query_offset, request_offset, *, selection_lengths=True
+):
     """Build one-query SFA batches without expanding any KV payload.
 
     ``table`` is already trimmed to the CPU sequence-length upper bound.
     Sparse indices are stable-compacted and filtered to each query's causal
-    context. The singleton batch lengths tell SFA how many selections to read.
+    context. A5 takes compact selection counts; A3 takes causal context bounds
+    and derives the valid selection count from the trailing negative indices.
     """
     device = logical.device
     if device.type != "npu":
@@ -601,6 +605,7 @@ def prepare_prefill_attention(logical, requests, query_starts, seq_lens, table, 
             query_ends,
             valid_lengths,
             expanded_table,
+            SELECTION_LENGTHS=selection_lengths,
             QUERY_OFFSET=query_offset,
             REQUEST_OFFSET=request_offset,
             INPUT_STRIDE=logical.stride(0),
@@ -631,7 +636,26 @@ def pack_attention_rows(packed_cache, physical_topk, selected_latent_out, select
         width - latent_dim
     ):
         raise ValueError("HiSparse attention staging shapes do not match the selected rows")
-    if rows:
+    if rows and (
+        latent_dim * packed_cache.element_size() % 32 or (width - latent_dim) * packed_cache.element_size() % 32
+    ):
+        pack_unaligned_attention_rows_kernel[(triton.cdiv(rows * topk * max(latent_dim, width - latent_dim), 256),)](
+            packed_cache,
+            physical_topk,
+            selected_latent_out,
+            selected_rope_out,
+            ROWS=rows,
+            K=topk,
+            CACHE_ROWS=packed_cache.size(0) * packed_cache.size(1),
+            CACHE_BLOCK=packed_cache.size(1),
+            CACHE_STRIDE=packed_cache.stride(0),
+            WIDTH=width,
+            LATENT=latent_dim,
+            INDEX_STRIDE=physical_topk.stride(0),
+            BLOCK=256,
+            multibuffer=False,
+        )
+    elif rows:
         pack_attention_rows_kernel[(rows, topk)](
             packed_cache,
             physical_topk,

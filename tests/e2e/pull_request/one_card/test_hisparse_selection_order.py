@@ -11,8 +11,8 @@ import torch_npu  # noqa: F401
 
 @pytest.mark.parametrize("capture", [False, True])
 def test_valid_order_duplicates_and_interleaved_padding(monkeypatch, capture):
-    if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith("Ascend950"):
-        pytest.skip("HiSparse SFA integration currently targets Ascend 950")
+    if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith(("Ascend950", "Ascend910_93")):
+        pytest.skip("HiSparse SFA integration requires Ascend 950 or 910_93")
     torch.npu.set_device(0)
     from vllm_ascend.utils import bootstrap_custom_op_env
 

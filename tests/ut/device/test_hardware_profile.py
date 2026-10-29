@@ -56,6 +56,7 @@ _EXPECTED_CAPABILITIES = {
     AscendDeviceType.A2: _STANDARD_CAPABILITIES | {HardwareCapability.RMS_NORM_CAST},
     AscendDeviceType.A3: _STANDARD_CAPABILITIES
     | {
+        HardwareCapability.SFA_PACKED_KV,
         HardwareCapability.CANN_MEGAMOE,
         HardwareCapability.MC2_FULLMESH_V2_COMM,
         HardwareCapability.RMS_NORM_CAST,
@@ -75,6 +76,8 @@ _EXPECTED_CAPABILITIES = {
     ),
     AscendDeviceType.A5: frozenset(
         {
+            HardwareCapability.SFA_PACKED_KV,
+            HardwareCapability.SFA_SELECTION_LENGTHS,
             HardwareCapability.AUTO_ENABLE_CUSTOM_OPS,
             HardwareCapability.SCATTER_ND_CACHE_STORE,
             HardwareCapability.SCATTER_ND_FP8_CACHE_STORE,

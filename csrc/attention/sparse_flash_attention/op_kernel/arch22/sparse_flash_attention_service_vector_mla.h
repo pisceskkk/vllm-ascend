@@ -887,11 +887,12 @@ SFAVectorService<SFAT>::CopyInSingleKv(int64_t &mte2Size, int64_t mte3Size, int6
     intriParams.srcStride = 0;
     DataCopyPadExtParams<KV_T> padParams;
     DataCopyPad(kvMergUb_[mergeMte3Idx % 2 * 32 * 512 + (mte2Size - mte3Size) * constInfo.headDim],
-                keyGm_[keyBNBOffset * constInfo.headDim], intriParams, padParams);
+                keyGm_[keyBNBOffset * constInfo.kvRowStride], intriParams, padParams);
     if (constInfo.headDimRope > 0) {
         intriParams.blockLen = validS2Count * constInfo.headDimRope * sizeof(KV_T);
         DataCopyPad(ropeMergUb_[mergeMte3Idx % 2 * 32 * 64 + (mte2Size - mte3Size) * constInfo.headDimRope],
-                    keyRopeGm_[keyBNBOffset * constInfo.headDimRope], intriParams, padParams);
+                    keyRopeGm_[keyBNBOffset * (constInfo.kvRowStride == 576 ? 576 : constInfo.headDimRope) +
+                                (constInfo.kvRowStride == 576 ? constInfo.headDim : 0)], intriParams, padParams);
     }
     mte2Size += validS2Count;
 }
@@ -908,6 +909,14 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyInKv(int64_t &mte2Size, int64
     int64_t keyOffset1 = GetKeyGmOffset(realS2Idx1, runInfo, s2IdLimit);
     int64_t keyOffset2 = GetKeyGmOffset(realS2Idx2, runInfo, s2IdLimit);
     if (unlikely(keyOffset1 < 0 && keyOffset2 < 0)) {
+        return;
+    }
+
+    // Packed pages contain one latent vector followed by its RoPE vector.
+    // Keep the existing split UB/GM workspace and gather directly from each row.
+    if (constInfo.kvRowStride == 576) {
+        CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx1, keyOffset1, s2IdLimit, runInfo);
+        CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx2, keyOffset2, s2IdLimit, runInfo);
         return;
     }
 

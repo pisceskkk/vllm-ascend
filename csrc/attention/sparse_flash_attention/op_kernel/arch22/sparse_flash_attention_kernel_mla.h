@@ -217,6 +217,7 @@ template <typename SFAT> __aicore__ inline void SparseFlashAttentionMla<SFAT>::I
     constInfo.s2BaseSize = tilingData->innerSplitParams.s2BaseSize;
     constInfo.kvHeadNum = kvHeadNum;
     constInfo.headDim = headDim;
+    constInfo.kvRowStride = tilingData->baseParams.kvRowStride;
     constInfo.headDimRope = tilingData->baseParams.ropeHeadDim;
     constInfo.sparseBlockSize = tilingData->baseParams.sparseBlockSize;
     constInfo.sparseBlockCount = tilingData->baseParams.sparseBlockCount;

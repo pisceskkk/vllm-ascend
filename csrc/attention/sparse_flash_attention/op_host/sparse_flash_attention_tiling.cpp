@@ -1347,8 +1347,8 @@ ge::graphStatus SFATilingCheck::CheckFeatureMlaNoQuantShape() const
         OP_LOGE(opName_, "KV row width should be 512 or packed 576, got %u", sfaInfo_.kvRowStride),
         return ge::GRAPH_FAILED);
     OP_CHECK_IF(sfaInfo_.kvRowStride == 576 &&
-        (!isA5_ || kvLayout_ != SFALayout::PA_BSND || sfaInfo_.sparseBlockSize != 1),
-        OP_LOGE(opName_, "Packed 512+64 KV requires Ascend 950, PA_BSND and sparse_block_size=1"),
+        (kvLayout_ != SFALayout::PA_BSND || sfaInfo_.sparseBlockSize != 1),
+        OP_LOGE(opName_, "Packed 512+64 KV requires PA_BSND and sparse_block_size=1"),
         return ge::GRAPH_FAILED);
     OP_CHECK_IF(bSize_ <= 0,
         OP_LOGE(opName_, "batch_size should be greater than 0, but got %u", bSize_),

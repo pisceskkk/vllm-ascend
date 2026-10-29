@@ -150,6 +150,7 @@ struct ConstInfo {
     uint64_t kvHeadNum;
     uint64_t headDim;
     uint64_t headDimRope;
+    uint32_t kvRowStride = 512;
     uint64_t kvSeqSize = 0ULL;        // kv最大S长度
     uint64_t qSeqSize = 1ULL;         // q最大S长度
     int64_t kvCacheBlockSize = 0;    // PA场景的block size

@@ -13,8 +13,8 @@ import torch_npu  # noqa: F401
 
 @pytest.fixture(autouse=True)
 def _require_ascend950_sfa():
-    if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith("Ascend950"):
-        pytest.skip("HiSparse SFA integration currently targets Ascend 950")
+    if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith(("Ascend950", "Ascend910_93")):
+        pytest.skip("HiSparse SFA integration requires Ascend 950 or 910_93")
     torch.npu.set_device(0)
     from vllm_ascend.utils import bootstrap_custom_op_env
 

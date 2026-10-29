@@ -276,12 +276,10 @@ def partition_residency_kernel(
         if (union > 0) & ~failed:
             slot = tl.load(lru + state.to(tl.int64) * HOT_SIZE + p, mask=valid, other=-1).to(tl.int32)
             prefix = tl.load(hit_prefix + first * HOT_SIZE + p, mask=valid, other=0)
-            hit_rank = prefix - 1
-            evictable = valid & ~hit
-            evict_rank = p - prefix
-            temp = temp_lru + first * HOT_SIZE
-            tl.store(temp + hit_rank, slot, mask=hit)
-            tl.store(temp + HOT_SIZE - 1 - evict_rank, slot, mask=evictable)
+            # Each valid slot has one unique destination. A single scatter
+            # avoids masked sparse-store lowering that loses writes on A3.
+            destination = tl.where(hit, prefix - 1, HOT_SIZE - 1 - (p - prefix))
+            tl.store(temp_lru + first * HOT_SIZE + destination, slot, mask=valid)
 
 
 @triton.jit
@@ -493,6 +491,7 @@ def prepare_prefill_attention_kernel(
     query_ends,
     valid_lengths,
     expanded_table,
+    SELECTION_LENGTHS: tl.constexpr,
     QUERY_OFFSET: tl.constexpr,
     REQUEST_OFFSET: tl.constexpr,
     INPUT_STRIDE: tl.constexpr,
@@ -516,7 +515,8 @@ def prepare_prefill_attention_kernel(
     tl.store(selected + row * TOP_K + prefix - 1, index, mask=valid)
     tl.store(selected + row * TOP_K + i, -1, mask=(i >= count) & (i < TOP_K))
     tl.store(query_ends + row, row + 1)
-    tl.store(valid_lengths + row, tl.maximum(count, 1))
+    length = count if SELECTION_LENGTHS else context_end
+    tl.store(valid_lengths + row, tl.maximum(length, 1))
     page = tl.arange(0, BT)
     value = tl.load(table + (request - REQUEST_OFFSET) * TABLE_STRIDE + page, mask=page < TABLE_WIDTH, other=0)
     tl.store(expanded_table + row * TABLE_WIDTH + page, value, mask=page < TABLE_WIDTH)
@@ -548,6 +548,40 @@ def pack_attention_rows_kernel(
     tl.store(
         rope + (row * K + col).to(tl.int64) * (WIDTH - LATENT) + i - LATENT, value, mask=(i >= LATENT) & (i < WIDTH)
     )
+
+
+@triton.jit
+def pack_unaligned_attention_rows_kernel(
+    cache,
+    indices,
+    latent,
+    rope,
+    ROWS: tl.constexpr,
+    K: tl.constexpr,
+    CACHE_ROWS: tl.constexpr,
+    CACHE_BLOCK: tl.constexpr,
+    CACHE_STRIDE: tl.constexpr,
+    WIDTH: tl.constexpr,
+    LATENT: tl.constexpr,
+    INDEX_STRIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # Tile contiguous output elements so short rows share one write unit.
+    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    selected = p // LATENT
+    active = selected < ROWS * K
+    physical = tl.load(indices + selected // K * INDEX_STRIDE + selected % K, mask=active, other=-1)
+    valid = active & (physical >= 0) & (physical < CACHE_ROWS)
+    base = physical.to(tl.int64) // CACHE_BLOCK * CACHE_STRIDE + physical % CACHE_BLOCK * WIDTH
+    value = tl.load(cache + base + p % LATENT, mask=valid, other=0)
+    tl.store(latent + p, value, mask=active)
+    selected_rope = p // (WIDTH - LATENT)
+    active_rope = selected_rope < ROWS * K
+    physical_rope = tl.load(indices + selected_rope // K * INDEX_STRIDE + selected_rope % K, mask=active_rope, other=-1)
+    valid_rope = active_rope & (physical_rope >= 0) & (physical_rope < CACHE_ROWS)
+    base_rope = physical_rope.to(tl.int64) // CACHE_BLOCK * CACHE_STRIDE + physical_rope % CACHE_BLOCK * WIDTH
+    value_rope = tl.load(cache + base_rope + LATENT + p % (WIDTH - LATENT), mask=valid_rope, other=0)
+    tl.store(rope + p, value_rope, mask=active_rope)
 
 
 @triton.jit

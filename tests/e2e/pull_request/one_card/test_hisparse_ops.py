@@ -20,7 +20,7 @@ from vllm_ascend.ops.hisparse import (
 
 @pytest.fixture(autouse=True)
 def _require_mapped_host_device():
-    if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith("Ascend950"):
+    if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith(("Ascend950", "Ascend910_93")):
         pytest.skip("HiSparse mapped-host operators currently target Ascend 950")
     torch.npu.set_device(0)
 
@@ -81,7 +81,8 @@ def reference(topk, requests, states, source, resident, hot_table, dgi, lru, blo
     return out, counts, sh, sd, sc, dgi, lru, stats
 
 
-def test_resolver_strides_padding_graph():
+@pytest.mark.parametrize("capture", [False, True])
+def test_resolver_strides_padding_graph(capture):
     torch.npu.set_device(0)
     raw = torch.empty(8192, dtype=torch.uint8)
     offset = (-raw.data_ptr()) % 4096
@@ -188,6 +189,9 @@ def test_resolver_strides_padding_graph():
     torch.testing.assert_close(hot[0, 0].cpu(), torch.cat((new_latent[0].flatten().cpu(), new_rope[0].flatten().cpu())))
     torch.testing.assert_close(hot[0, 2].cpu(), hot_cpu[0, 2])
     print(json.dumps({"pack_scatter_strides_padding": "PASS"}), flush=True)
+    if not capture:
+        mapping.close()
+        return
     # Capture warmed kernels, reset state outside capture, then verify replay
     # after changing the mapped CPU payload. No host selection work runs here.
     stream = torch.npu.Stream()
@@ -228,7 +232,8 @@ def test_resolver_strides_padding_graph():
 
 
 @pytest.mark.parametrize("query_rows,hot_size", [(2, 4096), (4, 10240)])
-def test_topk_2048_speculative_union_graph(query_rows, hot_size):
+@pytest.mark.parametrize("capture", [False, True])
+def test_topk_2048_speculative_union_graph(query_rows, hot_size, capture):
     topk, width, block = 2048, 576, 128
     union = query_rows * topk
     blocks = hot_size // block + 1
@@ -293,6 +298,9 @@ def test_topk_2048_speculative_union_graph(query_rows, hot_size):
     torch.npu.synchronize()
     torch.testing.assert_close(sc.cpu(), torch.zeros(query_rows, dtype=torch.int32))
     torch.testing.assert_close(stats.cpu(), torch.tensor([union, union], dtype=torch.int64))
+    if not capture:
+        mapping.close()
+        return
     stream = torch.npu.Stream()
     stream.wait_stream(torch.npu.current_stream())
     with torch.npu.stream(stream):

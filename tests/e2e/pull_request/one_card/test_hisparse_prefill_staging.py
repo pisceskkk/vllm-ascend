@@ -16,8 +16,8 @@ from vllm_ascend.ops.hisparse import HiSparseNPUOps, allocate_mapped_host, scatt
 @pytest.mark.parametrize("resident_block_size", [128, 64, 32])
 @pytest.mark.parametrize("host_pages", [1, 2])
 def test_resident_prefill_plan_shared_layers(resident_block_size, host_pages):
-    if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith("Ascend950"):
-        pytest.skip("HiSparse mapped-host staging currently targets Ascend 950")
+    if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith(("Ascend950", "Ascend910_93")):
+        pytest.skip("HiSparse mapped-host staging requires Ascend 950 or 910_93")
     torch.npu.set_device(0)
     device = "npu:0"
     block_size, width, layers, blocks = 128, 576, 4, 16
@@ -90,8 +90,8 @@ def test_resident_prefill_plan_shared_layers(resident_block_size, host_pages):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2])
 def test_backend_resident_payload_graph_replay(dtype):
-    if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith("Ascend950"):
-        pytest.skip("HiSparse resident gather currently targets Ascend 950")
+    if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith(("Ascend950", "Ascend910_93")):
+        pytest.skip("HiSparse resident gather requires Ascend 950 or 910_93")
     torch.npu.set_device(0)
     width = 656 if dtype != torch.bfloat16 else 576
     stride = 3 * width

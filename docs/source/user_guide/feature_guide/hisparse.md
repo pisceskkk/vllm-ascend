@@ -4,7 +4,7 @@
 
 HiSparse keeps sparse MLA KV pages in host memory and uses NPU memory for resident pages and a per-request hot cache. During decode, the sparse indexer selects logical tokens. The NPU resolves those tokens to resident or hot-cache rows and reads missing rows from mapped host memory. This allows the main KV history to exceed the resident device cache.
 
-This experimental implementation requires the matching vLLM platform-backend changes. It has no released version yet. The development environment uses Ascend 950, CANN 9.2, torch-npu 2.10, and Triton-Ascend 3.6 development builds.
+This experimental implementation requires the matching vLLM platform-backend changes. It has no released version yet. The development environment uses Ascend 950 and 910_93, CANN 9.2, torch-npu 2.10, and Triton-Ascend 3.6 development builds.
 
 ```text
 Sparse indexer -> logical top-k tokens -> NPU residency resolver
@@ -22,13 +22,13 @@ The adapter reuses upstream scheduling, prefix-cache ownership, page spills, and
 
 KV preprocessing uses the same fused RMSNorm/RoPE operator as native SFA before copying the result into HiSparse's packed cache. A reusable split cache preserves the native operator's BF16 rounding and is allocated during profiling, before graph capture. Local temporary slots include padding; the final packed write masks invalid slots and inactive rows.
 
-When the coordinator confirms that all context pages in the batch remain resident, prefill and any mixed decode rows read the original packed KV cache directly. This fast path skips prefill staging and split-cache copies, with no additional full KV mirror. It requires the Ascend 950 SFA operator built from the same source revision, including packed 512+64 KV support. Batches containing nonresident context pages retain the staged path.
+When the coordinator confirms that all context pages in the batch remain resident, prefill and any mixed decode rows read the original packed KV cache directly. This fast path skips prefill staging and split-cache copies, with no additional full KV mirror. It requires the Ascend 950 or 910_93 SFA operator built from the same source revision, including packed 512+64 KV support. Batches containing nonresident context pages retain the staged path.
 
 ## Requirements and limits
 
 | Area | Requirement |
 | --- | --- |
-| Hardware | Ascend 950 with AIV access to registered host memory; runtime capability is checked |
+| Hardware | Ascend 950 or 910_93 with AIV access to registered host memory; runtime capability is checked |
 | Runner | Model Runner V2 |
 | Model path | Sparse MLA/DSA with a sparse-index group |
 | KV formats | BF16 indexer KV and unquantized main KV; model-weight quantization is independent |
@@ -39,6 +39,8 @@ When the coordinator confirms that all context pages in the batch remain residen
 | Native extension | Build the Ascend extension for page DMA and sparse attention |
 
 Mapped-host allocations remain registered until work using their addresses has completed. Host pools must remain alive across graph replay. Initialization fails if the hardware lacks the required mapping capability.
+
+On Ascend 910_93, SFA receives the full causal context length and compacts valid selections before attention. Eager operator checks cover resident and staged prefill, mixed decode, host misses and LRU state. Graph capture remains unvalidated on this platform; use `--enforce-eager` for the current A3 development path.
 
 ## Configuration
 

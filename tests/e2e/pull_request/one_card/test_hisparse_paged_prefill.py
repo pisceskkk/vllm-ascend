@@ -14,8 +14,8 @@ import torch_npu  # noqa: F401
 @pytest.mark.parametrize("strided", [False, True])
 @pytest.mark.parametrize("resident", [False, True])
 def test_paged_prefill_reference(capture, mixed, strided, resident):
-    if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith("Ascend950"):
-        pytest.skip("HiSparse SFA integration currently targets Ascend 950")
+    if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith(("Ascend950", "Ascend910_93")):
+        pytest.skip("HiSparse SFA integration requires Ascend 950 or 910_93")
     torch.npu.set_device(0)
     from vllm_ascend.utils import bootstrap_custom_op_env
 
@@ -190,8 +190,8 @@ def test_paged_prefill_reference(capture, mixed, strided, resident):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("heads", [1, 128])
 def test_packed_sfa_reference(dtype, heads):
-    if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith("Ascend950"):
-        pytest.skip("Packed SFA currently targets Ascend 950")
+    if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith(("Ascend950", "Ascend910_93")):
+        pytest.skip("Packed SFA requires Ascend 950 or 910_93")
     torch.npu.set_device(0)
     from vllm_ascend.utils import bootstrap_custom_op_env
 
@@ -216,7 +216,12 @@ def test_packed_sfa_reference(dtype, heads):
             sparse_block_size=1,
             block_table=table.to("npu"),
             actual_seq_lengths_query=torch.arange(1, 4, dtype=torch.int32, device="npu"),
-            actual_seq_lengths_kv=torch.full((3,), 128, dtype=torch.int32, device="npu"),
+            actual_seq_lengths_kv=torch.full(
+                (3,),
+                128 if torch.npu.get_device_name(0).startswith("Ascend950") else 256,
+                dtype=torch.int32,
+                device="npu",
+            ),
             query_rope=query_rope.to("npu"),
             key_rope=packed,
             layout_query="TND",
@@ -238,10 +243,11 @@ def test_packed_sfa_reference(dtype, heads):
     torch.testing.assert_close(result, expected, atol=atol, rtol=rtol)
 
 
+@pytest.mark.parametrize("selection_lengths", [False, True])
 @pytest.mark.parametrize("rows,topk,capture", [(0, 128, False), (1, 128, False), (129, 2048, True), (129, 3072, False)])
-def test_prefill_index_preparation(rows, topk, capture):
-    if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith("Ascend950"):
-        pytest.skip("HiSparse prefill preparation currently targets Ascend 950")
+def test_prefill_index_preparation(rows, topk, capture, selection_lengths):
+    if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith(("Ascend950", "Ascend910_93")):
+        pytest.skip("HiSparse prefill preparation requires Ascend 950 or 910_93")
     torch.npu.set_device(0)
     from vllm_ascend.ops.hisparse import prepare_prefill_attention
 
@@ -262,7 +268,9 @@ def test_prefill_index_preparation(rows, topk, capture):
     device_requests, device_starts, device_lengths = requests.to("npu"), starts.to("npu"), lengths.to("npu")
 
     def forward():
-        return prepare_prefill_attention(logical, device_requests, device_starts, device_lengths, table, 2, 2)
+        return prepare_prefill_attention(
+            logical, device_requests, device_starts, device_lengths, table, 2, 2, selection_lengths=selection_lengths
+        )
 
     graph = None
     try:
@@ -287,7 +295,7 @@ def test_prefill_index_preparation(rows, topk, capture):
             end = lengths[request] - starts[request + 1] + 2 + row + 1
             selected = source[row][(source[row] >= 0) & (source[row] < end)]
             expected[row, 0, : selected.numel()] = selected
-            counts[row] = max(selected.numel(), 1)
+            counts[row] = max(selected.numel() if selection_lengths else end, 1)
         references = (
             expected,
             torch.arange(1, rows + 1, dtype=torch.int32),
