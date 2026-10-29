@@ -166,11 +166,36 @@ class AscendHiSparseImpl(AscendSFAImpl):
         return super().forward(layer_name, hidden_states, kv_cache, attn_metadata, output)
 
     def exec_kv(self, kv_no_split, cos, sin, kv_cache, slots, attn_metadata):
+        from vllm_ascend.distributed.kv_transfer.hisparse.layout import cache_components
         from vllm_ascend.ops.hisparse import scatter_packed_kv
 
         assert self.kv_a_layernorm is not None
         values = kv_no_split.reshape(-1, self.kv_lora_rank + self.qk_rope_head_dim)
         num_tokens = values.shape[0]
+        cache = self.hisparse_cache
+        if getattr(cache, "view", None) is not None and len(cache_components(cache.view.attention_cache)) == 2:
+            _, mapping, num_rows = cache.write_target(num_tokens, slots.numel())
+            latent, rope = cache_components(cache.view.attention_cache)
+            block_size = cache.view.block_size
+            valid = torch.arange(num_rows, device=mapping.device) < attn_metadata.query_start_loc[-1]
+            physical_slots = torch.where(
+                (mapping >= 0) & valid,
+                mapping // block_size * cache.view.attention_block_stride + mapping % block_size,
+                -1,
+            ).to(torch.int64)
+            torch_npu.npu_kv_rmsnorm_rope_cache(
+                values[:num_rows].view(num_rows, self.num_kv_heads, 1, self.kv_lora_rank + self.qk_rope_head_dim),
+                self.kv_a_layernorm.weight,
+                cos[:num_rows],
+                sin[:num_rows],
+                physical_slots,
+                rope.unsqueeze(2),
+                latent.unsqueeze(2),
+                epsilon=self.kv_a_layernorm.variance_epsilon,
+                cache_mode="PA",
+            )
+            cache.finish_kv_update()
+            return None, None
         if self.qk_rope_head_dim:
             if num_tokens > self._kv_staging_capacity:
                 raise ValueError("HiSparse KV preprocessing exceeds its profiled token capacity")
@@ -206,6 +231,7 @@ class AscendHiSparseImpl(AscendSFAImpl):
         return rope, latent
 
     def _attention_physical(self, query, query_rope, packed_cache, physical_topk):
+        from vllm_ascend.distributed.kv_transfer.hisparse.layout import cache_components
         from vllm_ascend.ops.hisparse import pack_attention_rows
 
         latent, rope, block_table, indices, query_ends, seq_lens = self._workspace(query.dtype)
@@ -224,7 +250,14 @@ class AscendHiSparseImpl(AscendSFAImpl):
             physical = physical.gather(1, keys.sort(dim=-1).indices)
             valid_lengths = (physical >= 0).sum(dim=-1, dtype=torch.int32)
             selected_latent, selected_rope = latent[:count], rope[:count]
-            pack_attention_rows(packed_cache, physical, selected_latent, selected_rope, self.kv_lora_rank)
+            components = cache_components(packed_cache)
+            if len(components) == 2:
+                row_ids = physical.clamp_min(0).to(torch.int64).view(-1)
+                for source, destination in zip(components, (selected_latent, selected_rope), strict=True):
+                    destination.copy_(source.view(-1, source.shape[-1]).index_select(0, row_ids).view_as(destination))
+                    destination.masked_fill_((physical < 0)[:, :, None, None], 0)
+            else:
+                pack_attention_rows(packed_cache, physical, selected_latent, selected_rope, self.kv_lora_rank)
             selected_indices = torch.where(physical[:, None, :] >= 0, indices, -1)
             result = torch.ops._C_ascend.npu_sparse_flash_attention(
                 query=query[start:end],
@@ -268,9 +301,14 @@ class AscendHiSparseImpl(AscendSFAImpl):
         logical = torch.where(rows[:, None] < metadata.query_start_loc[-1], logical, -1)
         self.index_group.set_logical_topk_ready(self.index_group_index)
         cache = self.hisparse_cache
+        from vllm_ascend.distributed.kv_transfer.hisparse.layout import cache_components, combine_components
+
         if (
             metadata.num_prefills
-            and self._packed_resident_supported
+            and (
+                self._packed_resident_supported
+                or (getattr(cache, "view", None) is not None and len(cache_components(cache.view.attention_cache)) == 2)
+            )
             and cache.all_context_pages_resident
             and cache.view is not None
             and cache.view.block_size == metadata.block_size
@@ -297,11 +335,13 @@ class AscendHiSparseImpl(AscendSFAImpl):
                 0,
                 selection_lengths=get_current_hardware_profile().supports(HardwareCapability.SFA_SELECTION_LENGTHS),
             )
-            packed = cache.view.attention_cache.unsqueeze(2)
+            components = cache_components(cache.view.attention_cache)
+            key = components[0].unsqueeze(2)
+            key_rope = components[-1].unsqueeze(2)
             result = torch.ops._C_ascend.npu_sparse_flash_attention(
                 query=ql_nope,
-                key=packed,
-                value=packed,
+                key=key,
+                value=key,
                 sparse_indices=selected,
                 scale_value=self.scale,
                 sparse_block_size=1,
@@ -309,7 +349,7 @@ class AscendHiSparseImpl(AscendSFAImpl):
                 actual_seq_lengths_query=query_ends,
                 actual_seq_lengths_kv=valid_lengths,
                 query_rope=q_pe,
-                key_rope=packed,
+                key_rope=key_rope,
                 layout_query="TND",
                 layout_kv="PA_BSND",
                 sparse_mode=3,
@@ -343,9 +383,15 @@ class AscendHiSparseImpl(AscendSFAImpl):
             )
         if metadata.num_prefills:
             host_cache = self.hisparse_cache.runtime.host_cache
+            host_cache = combine_components(
+                tuple(
+                    component.view(-1, metadata.block_size, component.shape[-1])
+                    for component in cache_components(host_cache)
+                )
+            )
             staged, staged_table, _ = self.index_group.stage_prefill_rows(
                 self.index_group_index,
-                host_cache.view(-1, metadata.block_size, host_cache.shape[-1]),
+                host_cache,
                 metadata,
             )
             from vllm_ascend.ops.hisparse import prepare_prefill_attention
@@ -354,8 +400,12 @@ class AscendHiSparseImpl(AscendSFAImpl):
             # lengths avoid duplicating top-k KV payload and repeated SFA calls.
             # Limit table copies to the CPU context upper bound, independently
             # of the configured maximum model length.
-            latent = staged[..., : self.kv_lora_rank].contiguous().unsqueeze(2)
-            rope = staged[..., self.kv_lora_rank :].contiguous().unsqueeze(2)
+            components = cache_components(staged)
+            if len(components) == 2:
+                latent, rope = (component.unsqueeze(2) for component in components)
+            else:
+                latent = staged[..., : self.kv_lora_rank].contiguous().unsqueeze(2)
+                rope = staged[..., self.kv_lora_rank :].contiguous().unsqueeze(2)
             query_end = logical.shape[0]
             table_width = (metadata.max_seq_len + metadata.block_size - 1) // metadata.block_size
             selected, query_ends, valid_lengths, expanded_table = prepare_prefill_attention(

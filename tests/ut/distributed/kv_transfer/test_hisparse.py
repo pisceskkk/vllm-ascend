@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupRole,
     KVCacheGroupSpec,
     KVCacheLayout,
+    KVCacheTensor,
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -174,7 +175,7 @@ def test_indexer_expanded_view_addresses_shared_hma_pages():
     caches = {"indexer": cache}
     backend = AscendHiSparseBackend()
     backend.validate_kv_cache_config(config)
-    backend.prepare_kv_cache_views(config, caches, {"indexer": layer})
+    binding._bind_indexer_views(caches, {"indexer": spec}, {"indexer": layer})
 
     expanded = caches["indexer"][0]
     assert expanded.is_contiguous()
@@ -186,6 +187,43 @@ def test_indexer_expanded_view_addresses_shared_hma_pages():
         torch.testing.assert_close(expanded[block * layer.hisparse_block_stride, :, 0], cache[block, 0])
     expanded[4, 3, 0, 3] = -1
     assert backing[-1] == -1
+
+
+@pytest.mark.parametrize("layer", [0, 3, 15])
+def test_split_indexer_addresses_only_the_latent_plane(layer):
+    blocks, block_size, head_size = 3, 128, 128
+    stride = 4 * block_size * 576 * 2
+    spec = AscendSFAIndexerCacheSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=head_size,
+        dtype=torch.bfloat16,
+    )
+    page_elements = block_size * head_size
+    backing = torch.arange(blocks * stride // 2, dtype=torch.int64).remainder(251).to(torch.bfloat16)
+    cache = torch.as_strided(
+        backing,
+        (blocks, 1, block_size, head_size),
+        (stride // 2, page_elements, head_size, 1),
+        storage_offset=layer * page_elements,
+    )
+    config = KVCacheConfig(
+        num_blocks=blocks,
+        kv_cache_tensors=[KVCacheTensor(blocks * stride, ["indexer"], page_elements * 2, stride)],
+        kv_cache_groups=[KVCacheGroupSpec(["indexer"], spec)],
+    )
+    context = SimpleNamespace()
+    caches = {"indexer": cache}
+    AscendHiSparseBackend().prepare_kv_cache_views(config, caches, {"indexer": context})
+    expanded = caches["indexer"][0]
+    assert expanded.is_contiguous()
+    assert context.hisparse_block_stride == 16
+    plane_stride = stride * 512 // 576 // 2
+    for block in range(blocks):
+        start = block * plane_stride + layer * page_elements
+        expected = backing[start : start + page_elements].view(block_size, 1, head_size)
+        torch.testing.assert_close(expanded[block * 16], expected, rtol=0, atol=0)
+    assert expanded.storage_offset() + expanded.numel() <= blocks * plane_stride
 
 
 @pytest.mark.parametrize(
@@ -260,7 +298,8 @@ def test_runtime_index_groups_drive_specs_and_physical_payloads(monkeypatch, sec
         runtime.index_group = object() if i and is_leader else group
         runtime.row_width = 576
         runtime.kv_dtype = torch.bfloat16
-        runtime.backend = MagicMock()
+        runtime.backend = AscendHiSparseBackend()
+        monkeypatch.setattr(runtime.backend, "create_cache_ops", lambda _runtime: None)
         handle = HiSparseCacheHandle(runtime)
         handles.append(handle)
         layer = MagicMock(spec=MLAAttention)
@@ -338,14 +377,18 @@ def test_runtime_index_groups_drive_specs_and_physical_payloads(monkeypatch, sec
     # Shared index groups use one physical row ID in different layer views.
     # Independent groups instead own different block IDs in the shared pool.
     blocks = (1, 2 if second_is_leader else 1)
+    from vllm_ascend.distributed.kv_transfer.hisparse.layout import cache_components
+
     for handle, block, value in zip(handles, blocks, (11, 29), strict=True):
-        handle.runtime.hot.cache[block, 7].fill_(value)
+        for component in cache_components(handle.runtime.hot.cache):
+            component[block, 7].fill_(value)
     for handle, block, value in zip(handles, blocks, (11, 29), strict=True):
         view = handle.view
         assert view is not None
         physical_row = block * view.attention_block_stride + 7
-        torch.testing.assert_close(view.cache[block, 7], torch.full((576,), value, dtype=torch.bfloat16))
-        torch.testing.assert_close(view.attention_cache.view(-1, 576)[physical_row], view.cache[block, 7])
+        for component, dense in zip(cache_components(view.cache), cache_components(view.attention_cache), strict=True):
+            torch.testing.assert_close(component[block, 7], torch.full_like(component[block, 7], value))
+            torch.testing.assert_close(dense.view(-1, component.shape[-1])[physical_row], component[block, 7])
 
 
 def test_quantized_indexer_is_rejected_before_pool_allocation(monkeypatch):
@@ -376,7 +419,11 @@ def test_invalid_indexer_stride_releases_initialized_host_pool(monkeypatch):
     monkeypatch.setattr(common_binding, "drop_hisparse_host_pool", drop)
     bind = MagicMock()
     monkeypatch.setattr(common_binding, "bind_hisparse_kv_caches", bind)
-    config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(layer_names=["indexer"], kv_cache_spec=spec)])
+    config = KVCacheConfig(
+        num_blocks=3,
+        kv_cache_tensors=[KVCacheTensor(3 * 132, ["indexer"], 64, 132)],
+        kv_cache_groups=[KVCacheGroupSpec(["indexer"], spec)],
+    )
     vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(get_resolved_kv_cache_layout=lambda: KVCacheLayout.BLHNC)
     )

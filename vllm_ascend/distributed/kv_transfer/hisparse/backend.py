@@ -86,7 +86,37 @@ class AscendHiSparseBackend(HiSparseBackend):
     ) -> None:
         from .binding import _bind_indexer_views, get_hisparse_indexer_specs
 
-        _bind_indexer_views(kv_caches, get_hisparse_indexer_specs(kv_cache_config), forward_context)
+        strides = {tensor.block_stride for tensor in kv_cache_config.kv_cache_tensors if not tensor.host_resident}
+        if len(strides) != 1:
+            raise ValueError("Split HiSparse requires one shared device slab geometry")
+        stride = strides.pop()
+        _bind_indexer_views(
+            kv_caches,
+            get_hisparse_indexer_specs(kv_cache_config),
+            forward_context,
+            split_plane_stride=stride * 512 // 576,
+            num_blocks=kv_cache_config.num_blocks,
+        )
+
+    def create_paged_cache_view(self, raw_tensor, **geometry):
+        from .layout import split_paged_cache
+
+        return split_paged_cache(raw_tensor, **geometry)
+
+    def prepare_host_cache(self, cache):
+        from .layout import split_host_cache
+
+        return split_host_cache(cache)
+
+    def cache_components(self, cache):
+        from .layout import cache_components
+
+        return cache_components(cache)
+
+    def combine_cache_components(self, components):
+        from .layout import combine_components
+
+        return combine_components(components)
 
     def create_stream(self, device: torch.device, *, generic: bool = False) -> Any:
         return torch.npu.Stream(device=device)

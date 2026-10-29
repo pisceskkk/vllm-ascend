@@ -13,7 +13,8 @@ import torch_npu  # noqa: F401
 @pytest.mark.parametrize("mixed", [False, True])
 @pytest.mark.parametrize("strided", [False, True])
 @pytest.mark.parametrize("resident", [False, True])
-def test_paged_prefill_reference(queries, capture, mixed, strided, resident):
+@pytest.mark.parametrize("split", [False, True])
+def test_paged_prefill_reference(queries, capture, mixed, strided, resident, split):
     if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith(("Ascend950", "Ascend910_93")):
         pytest.skip("HiSparse SFA integration requires Ascend 950 or 910_93")
     torch.npu.set_device(0)
@@ -120,6 +121,31 @@ def test_paged_prefill_reference(queries, capture, mixed, strided, resident):
         group.stage_prefill_rows = unexpected_staging
         impl.hisparse_cache.swap_in = unexpected_staging
 
+    if split:
+        from vllm_ascend.distributed.kv_transfer.hisparse.layout import cache_components, split_paged_cache
+
+        factor = 2 if strided else 1
+        raw = torch.zeros(6 * factor * 128 * (latent + rope) * 2, dtype=torch.uint8, device=device)
+        split_view = split_paged_cache(
+            raw,
+            dtype=torch.bfloat16,
+            row_width=latent + rope,
+            byte_offset=(factor - 1) * 128 * (latent + rope) * 2,
+            block_stride=factor * 128 * (latent + rope) * 2,
+            num_blocks=6,
+            block_size=128,
+        )
+        cache = split_view.cache
+
+        def update_split_payload():
+            for component, payload in zip(cache_components(cache), source.split((latent, rope), dim=-1), strict=True):
+                component.copy_(payload)
+
+        update_split_payload()
+        impl.hisparse_cache.runtime.host_cache = cache
+        if resident:
+            impl.hisparse_cache.view = split_view
+
     def forward():
         return AscendHiSparseImpl._execute_sparse_flash_attention_process(
             impl, q, qr, None, gpu_indices, metadata, None, None
@@ -139,7 +165,10 @@ def test_paged_prefill_reference(queries, capture, mixed, strided, resident):
                 actual = forward()
             # Replay changes page payload, request boundary, context and top-k.
             source.neg_()
-            cache.copy_(source)
+            if split:
+                update_split_payload()
+            else:
+                cache.copy_(source)
             queries = 11
             counts = [4, 7]
             metadata.num_actual_tokens = decode + queries

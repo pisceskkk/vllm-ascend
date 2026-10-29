@@ -467,7 +467,10 @@ class HiSparseNPUOps:
     def hisparse_gather_compact(
         self, host_cache, hot_cache, miss_global_indices, miss_hot_indices, miss_counts
     ) -> None:
-        self._gather(host_cache, hot_cache, miss_global_indices, miss_hot_indices, miss_counts, None, None, None, 0)
+        from vllm_ascend.distributed.kv_transfer.hisparse.layout import cache_components
+
+        for source, destination in zip(cache_components(host_cache), cache_components(hot_cache), strict=True):
+            self._gather(source, destination, miss_global_indices, miss_hot_indices, miss_counts, None, None, None, 0)
 
     def hisparse_gather_plan(
         self,

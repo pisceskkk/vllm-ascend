@@ -49,7 +49,12 @@ def get_hisparse_indexer_specs(
 
 
 def _bind_indexer_views(
-    kv_caches: dict[str, Any], indexer_specs: dict[str, AscendSFAIndexerCacheSpec], forward_context: dict[str, Any]
+    kv_caches: dict[str, Any],
+    indexer_specs: dict[str, AscendSFAIndexerCacheSpec],
+    forward_context: dict[str, Any],
+    *,
+    split_plane_stride: int | None = None,
+    num_blocks: int | None = None,
 ) -> None:
     for name, spec in indexer_specs.items():
         cache = kv_caches[name]
@@ -59,10 +64,13 @@ def _bind_indexer_views(
             raise ValueError(f"Unexpected HiSparse indexer cache shape for {name}: {tuple(cache.shape)}")
         block_size = cache.shape[2]
         page_elements = block_size * spec.num_kv_heads * spec.head_size
-        if cache.stride(0) % page_elements:
+        page_stride = cache.stride(0) if split_plane_stride is None else split_plane_stride // cache.element_size()
+        if page_stride % page_elements:
             raise ValueError("HiSparse indexer slab stride must be a whole number of indexer pages.")
-        block_stride = cache.stride(0) // page_elements
-        physical_blocks = (cache.shape[0] - 1) * block_stride + 1
+        block_stride = page_stride // page_elements
+        physical_blocks = ((cache.shape[0] if num_blocks is None else num_blocks) - 1) * block_stride + 1
+        if split_plane_stride is not None and cache.storage_offset() + page_elements > page_stride:
+            raise ValueError("Indexer components exceed the split latent plane's physical slab")
         indexer_cache = torch.as_strided(
             cache,
             size=(physical_blocks, block_size, spec.num_kv_heads, spec.head_size),
