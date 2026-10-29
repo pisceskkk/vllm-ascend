@@ -23,6 +23,7 @@ from vllm_ascend.ops.triton.hisparse import (
     invalidate_kernel,
     pack_attention_rows_kernel,
     partition_residency_kernel,
+    prepare_prefill_attention_kernel,
     prepare_residency_kernel,
     protect_residency_kernel,
     residency_stats_kernel,
@@ -563,6 +564,54 @@ class HiSparseNPUOps:
             BLOCK=256,
             multibuffer=False,
         )
+
+
+def prepare_prefill_attention(logical, requests, query_starts, seq_lens, table, query_offset, request_offset):
+    """Build one-query SFA batches without expanding any KV payload.
+
+    ``table`` is already trimmed to the CPU sequence-length upper bound.
+    Sparse indices are stable-compacted and filtered to each query's causal
+    context. The singleton batch lengths tell SFA how many selections to read.
+    """
+    device = logical.device
+    if device.type != "npu":
+        raise ValueError("HiSparse prefill preparation requires NPU tensors")
+    _check_tensor(logical, "logical", device, (torch.int32,), ndim=2, contiguous=False)
+    if logical.stride(1) != 1:
+        raise ValueError("HiSparse prefill top-k columns must be contiguous")
+    rows, topk = logical.shape
+    _check_tensor(requests, "requests", device, (torch.int32,), shape=(rows,))
+    _check_tensor(query_starts, "query_starts", device, (torch.int32,), ndim=1)
+    _check_tensor(seq_lens, "seq_lens", device, (torch.int32,), ndim=1)
+    _check_tensor(table, "table", device, (torch.int32,), ndim=2, contiguous=False)
+    if table.stride(1) != 1 or topk <= 0 or table.shape[1] <= 0:
+        raise ValueError("HiSparse prefill requires nonempty top-k and dense table columns")
+    selected = torch.empty((rows, topk), dtype=torch.int32, device=device)
+    query_ends = torch.empty((rows,), dtype=torch.int32, device=device)
+    valid_lengths = torch.empty_like(query_ends)
+    expanded_table = torch.empty((rows, table.shape[1]), dtype=torch.int32, device=device)
+    if rows:
+        prepare_prefill_attention_kernel[(rows,)](
+            logical,
+            requests,
+            query_starts,
+            seq_lens,
+            table,
+            selected,
+            query_ends,
+            valid_lengths,
+            expanded_table,
+            QUERY_OFFSET=query_offset,
+            REQUEST_OFFSET=request_offset,
+            INPUT_STRIDE=logical.stride(0),
+            TABLE_STRIDE=table.stride(0),
+            TOP_K=topk,
+            TABLE_WIDTH=table.shape[1],
+            BK=triton.next_power_of_2(topk),
+            BT=triton.next_power_of_2(table.shape[1]),
+            multibuffer=False,
+        )
+    return selected[:, None, :], query_ends, valid_lengths, expanded_table
 
 
 def pack_attention_rows(packed_cache, physical_topk, selected_latent_out, selected_rope_out, latent_dim) -> None:

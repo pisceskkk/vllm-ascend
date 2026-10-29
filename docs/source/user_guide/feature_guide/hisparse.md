@@ -18,7 +18,7 @@ Sparse indexer -> logical top-k tokens -> NPU residency resolver
 
 The resolver protects the union of tokens selected by all MTP query rows before choosing eviction slots. It uses device sorting and Triton-Ascend kernels with persistent scratch buffers. Decode does not copy top-k indices to the CPU for transfer planning.
 
-The adapter reuses upstream scheduling, prefix-cache ownership, page spills, and host-mirror completion. Its current attention bridge moves invalid selections to the end while preserving valid KV order and duplicates, then copies selected rows into the split latent/RoPE layout accepted by Ascend SFA. Preserving the order avoids additional BF16 reduction differences. The valid count excludes padding from softmax. Sorting and device copying are part of the execution cost; a throughput or latency benefit must be measured for the intended workload.
+The adapter reuses upstream scheduling, prefix-cache ownership, page spills, and host-mirror completion. During prefill, staged KV is split into latent/RoPE storage once per cached token. A device kernel filters selections to the causal context, stable-compacts valid indices, and builds per-query page tables and selection lengths for one SFA call. Table width follows the current context upper bound rather than the configured maximum model length. Empty and graph-padding query rows produce zero output. Decode retains the resident/hot-cache resolver and bounded selected-row packing. Both paths preserve valid selection order and duplicates to avoid additional BF16 reduction differences. Staging and device copying remain execution costs; measure throughput and latency for the intended workload.
 
 KV preprocessing uses the same fused RMSNorm/RoPE operator as native SFA before copying the result into HiSparse's packed cache. A reusable split cache preserves the native operator's BF16 rounding and is allocated during profiling, before graph capture. Local temporary slots include padding; the final packed write masks invalid slots and inactive rows.
 
@@ -70,6 +70,7 @@ ASCEND_RT_VISIBLE_DEVICES=0 python -m pytest \
   --confcutdir=tests/e2e/pull_request/one_card \
   tests/e2e/pull_request/one_card/test_hisparse_ops.py \
   tests/e2e/pull_request/one_card/test_hisparse_attention.py \
+  tests/e2e/pull_request/one_card/test_hisparse_paged_prefill.py \
   tests/e2e/pull_request/one_card/test_hisparse_prefill_staging.py \
   tests/e2e/pull_request/one_card/test_hisparse_selection_order.py \
   tests/e2e/pull_request/one_card/test_hisparse_kv_preprocess.py -v

@@ -229,7 +229,7 @@ class AscendHiSparseImpl(AscendSFAImpl):
                 sparse_block_size=1,
                 block_table=block_table[:count],
                 actual_seq_lengths_query=query_ends[:count],
-                actual_seq_lengths_kv=valid_lengths.clamp_min(1),
+                actual_seq_lengths_kv=valid_lengths,
                 query_rope=query_rope[start:end] if self.qk_rope_head_dim else None,
                 key_rope=selected_rope.view(-1, 128, 1, self.qk_rope_head_dim) if self.qk_rope_head_dim else None,
                 layout_query="TND",
@@ -286,25 +286,50 @@ class AscendHiSparseImpl(AscendSFAImpl):
             )
         if metadata.num_prefills:
             host_cache = self.hisparse_cache.runtime.host_cache
-            staged, staged_table, req_ids = self.index_group.stage_prefill_rows(
+            staged, staged_table, _ = self.index_group.stage_prefill_rows(
                 self.index_group_index,
                 host_cache.view(-1, metadata.block_size, host_cache.shape[-1]),
                 metadata,
             )
-            selected = logical[num_decode:]
-            block_ids = selected.clamp_min(0).to(torch.int64) // metadata.block_size
-            request_tables = staged_table[req_ids.to(torch.int64)]
-            physical = torch.gather(request_tables, 1, block_ids) * metadata.block_size
-            physical = physical + selected.clamp_min(0) % metadata.block_size
-            physical = physical.masked_fill(selected < 0, -1).to(torch.int32)
-            outputs.append(
-                self._attention_physical(
-                    ql_nope[num_decode:],
-                    q_pe[num_decode:] if q_pe is not None else None,
-                    staged,
-                    physical,
-                )
+            from vllm_ascend.ops.hisparse import prepare_prefill_attention
+
+            # Split each staged row once. Per-query page tables and selection
+            # lengths avoid duplicating top-k KV payload and repeated SFA calls.
+            # Limit table copies to the CPU context upper bound, independently
+            # of the configured maximum model length.
+            latent = staged[..., : self.kv_lora_rank].contiguous().unsqueeze(2)
+            rope = staged[..., self.kv_lora_rank :].contiguous().unsqueeze(2)
+            query_end = logical.shape[0]
+            table_width = (metadata.max_seq_len + metadata.block_size - 1) // metadata.block_size
+            selected, query_ends, valid_lengths, expanded_table = prepare_prefill_attention(
+                logical[num_decode:query_end],
+                metadata.req_id_per_token[num_decode:query_end],
+                metadata.query_start_loc,
+                metadata.seq_lens,
+                staged_table[:, :table_width],
+                num_decode,
+                metadata.num_decodes,
             )
+            result = torch.ops._C_ascend.npu_sparse_flash_attention(
+                query=ql_nope[num_decode:query_end],
+                key=latent,
+                value=latent,
+                sparse_indices=selected,
+                scale_value=self.scale,
+                sparse_block_size=1,
+                block_table=expanded_table,
+                actual_seq_lengths_query=query_ends,
+                actual_seq_lengths_kv=valid_lengths,
+                query_rope=q_pe[num_decode:query_end] if self.qk_rope_head_dim else None,
+                key_rope=rope if self.qk_rope_head_dim else None,
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+                attention_mode=2,
+            )
+            if isinstance(result, tuple):
+                result = result[0]
+            outputs.append(result.masked_fill(~(selected >= 0).any(dim=-1)[:, :, None], 0))
         if not outputs:
             return torch.zeros_like(ql_nope)
         result = torch.cat(outputs, dim=0) if len(outputs) > 1 else outputs[0]

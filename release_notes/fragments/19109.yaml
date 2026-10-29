@@ -3,3 +3,6 @@ entries:
   - category: feature
     text: Added experimental HiSparse host KV caching for sparse MLA on Ascend 950 with Model Runner V2, BF16 indexer KV and unquantized main KV. Host pools are allocated separately for each worker rank.
     hardware: [950]
+  - category: performance
+    text: HiSparse prefill now splits each staged KV row once and uses paged SFA with fused causal index preparation, removing per-query KV expansion and repeated attention launches.
+    hardware: [950]

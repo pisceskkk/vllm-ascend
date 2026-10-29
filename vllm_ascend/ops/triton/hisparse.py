@@ -483,6 +483,46 @@ def invalidate_kernel(
 
 
 @triton.jit
+def prepare_prefill_attention_kernel(
+    logical,
+    requests,
+    query_starts,
+    seq_lens,
+    table,
+    selected,
+    query_ends,
+    valid_lengths,
+    expanded_table,
+    QUERY_OFFSET: tl.constexpr,
+    REQUEST_OFFSET: tl.constexpr,
+    INPUT_STRIDE: tl.constexpr,
+    TABLE_STRIDE: tl.constexpr,
+    TOP_K: tl.constexpr,
+    TABLE_WIDTH: tl.constexpr,
+    BK: tl.constexpr,
+    BT: tl.constexpr,
+):
+    row = tl.program_id(0)
+    request = tl.load(requests + row)
+    query_end = tl.load(query_starts + request + 1)
+    context_end = tl.load(seq_lens + request) - query_end + QUERY_OFFSET + row + 1
+    i = tl.arange(0, BK)
+    index = tl.load(logical + row * INPUT_STRIDE + i, mask=i < TOP_K, other=-1)
+    valid = (i < TOP_K) & (index >= 0) & (index < context_end)
+    prefix = tl.cumsum(valid.to(tl.int32), 0)
+    count = tl.sum(valid.to(tl.int32), 0)
+    # These stores have disjoint destinations: the compact valid prefix and
+    # the invalid tail. Preserve valid order and duplicate multiplicity.
+    tl.store(selected + row * TOP_K + prefix - 1, index, mask=valid)
+    tl.store(selected + row * TOP_K + i, -1, mask=(i >= count) & (i < TOP_K))
+    tl.store(query_ends + row, row + 1)
+    tl.store(valid_lengths + row, tl.maximum(count, 1))
+    page = tl.arange(0, BT)
+    value = tl.load(table + (request - REQUEST_OFFSET) * TABLE_STRIDE + page, mask=page < TABLE_WIDTH, other=0)
+    tl.store(expanded_table + row * TABLE_WIDTH + page, value, mask=page < TABLE_WIDTH)
+
+
+@triton.jit
 def pack_attention_rows_kernel(
     cache,
     indices,
