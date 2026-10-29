@@ -9,3 +9,6 @@ entries:
   - category: performance
     text: HiSparse batches with fully resident context now read packed KV directly in SFA, skipping prefill staging and split-cache copies without allocating a second full KV cache.
     hardware: [950, 910_93]
+  - category: bugfix
+    text: HiSparse keeps CPU thread affinity without migrating registered host KV pools during worker warmup, avoiding long NUMA migration scans of pinned pages.
+    hardware: [950, 910_93]
