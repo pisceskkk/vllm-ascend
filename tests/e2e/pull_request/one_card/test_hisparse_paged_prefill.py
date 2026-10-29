@@ -12,7 +12,8 @@ import torch_npu  # noqa: F401
 @pytest.mark.parametrize("capture", [False, True])
 @pytest.mark.parametrize("mixed", [False, True])
 @pytest.mark.parametrize("strided", [False, True])
-def test_paged_prefill_reference(capture, mixed, strided):
+@pytest.mark.parametrize("resident", [False, True])
+def test_paged_prefill_reference(capture, mixed, strided, resident):
     if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith("Ascend950"):
         pytest.skip("HiSparse SFA integration currently targets Ascend 950")
     torch.npu.set_device(0)
@@ -52,6 +53,8 @@ def test_paged_prefill_reference(capture, mixed, strided):
         values[2::7] = -1
         indices[decode + row, :33] = values
     indices[decode + 1] = -1
+    if resident and mixed:
+        indices[:decode, :3] = torch.tensor([0, -1, 0])
     gpu_indices, gpu_ends, gpu_lens = indices.to(device), ends.to(device), seq_lens.to(device)
     metadata = SimpleNamespace(
         req_id_per_token=torch.tensor(
@@ -67,6 +70,7 @@ def test_paged_prefill_reference(capture, mixed, strided):
         seq_lens=gpu_lens,
         block_size=128,
         max_seq_len=265,
+        num_reqs=decode + 2,
     )
     group = SimpleNamespace(
         set_logical_topk_ready=lambda _: None,
@@ -74,6 +78,7 @@ def test_paged_prefill_reference(capture, mixed, strided):
         physical_kv_cache=lambda _: cache,
     )
     impl = SimpleNamespace(
+        _packed_resident_supported=resident,
         index_group=group,
         index_group_index=0,
         kv_lora_rank=latent,
@@ -86,6 +91,34 @@ def test_paged_prefill_reference(capture, mixed, strided):
         ),
         _attention_physical=lambda query, *_: torch.full_like(query, 7),
     )
+    if resident:
+        # Request-state rows differ from batch rows; HMA pages may be
+        # interleaved with another cache in the same backing allocation.
+        states = torch.tensor([4, 1, 5, 2][: decode + 2], dtype=torch.int32, device=device)
+        all_table = torch.cat((table[:decode], table)) if mixed else table
+        resident_table = torch.zeros(6, 9, dtype=torch.int32, device=device)
+        resident_table[states.long(), :3] = all_table
+        impl.hisparse_cache.all_context_pages_resident = True
+        impl.hisparse_cache.block_table = resident_table
+        impl.hisparse_cache.runtime.request_state_indices = states
+        impl.hisparse_cache.view = SimpleNamespace(
+            block_size=128,
+            cache=cache,
+            attention_cache=backing.view(-1, 128, latent + rope) if strided else cache,
+            attention_block_stride=256 if strided else 128,
+        )
+        if strided:
+            # cache is backing[:, 1], so add its page offset before scaling.
+            # Model the same aligned HMA layer offset as PagedCacheView.bind.
+            impl.hisparse_cache.view.attention_cache = backing.view(-1)[128 * (latent + rope) :].view(
+                -1, 128, latent + rope
+            )
+
+        def unexpected_staging(*_):
+            raise AssertionError("All-resident attention must skip prefill staging")
+
+        group.stage_prefill_rows = unexpected_staging
+        impl.hisparse_cache.swap_in = unexpected_staging
 
     def forward():
         return AscendHiSparseImpl._execute_sparse_flash_attention_process(
@@ -128,7 +161,10 @@ def test_paged_prefill_reference(capture, mixed, strided):
             actual = forward()
         actual = actual.float().cpu()
         expected = torch.zeros_like(query.float())
-        expected[:decode] = 7
+        expected[:decode] = 0 if resident else 7
+        if resident and mixed:
+            for row in range(decode):
+                expected[row] = source[table_cpu[row, 0], 0, :latent].float()
         for row in range(queries):
             req = int(row >= counts[0])
             offset = row if req == 0 else row - counts[0]
@@ -149,6 +185,57 @@ def test_paged_prefill_reference(capture, mixed, strided):
         torch.npu.synchronize()
         if graph is not None:
             graph.reset()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("heads", [1, 128])
+def test_packed_sfa_reference(dtype, heads):
+    if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith("Ascend950"):
+        pytest.skip("Packed SFA currently targets Ascend 950")
+    torch.npu.set_device(0)
+    from vllm_ascend.utils import bootstrap_custom_op_env
+
+    bootstrap_custom_op_env()
+    import vllm_ascend.vllm_ascend_C  # noqa: F401
+
+    torch.manual_seed(97)
+    source = torch.randn(4, 128, 1, 576).to(dtype)
+    query = torch.randn(3, heads, 512).to(dtype)
+    query_rope = torch.randn(3, heads, 64).to(dtype)
+    table = torch.tensor([[3, 1], [2, 0], [1, 3]], dtype=torch.int32)
+    indices = torch.randint(0, 256, (3, 1, 128), dtype=torch.int32)
+    indices[:, :, 1] = indices[:, :, 0]
+    packed = source.to("npu")
+    result = (
+        torch.ops._C_ascend.npu_sparse_flash_attention(
+            query=query.to("npu"),
+            key=packed,
+            value=packed,
+            sparse_indices=indices.to("npu"),
+            scale_value=576**-0.5,
+            sparse_block_size=1,
+            block_table=table.to("npu"),
+            actual_seq_lengths_query=torch.arange(1, 4, dtype=torch.int32, device="npu"),
+            actual_seq_lengths_kv=torch.full((3,), 128, dtype=torch.int32, device="npu"),
+            query_rope=query_rope.to("npu"),
+            key_rope=packed,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            sparse_mode=3,
+            attention_mode=2,
+        )[0]
+        .float()
+        .cpu()
+    )
+    expected = torch.empty_like(query.float())
+    for row in range(3):
+        selected = indices[row, 0].long()
+        values = source[table[row, selected // 128].long(), selected % 128, 0].float()
+        logits = query[row].float() @ values[:, :512].T
+        logits += query_rope[row].float() @ values[:, 512:].T
+        expected[row] = (logits * 576**-0.5).softmax(-1) @ values[:, :512]
+    atol, rtol = (0.005, 0.025) if dtype == torch.bfloat16 else (0.001, 0.01)
+    torch.testing.assert_close(result, expected, atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize("rows,topk,capture", [(0, 128, False), (1, 128, False), (129, 2048, True), (129, 3072, False)])

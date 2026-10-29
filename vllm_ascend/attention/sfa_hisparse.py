@@ -11,6 +11,7 @@ from vllm.v1.hisparse.runtime import HiSparsePrefillStagingPlan, build_hisparse_
 from vllm.v1.worker.workspace import current_workspace_manager
 
 from vllm_ascend.attention.sfa_v1 import AscendSFAImpl, AscendSFAMetadata, AscendSFAMetadataBuilder
+from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, get_current_hardware_profile
 
 # Bound the temporary D2D packing workspace independently of prefill length.
 _ATTENTION_CHUNK_ROWS = 32
@@ -101,6 +102,11 @@ class AscendHiSparseImpl(AscendSFAImpl):
             self.vllm_config.compilation_config.max_cudagraph_capture_size or 0,
         )
         self._kv_staging_capacity = (max_rows + 127) // 128 * 128
+        self._packed_resident_supported = (
+            get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
+            and self.kv_lora_rank == 512
+            and self.qk_rope_head_dim == 64
+        )
 
     def _fused_preprocess_type(self):
         # Fused prologs write the ordinary split cache directly. HiSparse owns
@@ -261,6 +267,56 @@ class AscendHiSparseImpl(AscendSFAImpl):
         rows = torch.arange(logical.shape[0], dtype=torch.int32, device=logical.device)
         logical = torch.where(rows[:, None] < metadata.query_start_loc[-1], logical, -1)
         self.index_group.set_logical_topk_ready(self.index_group_index)
+        cache = self.hisparse_cache
+        if (
+            metadata.num_prefills
+            and self._packed_resident_supported
+            and cache.all_context_pages_resident
+            and cache.view is not None
+            and cache.view.block_size == metadata.block_size
+            and cache.view.attention_cache.is_contiguous()
+        ):
+            from vllm_ascend.ops.hisparse import prepare_prefill_attention
+
+            # The coordinator's resident flag covers every request in the
+            # current batch. Read the original packed cache, including mixed
+            # decode rows, without gathering or allocating a split KV mirror.
+            assert cache.block_table is not None
+            states = cache.runtime.request_state_indices
+            assert states is not None
+            width = (metadata.max_seq_len + metadata.block_size - 1) // metadata.block_size
+            table = cache.block_table[:, :width].index_select(0, states[: metadata.num_reqs])
+            table = table * (cache.view.attention_block_stride // metadata.block_size)
+            selected, query_ends, valid_lengths, expanded_table = prepare_prefill_attention(
+                logical,
+                metadata.req_id_per_token,
+                metadata.query_start_loc,
+                metadata.seq_lens,
+                table,
+                0,
+                0,
+            )
+            packed = cache.view.attention_cache.unsqueeze(2)
+            result = torch.ops._C_ascend.npu_sparse_flash_attention(
+                query=ql_nope,
+                key=packed,
+                value=packed,
+                sparse_indices=selected,
+                scale_value=self.scale,
+                sparse_block_size=1,
+                block_table=expanded_table,
+                actual_seq_lengths_query=query_ends,
+                actual_seq_lengths_kv=valid_lengths,
+                query_rope=q_pe,
+                key_rope=packed,
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+                attention_mode=2,
+            )
+            if isinstance(result, tuple):
+                result = result[0]
+            return result.masked_fill(~(selected >= 0).any(dim=-1)[:, :, None], 0)
         outputs = []
         num_decode = metadata.num_decode_tokens
         if num_decode:

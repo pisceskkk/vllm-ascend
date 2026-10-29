@@ -169,6 +169,7 @@ TILING_DATA_FIELD_DEF(uint32_t, sparseBlockCount)
 TILING_DATA_FIELD_DEF(uint32_t, isActualLenDimsNull)
 TILING_DATA_FIELD_DEF(uint32_t, isActualLenDimsKVNull)
 TILING_DATA_FIELD_DEF(uint32_t, ropeHeadDim)
+TILING_DATA_FIELD_DEF(uint32_t, kvRowStride)
 END_TILING_DATA_DEF
 REGISTER_TILING_DATA_CLASS(SparseFlashAttentionBaseParamsMlaOp, SparseFlashAttentionBaseParamsMla)
 
@@ -248,6 +249,7 @@ struct SFATilingInfo {
     int64_t s2Size = 0;
     uint32_t qkHeadDim = 0;
     uint32_t vHeadDim = 0;
+    uint32_t kvRowStride = 512;
     uint32_t gSize = 0;
     uint32_t ropeHeadDim = 0;
     uint32_t qTSize = 0; // 仅TND时生效

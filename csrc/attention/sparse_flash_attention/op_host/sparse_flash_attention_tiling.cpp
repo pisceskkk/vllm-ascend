@@ -371,6 +371,7 @@ void SFAMlaTiling::FillTilingBaseParamsMla()
     tilingData_.baseParams.set_isActualLenDimsNull(sfaInfo_->actualQSeqLenFlag ? 0U : 1U);
     tilingData_.baseParams.set_isActualLenDimsKVNull(sfaInfo_->actualSeqLenFlag ? 0U : 1U);
     tilingData_.baseParams.set_ropeHeadDim(sfaInfo_->ropeHeadDim);
+    tilingData_.baseParams.set_kvRowStride(sfaInfo_->kvRowStride);
 }
 
 // for flash decode
@@ -1182,13 +1183,13 @@ ge::graphStatus SFATilingCheck::CheckVAndKRopeShapeForPageAttention()
     shapeParams.Bn = blockNum;
     shapeParams.N = n2Size_;
     shapeParams.Bs = blockSize_;
-    shapeParams.D = vHeadDim_;
+    shapeParams.D = sfaInfo_.kvRowStride;
     shapeParams.T = kvTSize_;
     if (CompareShape(shapeParams, valueShapeCmp_, kvLayout_, VALUE_NAME) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
 
-    shapeParams.D = ropeHeadDim_;
+    shapeParams.D = sfaInfo_.kvRowStride == 576 ? 576 : ropeHeadDim_;
     if (CompareShape(shapeParams, keyRopeShapeCmp_, kvLayout_, KEY_ROPE_NAME) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
@@ -1342,6 +1343,13 @@ ge::graphStatus SFATilingCheck::CheckMultiParaConsistency()
 
 ge::graphStatus SFATilingCheck::CheckFeatureMlaNoQuantShape() const
 {
+    OP_CHECK_IF(sfaInfo_.kvRowStride != 512 && sfaInfo_.kvRowStride != 576,
+        OP_LOGE(opName_, "KV row width should be 512 or packed 576, got %u", sfaInfo_.kvRowStride),
+        return ge::GRAPH_FAILED);
+    OP_CHECK_IF(sfaInfo_.kvRowStride == 576 &&
+        (!isA5_ || kvLayout_ != SFALayout::PA_BSND || sfaInfo_.sparseBlockSize != 1),
+        OP_LOGE(opName_, "Packed 512+64 KV requires Ascend 950, PA_BSND and sparse_block_size=1"),
+        return ge::GRAPH_FAILED);
     OP_CHECK_IF(bSize_ <= 0,
         OP_LOGE(opName_, "batch_size should be greater than 0, but got %u", bSize_),
         return ge::GRAPH_FAILED);
@@ -1895,7 +1903,8 @@ ge::graphStatus SFAInfoParser::GetValueHeadDim()
 {
     // 获取vHeadDim基准值
     // 以value的D维度为基准
-    vHeadDim_ = GetAxisNum(valueShape_, SFAAxis::D, kvLayout_);
+    const auto keyDim = GetAxisNum(keyShape_, SFAAxis::D, kvLayout_);
+    vHeadDim_ = keyDim == 576 ? 512 : GetAxisNum(valueShape_, SFAAxis::D, kvLayout_);
     return ge::GRAPH_SUCCESS;
 }
 
@@ -2012,6 +2021,7 @@ void SFAInfoParser::GenerateInfo(SFATilingInfo &sfaInfo)
     sfaInfo.gSize = gSize_;
     sfaInfo.qkHeadDim = qkHeadDim_;
     sfaInfo.vHeadDim = vHeadDim_;
+    sfaInfo.kvRowStride = GetAxisNum(keyShape_, SFAAxis::D, kvLayout_);
     sfaInfo.ropeHeadDim = ropeHeadDim_;
     sfaInfo.qTSize = qTSize_;
     sfaInfo.kvTSize = kvTSize_;

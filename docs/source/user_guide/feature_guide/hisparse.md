@@ -22,6 +22,8 @@ The adapter reuses upstream scheduling, prefix-cache ownership, page spills, and
 
 KV preprocessing uses the same fused RMSNorm/RoPE operator as native SFA before copying the result into HiSparse's packed cache. A reusable split cache preserves the native operator's BF16 rounding and is allocated during profiling, before graph capture. Local temporary slots include padding; the final packed write masks invalid slots and inactive rows.
 
+When the coordinator confirms that all context pages in the batch remain resident, prefill and any mixed decode rows read the original packed KV cache directly. This fast path skips prefill staging and split-cache copies, with no additional full KV mirror. It requires the Ascend 950 SFA operator built from the same source revision, including packed 512+64 KV support. Batches containing nonresident context pages retain the staged path.
+
 ## Requirements and limits
 
 | Area | Requirement |
