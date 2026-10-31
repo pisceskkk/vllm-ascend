@@ -142,7 +142,7 @@ class AscendHiSparseBackend(HiSparseBackend):
         raise NotImplementedError("Ascend HiSparse does not import NPU IPC events.")
 
     def gather_resident_rows(self, source: torch.Tensor, destination: torch.Tensor, row_ids: torch.Tensor) -> None:
-        """Copy packed rows as bytes, including RoPE and scale payloads in C8.
+        """Copy component rows as bytes while retaining page gaps.
 
         The source may have gaps between physical pages. Reinterpret FP8 views
         before indexing because NPU advanced indexing does not support FP8.
@@ -183,7 +183,7 @@ class AscendHiSparseBackend(HiSparseBackend):
         # Native SFA stages opaque rows via gather_prefill_cache and consumes
         # the Ascend C8 layout directly; CUDA fp8_ds_mla has a different layout.
         raise NotImplementedError(
-            "Ascend HiSparse uses native SFA prefill with packed KV rows; "
+            "Ascend HiSparse uses native SFA prefill with split KV planes; "
             "the CUDA fp8_ds_mla prefill conversion path is unsupported."
         )
 

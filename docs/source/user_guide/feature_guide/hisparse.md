@@ -18,11 +18,13 @@ Sparse indexer -> logical top-k tokens -> NPU residency resolver
 
 The resolver protects the union of tokens selected by all MTP query rows before choosing eviction slots. It uses device sorting and Triton-Ascend kernels with persistent scratch buffers. Decode does not copy top-k indices to the CPU for transfer planning.
 
-The adapter reuses upstream scheduling, prefix-cache ownership, page spills, and host-mirror completion. During prefill, staged KV is split into latent/RoPE storage once per cached token. A device kernel filters selections to the causal context, stable-compacts valid indices, and builds per-query page tables and selection lengths for one SFA call. Table width follows the current context upper bound rather than the configured maximum model length. Empty and graph-padding query rows produce zero output. Decode retains the resident/hot-cache resolver and bounded selected-row packing. Both paths preserve valid selection order and duplicates to avoid additional BF16 reduction differences. Staging and device copying remain execution costs; measure throughput and latency for the intended workload.
+The adapter reuses upstream scheduling, prefix-cache ownership, page spills, and host-mirror completion. Host, resident, and hot caches use separate 512-dimensional latent and 64-dimensional RoPE planes. Both planes share one logical page allocator and the original KV memory budget. Runtime layer views retain shared-slab gaps; attention views are contiguous and use a common scaled page table. Indexer pages retain their own contiguous format within the latent plane, with initialization checks for slab capacity and layer offsets.
 
-KV preprocessing uses the same fused RMSNorm/RoPE operator as native SFA before copying the result into HiSparse's packed cache. A reusable split cache preserves the native operator's BF16 rounding and is allocated during profiling, before graph capture. Local temporary slots include padding; the final packed write masks invalid slots and inactive rows.
+KV preprocessing uses native fused RMSNorm/RoPE to write the two destination planes directly. Slot translation masks invalid slots and inactive rows. Resident mirrors, page spills, restores, and host copies transfer both components in one batched DMA submission. This avoids a preprocessing scratch cache and a separate payload scatter.
 
-When the coordinator confirms that all context pages in the batch remain resident, prefill and any mixed decode rows read the original packed KV cache directly. This fast path skips prefill staging and split-cache copies, with no additional full KV mirror. It requires the Ascend 950 or 910_93 SFA operator built from the same source revision, including packed 512+64 KV support. Batches containing nonresident context pages retain the staged path.
+When the coordinator confirms that all context pages in the batch remain resident, prefill and mixed decode rows read the resident planes directly, skipping prefill staging. Other prefill batches gather resident and host rows into two contiguous staging tensors. A device kernel filters selections to the causal context, stable-compacts valid indices, and builds per-query page tables and lengths for one SFA call. Table width follows the current context upper bound. Empty and graph-padding query rows produce zero output.
+
+Decode retains the resident/hot-cache resolver and a bounded selected-row workspace. Both paths preserve valid selection order and duplicates. SFA uses its existing 512/64 input interface on Ascend 950 and 910_93; this adapter requires no changes to its tiling or device kernels. Staging and device copying remain execution costs; measure throughput and latency for the intended workload.
 
 ## Requirements and limits
 
@@ -33,6 +35,7 @@ When the coordinator confirms that all context pages in the batch remain residen
 | Model path | Sparse MLA/DSA with a sparse-index group |
 | KV formats | BF16 indexer KV and unquantized main KV; model-weight quantization is independent |
 | Context parallelism | Prefill and decode context-parallel sizes must both be 1 |
+| MLA dimensions | 512 latent and 64 RoPE |
 | Sparse selection | SFA requires top-k divisible by 128 |
 | Hot cache | Representation supports at most 32768 aligned rows; NPU tests cover capacities through 10240. Capacity must cover the complete query-row union |
 | Host allocation | Private pool per worker rank; account for the sum across TP ranks |
@@ -77,20 +80,21 @@ ASCEND_RT_VISIBLE_DEVICES=0 python -m pytest \
   tests/e2e/pull_request/one_card/test_hisparse_paged_prefill.py \
   tests/e2e/pull_request/one_card/test_hisparse_prefill_staging.py \
   tests/e2e/pull_request/one_card/test_hisparse_selection_order.py \
-  tests/e2e/pull_request/one_card/test_hisparse_kv_preprocess.py -v
+  tests/e2e/pull_request/one_card/test_hisparse_kv_preprocess.py \
+  tests/e2e/pull_request/one_card/test_hisparse_split.py -v
 ```
 
 These tests compare state transitions and KV payloads with a CPU reference. They cover resident hits, hot-cache hits, host misses, reordered request state, padded rows, physical cache strides, compact gathers, invalidation after KV writes, and ACL graph replay. Large cases include top-k 2048 and four query rows with an 8192-row union. The attention tests independently compute QK, masked softmax, and weighted values in FP32 on CPU, including duplicate selections and empty rows. `--confcutdir` keeps these tests independent of the model-download fixtures. Passing operator tests alone does not establish full-model accuracy or performance.
 
 The prefill staging tests check resident and host rows across shared-layer cache views and different resident page sizes. The selection-order tests check interleaved padding, duplicates, empty rows, and changed selections during graph replay.
 
-The KV preprocessing tests include a fixed BF16 activation row that exposes a rounding difference between standalone and fused RMSNorm. They require native fused results to match exactly, including strided packed destinations, invalid slots, padding, and graph replay with changed inputs.
+The KV preprocessing tests include a fixed BF16 activation row that exposes a rounding difference between standalone and fused RMSNorm. They require native fused results to match exactly, including split planes in shared backing, page-boundary writes, invalid slots, padding, and graph replay with changed inputs.
 
 ## Platform backend dependency
 
 The platform-backend interface from vLLM PR
 [#62592](https://github.com/vllm-project/vllm/pull/62592) is merged upstream.
-This integration is adapted to vLLM `af4db2a675f79ed20a8888ee0ec0c71ad581ad25`
+This integration requires the component-cache backend hooks in vLLM `611502d66a`
 and Ascend main `e8a6393dda93e085cd8210011c6ec12027acb8a0`.
 Pin the paired revisions and integration changes when reproducing validation.
 
@@ -98,14 +102,12 @@ Pin the paired revisions and integration changes when reproducing validation.
 The common runtime owns scheduling, TP coordination, allocation rollback and
 synchronization before Host release. The plugin owns NPU operations and view
 adaptation through `validate_kv_cache_config()` and `prepare_kv_cache_views()`.
-The previous patch of `init_hisparse_kv_cache` is removed: indexer views are now
-prepared before common handle binding, inside its rollback scope.
+Indexer views are prepared before common handle binding, inside its rollback scope.
 
 `gather_resident_rows()` copies complete payloads while preserving page strides
 and layer offsets. FP8-typed payloads use `uint8` views before indexing, avoiding
 unsupported NPU FP8 indexing without numerical conversion. This primitive does
-not add end-to-end attention C8 support to this BF16 feature PR. Native attention
-C8 integration remains a separate experimental branch. The CUDA `fp8_ds_mla`
+not add end-to-end attention C8 support to this BF16 feature PR. The CUDA `fp8_ds_mla`
 prefill conversion path is explicitly rejected rather than reinterpreting its
 layout as Ascend storage.
 

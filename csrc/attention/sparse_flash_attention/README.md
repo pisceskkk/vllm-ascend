@@ -1,11 +1,5 @@
 # SparseFlashAttention
 
-Ascend 950 额外支持 HiSparse 的 packed KV：在 `layout_kv="PA_BSND"`、
-`sparse_block_size=1` 时，`key`、`value`、`key_rope` 可传入同一个连续的
-`[block_num, block_size, 1, 576]` 张量，每行保存 512 维 latent 和 64 维 RoPE。
-query 及输出仍为 512 维，query_rope 为 64 维。算子直接读取 packed 行，
-不生成完整 split KV 缓存。原有 512/64 分离输入继续使用原路径。
-
 ## 产品支持情况
 
 |产品      | 是否支持 |

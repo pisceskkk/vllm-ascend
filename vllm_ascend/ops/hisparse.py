@@ -22,14 +22,11 @@ from vllm_ascend.ops.triton.hisparse import (
     finish_residency_kernel,
     gather_rows_kernel,
     invalidate_kernel,
-    pack_attention_rows_kernel,
-    pack_unaligned_attention_rows_kernel,
     partition_residency_kernel,
     prepare_prefill_attention_kernel,
     prepare_residency_kernel,
     protect_residency_kernel,
     residency_stats_kernel,
-    scatter_packed_kv_kernel,
     update_lru_kernel,
 )
 
@@ -694,93 +691,3 @@ def prepare_prefill_attention(
             multibuffer=False,
         )
     return selected[:, None, :], query_ends, valid_lengths, expanded_table
-
-
-def pack_attention_rows(packed_cache, physical_topk, selected_latent_out, selected_rope_out, latent_dim) -> None:
-    """Gather packed physical KV rows into the split, dense SFA input layout."""
-    _check_packed_cache(packed_cache)
-    device = packed_cache.device
-    _check_tensor(physical_topk, "physical_topk", device, (torch.int32,), ndim=2, contiguous=False)
-    if physical_topk.stride(1) != 1:
-        raise ValueError("HiSparse attention top-k columns must be contiguous")
-    rows, topk = physical_topk.shape
-    width = packed_cache.size(-1)
-    if not 0 < latent_dim < width:
-        raise ValueError("HiSparse attention requires nonempty latent and RoPE rows")
-    _check_tensor(selected_latent_out, "selected_latent_out", device, (packed_cache.dtype,))
-    _check_tensor(selected_rope_out, "selected_rope_out", device, (packed_cache.dtype,))
-    if selected_latent_out.numel() != rows * topk * latent_dim or selected_rope_out.numel() != rows * topk * (
-        width - latent_dim
-    ):
-        raise ValueError("HiSparse attention staging shapes do not match the selected rows")
-    if rows and (
-        latent_dim * packed_cache.element_size() % 32 or (width - latent_dim) * packed_cache.element_size() % 32
-    ):
-        pack_unaligned_attention_rows_kernel[(triton.cdiv(rows * topk * max(latent_dim, width - latent_dim), 256),)](
-            packed_cache,
-            physical_topk,
-            selected_latent_out,
-            selected_rope_out,
-            ROWS=rows,
-            K=topk,
-            CACHE_ROWS=packed_cache.size(0) * packed_cache.size(1),
-            CACHE_BLOCK=packed_cache.size(1),
-            CACHE_STRIDE=packed_cache.stride(0),
-            WIDTH=width,
-            LATENT=latent_dim,
-            INDEX_STRIDE=physical_topk.stride(0),
-            BLOCK=256,
-            multibuffer=False,
-        )
-    elif rows:
-        pack_attention_rows_kernel[(rows, topk)](
-            packed_cache,
-            physical_topk,
-            selected_latent_out,
-            selected_rope_out,
-            K=topk,
-            CACHE_ROWS=packed_cache.size(0) * packed_cache.size(1),
-            CACHE_BLOCK=packed_cache.size(1),
-            CACHE_STRIDE=packed_cache.stride(0),
-            WIDTH=width,
-            LATENT=latent_dim,
-            INDEX_STRIDE=physical_topk.stride(0),
-            BLOCK=triton.next_power_of_2(width),
-            multibuffer=False,
-        )
-
-
-def scatter_packed_kv(k_nope, k_rope, packed_cache, slot_mapping, num_valid_rows=None) -> None:
-    """Write current KV with explicit page strides; ignore padding slots."""
-    _check_packed_cache(packed_cache)
-    device = packed_cache.device
-    _check_tensor(slot_mapping, "slot_mapping", device, (torch.int32, torch.int64), ndim=1)
-    rows = slot_mapping.numel()
-    _check_payload_rows(k_nope, "k_nope", device, packed_cache.dtype, rows)
-    _check_payload_rows(k_rope, "k_rope", device, packed_cache.dtype, rows)
-    if num_valid_rows is not None:
-        _check_tensor(num_valid_rows, "num_valid_rows", device, (torch.int32, torch.int64))
-        if num_valid_rows.numel() != 1:
-            raise ValueError("num_valid_rows must contain one device scalar")
-    latent_dim = math.prod(k_nope.shape[1:])
-    rope_dim = math.prod(k_rope.shape[1:])
-    if latent_dim + rope_dim != packed_cache.size(-1):
-        raise ValueError("HiSparse packed row width must equal latent + RoPE widths")
-    if rows:
-        scatter_packed_kv_kernel[(rows,)](
-            k_nope,
-            k_rope,
-            packed_cache,
-            slot_mapping,
-            num_valid_rows if num_valid_rows is not None else slot_mapping,
-            CACHE_ROWS=packed_cache.size(0) * packed_cache.size(1),
-            CACHE_BLOCK=packed_cache.size(1),
-            CACHE_STRIDE=packed_cache.stride(0),
-            WIDTH=latent_dim + rope_dim,
-            LATENT=latent_dim,
-            LATENT_STRIDE=k_nope.stride(0),
-            ROPE_STRIDE=k_rope.stride(0),
-            HAS_VALID=num_valid_rows is not None,
-            BLOCK=triton.next_power_of_2(latent_dim + rope_dim),
-            multibuffer=False,
-        )

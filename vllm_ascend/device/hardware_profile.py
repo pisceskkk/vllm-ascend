@@ -48,8 +48,6 @@ class HardwareCapability(Enum):
     as broad claims about the underlying silicon.
     """
 
-    # Paged SFA accepts interleaved 512+64 KV rows without a split mirror.
-    SFA_PACKED_KV = auto()
     # SFA interprets per-query KV lengths as compact selection counts.
     SFA_SELECTION_LENGTHS = auto()
 
@@ -288,7 +286,6 @@ _STANDARD_CAPABILITIES = frozenset(
     }
 )
 _A3_CAPABILITIES = _STANDARD_CAPABILITIES | {
-    HardwareCapability.SFA_PACKED_KV,
     HardwareCapability.MC2_FULLMESH_V2_COMM,
     HardwareCapability.RMS_NORM_CAST,
 }
@@ -359,7 +356,6 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
             quantization_backend_family=QuantizationBackendFamily.STANDARD,
             capabilities=frozenset(
                 {
-                    HardwareCapability.SFA_PACKED_KV,
                     HardwareCapability.SFA_SELECTION_LENGTHS,
                     HardwareCapability.AUTO_ENABLE_CUSTOM_OPS,
                     HardwareCapability.SCATTER_ND_CACHE_STORE,

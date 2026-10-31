@@ -241,8 +241,8 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             continue
 
         if isinstance(attn_module, MLAAttention) and vllm_config.attention_config.hisparse_config is not None:
-            # HiSparse owns row-packed host/resident/hot views. Keep the
-            # upstream MLA spec instead of selecting Ascend's split K/RoPE layout.
+            # HiSparse binds split planes over Core's shared slab. Keep the
+            # upstream MLA spec instead of independent per-layer allocations.
             # Ascend may retain an indexer only for cache writes while reusing
             # another layer's top-k. The physical pool must follow the actual
             # runtime group, not merely the presence of an indexer module.

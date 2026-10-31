@@ -12,6 +12,12 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 from vllm_ascend.attention.sfa_v1 import AscendSFAImpl, AscendSFAMetadata, AscendSFAMetadataBuilder
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+from vllm_ascend.distributed.kv_transfer.hisparse.layout import (
+    LATENT_WIDTH,
+    ROPE_WIDTH,
+    cache_components,
+    combine_components,
+)
 
 # Bound the temporary D2D packing workspace independently of prefill length.
 _ATTENTION_CHUNK_ROWS = 32
@@ -77,6 +83,8 @@ class AscendHiSparseImpl(AscendSFAImpl):
         super().__init__(*args, **kwargs)
         if self.enable_sparse_sfa_c8 or self.enable_sparse_sfa_turboquant:
             raise ValueError("Ascend HiSparse currently requires an unquantized main MLA KV cache")
+        if (self.kv_lora_rank, self.qk_rope_head_dim) != (LATENT_WIDTH, ROPE_WIDTH):
+            raise ValueError("Ascend HiSparse requires 512 latent and 64 RoPE dimensions")
         parallel = self.vllm_config.parallel_config
         if parallel.prefill_context_parallel_size > 1 or parallel.decode_context_parallel_size > 1:
             raise ValueError("Ascend HiSparse does not support context parallelism")
@@ -97,16 +105,6 @@ class AscendHiSparseImpl(AscendSFAImpl):
         self.topk = self.index_group.logical_topk_indices.shape[-1]
         if self.topk % 128:
             raise ValueError("Ascend HiSparse SFA requires top-k to be divisible by 128")
-        max_rows = max(
-            self.vllm_config.scheduler_config.max_num_batched_tokens,
-            self.vllm_config.compilation_config.max_cudagraph_capture_size or 0,
-        )
-        self._kv_staging_capacity = (max_rows + 127) // 128 * 128
-        self._packed_resident_supported = (
-            get_current_hardware_profile().supports(HardwareCapability.SFA_PACKED_KV)
-            and self.kv_lora_rank == 512
-            and self.qk_rope_head_dim == 64
-        )
 
     def _fused_preprocess_type(self):
         # Fused prologs write the ordinary split cache directly. HiSparse owns
@@ -136,104 +134,43 @@ class AscendHiSparseImpl(AscendSFAImpl):
 
         return current_workspace_manager().get_persistent_resource(key, allocate)
 
-    def _kv_workspace(self, dtype):
-        key = (
-            "ascend_hisparse_kv_preprocess",
-            self._kv_staging_capacity,
-            self.kv_lora_rank,
-            self.qk_rope_head_dim,
-            dtype,
-        )
-
-        def allocate():
-            device = self.index_group.logical_topk_indices.device
-            shape = (self._kv_staging_capacity // 128, 128, 1)
-            return (
-                torch.empty((*shape, self.kv_lora_rank), dtype=dtype, device=device),
-                torch.empty((*shape, self.qk_rope_head_dim), dtype=dtype, device=device),
-                torch.arange(self._kv_staging_capacity, dtype=torch.int64, device=device),
-            )
-
-        return current_workspace_manager().get_persistent_resource(key, allocate)
-
     def forward(self, layer_name, hidden_states, kv_cache, attn_metadata, output=None):
         self._workspace(hidden_states.dtype)
-        if self.qk_rope_head_dim:
-            # Include preprocessing scratch in profiling and allocate it before
-            # graph capture, including dummy forwards without attention metadata.
-            self._kv_workspace(hidden_states.dtype)
         self.index_group.prepare_for_batch(self.index_group_index, attn_metadata)
         return super().forward(layer_name, hidden_states, kv_cache, attn_metadata, output)
 
     def exec_kv(self, kv_no_split, cos, sin, kv_cache, slots, attn_metadata):
-        from vllm_ascend.distributed.kv_transfer.hisparse.layout import cache_components
-        from vllm_ascend.ops.hisparse import scatter_packed_kv
-
         assert self.kv_a_layernorm is not None
         values = kv_no_split.reshape(-1, self.kv_lora_rank + self.qk_rope_head_dim)
-        num_tokens = values.shape[0]
         cache = self.hisparse_cache
-        if getattr(cache, "view", None) is not None and len(cache_components(cache.view.attention_cache)) == 2:
-            _, mapping, num_rows = cache.write_target(num_tokens, slots.numel())
-            latent, rope = cache_components(cache.view.attention_cache)
-            block_size = cache.view.block_size
-            valid = torch.arange(num_rows, device=mapping.device) < attn_metadata.query_start_loc[-1]
-            physical_slots = torch.where(
-                (mapping >= 0) & valid,
-                mapping // block_size * cache.view.attention_block_stride + mapping % block_size,
-                -1,
-            ).to(torch.int64)
-            torch_npu.npu_kv_rmsnorm_rope_cache(
-                values[:num_rows].view(num_rows, self.num_kv_heads, 1, self.kv_lora_rank + self.qk_rope_head_dim),
-                self.kv_a_layernorm.weight,
-                cos[:num_rows],
-                sin[:num_rows],
-                physical_slots,
-                rope.unsqueeze(2),
-                latent.unsqueeze(2),
-                epsilon=self.kv_a_layernorm.variance_epsilon,
-                cache_mode="PA",
-            )
-            cache.finish_kv_update()
-            return None, None
-        if self.qk_rope_head_dim:
-            if num_tokens > self._kv_staging_capacity:
-                raise ValueError("HiSparse KV preprocessing exceeds its profiled token capacity")
-            latent_cache, rope_cache, local_slots = self._kv_workspace(values.dtype)
-            # Match ordinary SFA's fused RMSNorm/RoPE rounding. Separate RMSNorm
-            # can differ by a BF16 ULP near a rounding midpoint. Local slots
-            # isolate padding from the real resident/hot destination below.
-            torch_npu.npu_kv_rmsnorm_rope_cache(
-                values.view(num_tokens, self.num_kv_heads, 1, self.kv_lora_rank + self.qk_rope_head_dim),
-                self.kv_a_layernorm.weight,
-                cos,
-                sin,
-                local_slots[:num_tokens],
-                rope_cache,
-                latent_cache,
-                epsilon=self.kv_a_layernorm.variance_epsilon,
-                cache_mode="PA",
-            )
-            latent = latent_cache.view(-1, self.kv_lora_rank)[:num_tokens]
-            rope = rope_cache.view(-1, self.qk_rope_head_dim)[:num_tokens]
-        else:
-            # The native NoPE path uses the layer's normalization implementation.
-            latent = self.kv_a_layernorm(values)
-            rope = values[:, self.kv_lora_rank :]
-        cache = self.hisparse_cache
-        destination, mapping, num_rows = cache.write_target(values.shape[0], slots.numel())
-        num_valid_rows = attn_metadata.query_start_loc[-1:]
-        scatter_packed_kv(latent[:num_rows], rope[:num_rows], destination, mapping, num_valid_rows)
+        assert cache.view is not None
+        _, mapping, num_rows = cache.write_target(values.shape[0], slots.numel())
+        latent, rope = cache_components(cache.view.attention_cache)
+        block_size = cache.view.block_size
+        valid = torch.arange(num_rows, device=mapping.device) < attn_metadata.query_start_loc[-1]
+        physical_slots = torch.where(
+            (mapping >= 0) & valid,
+            mapping // block_size * cache.view.attention_block_stride + mapping % block_size,
+            -1,
+        ).to(torch.int64)
+        torch_npu.npu_kv_rmsnorm_rope_cache(
+            values[:num_rows].view(num_rows, self.num_kv_heads, 1, self.kv_lora_rank + self.qk_rope_head_dim),
+            self.kv_a_layernorm.weight,
+            cos[:num_rows],
+            sin[:num_rows],
+            physical_slots,
+            rope.unsqueeze(2),
+            latent.unsqueeze(2),
+            epsilon=self.kv_a_layernorm.variance_epsilon,
+            cache_mode="PA",
+        )
         # The common connector mirrors resident rows after this write. Draft
         # rows are deferred until the next step, and FULL graphs are mirrored
         # by finish_forward after replay.
         cache.finish_kv_update()
-        return rope, latent
+        return None, None
 
-    def _attention_physical(self, query, query_rope, packed_cache, physical_topk):
-        from vllm_ascend.distributed.kv_transfer.hisparse.layout import cache_components
-        from vllm_ascend.ops.hisparse import pack_attention_rows
-
+    def _attention_physical(self, query, query_rope, physical_cache, physical_topk):
         latent, rope, block_table, indices, query_ends, seq_lens = self._workspace(query.dtype)
         positions = indices.view(1, -1).to(torch.float32)
         outputs = []
@@ -250,14 +187,12 @@ class AscendHiSparseImpl(AscendSFAImpl):
             physical = physical.gather(1, keys.sort(dim=-1).indices)
             valid_lengths = (physical >= 0).sum(dim=-1, dtype=torch.int32)
             selected_latent, selected_rope = latent[:count], rope[:count]
-            components = cache_components(packed_cache)
-            if len(components) == 2:
-                row_ids = physical.clamp_min(0).to(torch.int64).view(-1)
-                for source, destination in zip(components, (selected_latent, selected_rope), strict=True):
-                    destination.copy_(source.view(-1, source.shape[-1]).index_select(0, row_ids).view_as(destination))
-                    destination.masked_fill_((physical < 0)[:, :, None, None], 0)
-            else:
-                pack_attention_rows(packed_cache, physical, selected_latent, selected_rope, self.kv_lora_rank)
+            row_ids = physical.clamp_min(0).to(torch.int64).view(-1)
+            for source, destination in zip(
+                cache_components(physical_cache), (selected_latent, selected_rope), strict=True
+            ):
+                destination.copy_(source.view(-1, source.shape[-1]).index_select(0, row_ids).view_as(destination))
+                destination.masked_fill_((physical < 0)[:, :, None, None], 0)
             selected_indices = torch.where(physical[:, None, :] >= 0, indices, -1)
             result = torch.ops._C_ascend.npu_sparse_flash_attention(
                 query=query[start:end],
@@ -301,14 +236,8 @@ class AscendHiSparseImpl(AscendSFAImpl):
         logical = torch.where(rows[:, None] < metadata.query_start_loc[-1], logical, -1)
         self.index_group.set_logical_topk_ready(self.index_group_index)
         cache = self.hisparse_cache
-        from vllm_ascend.distributed.kv_transfer.hisparse.layout import cache_components, combine_components
-
         if (
             metadata.num_prefills
-            and (
-                self._packed_resident_supported
-                or (getattr(cache, "view", None) is not None and len(cache_components(cache.view.attention_cache)) == 2)
-            )
             and cache.all_context_pages_resident
             and cache.view is not None
             and cache.view.block_size == metadata.block_size
@@ -317,8 +246,8 @@ class AscendHiSparseImpl(AscendSFAImpl):
             from vllm_ascend.ops.hisparse import prepare_prefill_attention
 
             # The coordinator's resident flag covers every request in the
-            # current batch. Read the original packed cache, including mixed
-            # decode rows, without gathering or allocating a split KV mirror.
+            # current batch. Read both resident planes, including mixed decode
+            # rows, without gathering or allocating another KV mirror.
             assert cache.block_table is not None
             states = cache.runtime.request_state_indices
             assert states is not None
@@ -396,16 +325,11 @@ class AscendHiSparseImpl(AscendSFAImpl):
             )
             from vllm_ascend.ops.hisparse import prepare_prefill_attention
 
-            # Split each staged row once. Per-query page tables and selection
-            # lengths avoid duplicating top-k KV payload and repeated SFA calls.
+            # Per-query page tables and selection lengths avoid duplicating
+            # top-k KV payload and repeated SFA calls.
             # Limit table copies to the CPU context upper bound, independently
             # of the configured maximum model length.
-            components = cache_components(staged)
-            if len(components) == 2:
-                latent, rope = (component.unsqueeze(2) for component in components)
-            else:
-                latent = staged[..., : self.kv_lora_rank].contiguous().unsqueeze(2)
-                rope = staged[..., self.kv_lora_rank :].contiguous().unsqueeze(2)
+            latent, rope = (component.unsqueeze(2) for component in cache_components(staged))
             query_end = logical.shape[0]
             table_width = (metadata.max_seq_len + metadata.block_size - 1) // metadata.block_size
             selected, query_ends, valid_lengths, expanded_table = prepare_prefill_attention(

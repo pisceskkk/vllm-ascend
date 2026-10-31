@@ -40,13 +40,14 @@ def _setup():
 
 
 @pytest.mark.parametrize("capture", [False, True])
-def test_fused_preprocess_preserves_native_rounding_and_packed_writes(monkeypatch, capture):
+@pytest.mark.parametrize("tokens", [17, 131])
+def test_fused_preprocess_writes_split_planes(monkeypatch, capture, tokens):
     _setup()
-    from vllm_ascend.attention import sfa_hisparse
+    from vllm_ascend.attention.sfa_hisparse import AscendHiSparseImpl
+    from vllm_ascend.distributed.kv_transfer.hisparse.layout import cache_components, split_paged_cache
 
-    tokens, width, capacity = 17, 576, 128
+    width = 576
     row = torch.frombuffer(bytearray.fromhex(_ROUNDING_ROW_HEX), dtype=torch.bfloat16).clone()
-    assert row.shape == (512,)
     values = torch.empty(tokens, 2624, dtype=torch.bfloat16, device="npu")[:, 2048:]
     source = torch.cat((row, torch.arange(64).to(torch.bfloat16) / 64)).expand(tokens, -1).clone()
     values.copy_(source.to("npu"))
@@ -54,8 +55,8 @@ def test_fused_preprocess_preserves_native_rounding_and_packed_writes(monkeypatc
     sin = torch.zeros_like(cos)
     gamma = torch.ones(512, dtype=values.dtype, device="npu")
     local_slots = torch.arange(tokens, dtype=torch.int64, device="npu")
-    reference_k = torch.empty(1, 128, 1, 512, dtype=values.dtype, device="npu")
-    reference_r = torch.empty(1, 128, 1, 64, dtype=values.dtype, device="npu")
+    reference_k = torch.empty((tokens + 127) // 128, 128, 1, 512, dtype=values.dtype, device="npu")
+    reference_r = torch.empty((tokens + 127) // 128, 128, 1, 64, dtype=values.dtype, device="npu")
 
     def native():
         torch_npu.npu_kv_rmsnorm_rope_cache(
@@ -73,51 +74,51 @@ def test_fused_preprocess_preserves_native_rounding_and_packed_writes(monkeypatc
 
     reference = native()
     old_split, _ = torch_npu.npu_rms_norm(values[:, :512], gamma, epsilon=1e-5)
-    # A random oracle can miss this rare rounding boundary. This fixture must
-    # demonstrate the old path's disagreement before checking the replacement.
     if torch.npu.get_device_name(0).startswith("Ascend950"):
         assert not torch.equal(old_split.cpu(), reference[:, :512])
-
-    resources = {}
-
-    def persistent(key, allocate):
-        if key not in resources:
-            resources[key] = allocate()
-        return resources[key]
-
-    monkeypatch.setattr(
-        sfa_hisparse, "current_workspace_manager", lambda: SimpleNamespace(get_persistent_resource=persistent)
-    )
     raw = torch.empty(4 * 6 * 128 * width * 2, dtype=torch.int8, device="npu")
     backing = raw.view(values.dtype)
-    target = backing.as_strided((4, 128, width), (6 * 128 * width, width, 1), 2 * 128 * width)
+    view = split_paged_cache(
+        raw,
+        dtype=values.dtype,
+        row_width=width,
+        byte_offset=2 * 128 * width * 2,
+        block_stride=6 * 128 * width * 2,
+        num_blocks=4,
+        block_size=128,
+    )
     slots_cpu = 256 + torch.arange(tokens, dtype=torch.int64)
     slots_cpu[::4] = -1
     slots = slots_cpu.to("npu")
     ends = torch.tensor([0, tokens], dtype=torch.int32, device="npu")
     mirrored = []
     handle = SimpleNamespace(
-        write_target=lambda count, slot_count: (target, slots, count),
+        view=view,
+        write_target=lambda count, slot_count: (view.cache, slots, count),
         finish_kv_update=lambda: mirrored.append(True),
     )
     impl = SimpleNamespace(
         kv_lora_rank=512,
         qk_rope_head_dim=64,
         num_kv_heads=1,
-        _kv_staging_capacity=capacity,
-        index_group=SimpleNamespace(logical_topk_indices=slots),
         kv_a_layernorm=SimpleNamespace(weight=gamma, variance_epsilon=1e-5),
         hisparse_cache=handle,
     )
-    impl._kv_workspace = lambda dtype: sfa_hisparse.AscendHiSparseImpl._kv_workspace(impl, dtype)
-    first = impl._kv_workspace(values.dtype)
-    assert all(a is b for a, b in zip(first, impl._kv_workspace(values.dtype)))
-    assert first[2].dtype == torch.int64 and first[2].numel() == capacity
 
     def forward():
-        return sfa_hisparse.AscendHiSparseImpl.exec_kv(
-            impl, values, cos, sin, None, slots, SimpleNamespace(query_start_loc=ends)
-        )
+        return AscendHiSparseImpl.exec_kv(impl, values, cos, sin, None, slots, SimpleNamespace(query_start_loc=ends))
+
+    def verify(valid):
+        expected_backing = torch.full_like(backing, -11).cpu()
+        offset = 0
+        for component in cache_components(view.cache):
+            expected = expected_backing.as_strided(component.shape, component.stride(), component.storage_offset())
+            size = component.shape[-1]
+            for row_id, slot in enumerate(slots_cpu.tolist()):
+                if row_id < valid and slot >= 0:
+                    expected[slot // 128, slot % 128].copy_(reference[row_id, offset : offset + size])
+            offset += size
+        torch.testing.assert_close(backing.cpu(), expected_backing, rtol=0, atol=0)
 
     graph = None
     try:
@@ -131,12 +132,11 @@ def test_fused_preprocess_preserves_native_rounding_and_packed_writes(monkeypatc
             torch.npu.synchronize()
             graph = torch.npu.NPUGraph()
             with torch.npu.graph(graph, stream=stream):
-                rope, latent = forward()
+                result = forward()
         else:
-            rope, latent = forward()
-        torch.testing.assert_close(latent.cpu(), reference[:, :512], rtol=0, atol=0)
-        torch.testing.assert_close(rope.cpu(), reference[:, 512:], rtol=0, atol=0)
-        assert mirrored
+            result = forward()
+        assert result == (None, None) and mirrored
+        verify(tokens)
         for iteration in range(3):
             values.copy_((source * (iteration + 2)).to("npu"))
             reference = native()
@@ -149,57 +149,9 @@ def test_fused_preprocess_preserves_native_rounding_and_packed_writes(monkeypatc
             if capture:
                 graph.replay()
             else:
-                rope, latent = forward()
-            expected_backing = torch.full_like(backing, -11).cpu()
-            expected = expected_backing.as_strided(target.shape, target.stride(), target.storage_offset())
-            for row_id, slot in enumerate(slots_cpu.tolist()):
-                if row_id < valid and slot >= 0:
-                    expected[slot // 128, slot % 128].copy_(reference[row_id])
-            torch.testing.assert_close(backing.cpu(), expected_backing, rtol=0, atol=0)
-            torch.testing.assert_close(latent.cpu(), reference[:, :512], rtol=0, atol=0)
-            torch.testing.assert_close(rope.cpu(), reference[:, 512:], rtol=0, atol=0)
+                forward()
+            verify(valid)
     finally:
         torch.npu.synchronize()
         if graph is not None:
             graph.reset()
-
-
-def test_nope_preprocess_uses_native_layernorm(monkeypatch):
-    _setup()
-    from vllm_ascend.attention.sfa_hisparse import AscendHiSparseImpl
-
-    values = torch.arange(3 * 512, dtype=torch.float32, device="npu").view(3, 512).to(torch.bfloat16)
-    target = torch.full((1, 128, 512), -7, dtype=values.dtype, device="npu")
-    slots = torch.tensor([1, -1, 4], dtype=torch.int64, device="npu")
-    calls = []
-
-    def norm(x):
-        calls.append(True)
-        return x * 2
-
-    def unexpected(*args, **kwargs):
-        raise AssertionError("NoPE must not call the RoPE fused kernel")
-
-    monkeypatch.setattr(torch_npu, "npu_kv_rmsnorm_rope_cache", unexpected)
-    impl = SimpleNamespace(
-        kv_lora_rank=512,
-        qk_rope_head_dim=0,
-        kv_a_layernorm=norm,
-        hisparse_cache=SimpleNamespace(
-            write_target=lambda count, slot_count: (target, slots, count),
-            finish_kv_update=lambda: None,
-        ),
-    )
-    rope, latent = AscendHiSparseImpl.exec_kv(
-        impl,
-        values,
-        None,
-        None,
-        None,
-        slots,
-        SimpleNamespace(query_start_loc=torch.tensor([0, 2], dtype=torch.int32, device="npu")),
-    )
-    expected = torch.full_like(target, -7).cpu()
-    expected[0, 1].copy_((values[0] * 2).cpu())
-    torch.testing.assert_close(target.cpu(), expected, rtol=0, atol=0)
-    assert calls and rope.shape == (3, 0) and latent.shape == values.shape

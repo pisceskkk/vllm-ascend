@@ -7,10 +7,10 @@ entries:
     text: Added experimental HiSparse host KV caching for sparse MLA on Ascend 950 and 910_93 with Model Runner V2, BF16 indexer KV and unquantized main KV. Host pools are allocated separately for each worker rank.
     hardware: [950, 910_93]
   - category: performance
-    text: HiSparse prefill now splits each staged KV row once and uses paged SFA with fused causal index preparation, removing per-query KV expansion and repeated attention launches.
+    text: HiSparse prefill uses two contiguous staging planes and paged SFA with fused causal index preparation, removing per-query KV expansion and repeated attention launches.
     hardware: [950, 910_93]
   - category: performance
-    text: HiSparse batches with fully resident context now read packed KV directly in SFA, skipping prefill staging and split-cache copies without allocating a second full KV cache.
+    text: HiSparse host, resident and hot caches share a split latent/RoPE layout within the existing KV budget. Native preprocessing writes both planes directly, and fully resident batches skip staging through the existing SFA interface.
     hardware: [950, 910_93]
   - category: bugfix
     text: HiSparse keeps CPU thread affinity without migrating registered host KV pools during worker warmup, avoiding long NUMA migration scans of pinned pages.

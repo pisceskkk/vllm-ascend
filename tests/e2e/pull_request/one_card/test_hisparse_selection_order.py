@@ -20,7 +20,7 @@ def test_valid_order_duplicates_and_interleaved_padding(monkeypatch, capture):
     import vllm_ascend.vllm_ascend_C  # noqa: F401
 
     from vllm_ascend.attention.sfa_hisparse import AscendHiSparseImpl
-    from vllm_ascend.ops import hisparse
+    from vllm_ascend.distributed.kv_transfer.hisparse.layout import combine_components
 
     torch.manual_seed(61)
     device, topk, latent, rope, capacity = "npu:0", 2048, 512, 64, 32
@@ -37,19 +37,26 @@ def test_valid_order_duplicates_and_interleaved_padding(monkeypatch, capture):
     )
     query = torch.randn(3, 8, latent, dtype=torch.bfloat16, device=device)
     query_rope = torch.randn(3, 8, rope, dtype=torch.bfloat16, device=device)
-    cache = torch.randn(1, 128, latent + rope, dtype=torch.bfloat16, device=device)
+    ids = torch.arange(128, dtype=torch.bfloat16, device=device)
+    cache = combine_components(
+        (
+            ids[:, None].expand(128, latent).contiguous().view(1, 128, latent),
+            torch.zeros(1, 128, rope, dtype=torch.bfloat16, device=device),
+        )
+    )
     indices = torch.full((3, topk), -1, dtype=torch.int32)
     indices[0, :6] = torch.tensor([7, -1, 2, 7, -1, 0])
     indices[2, :6] = torch.tensor([0, 5, -1, 3, 5, 1])
     device_indices = indices.to(device)
     observed = torch.empty_like(device_indices)
-    original_pack = hisparse.pack_attention_rows
+    original_sfa = torch.ops._C_ascend.npu_sparse_flash_attention
 
-    def observe(cache, physical, selected_latent, selected_rope, latent_dim):
-        observed.copy_(physical)
-        return original_pack(cache, physical, selected_latent, selected_rope, latent_dim)
+    def observe(**kwargs):
+        values = kwargs["key"].view(3, topk, 1, latent)[:, :, 0, 0].to(torch.int32)
+        observed.copy_(torch.where(kwargs["sparse_indices"].squeeze(1) >= 0, values, -1))
+        return original_sfa(**kwargs)
 
-    monkeypatch.setattr(hisparse, "pack_attention_rows", observe)
+    monkeypatch.setattr(torch.ops._C_ascend, "npu_sparse_flash_attention", observe)
 
     def forward():
         return AscendHiSparseImpl._attention_physical(impl, query, query_rope, cache, device_indices)

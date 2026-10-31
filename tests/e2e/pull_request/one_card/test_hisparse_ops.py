@@ -13,8 +13,6 @@ from vllm_ascend.ops.hisparse import (
     MappedHostTensor,
     ResolverWorkspace,
     allocate_mapped_host,
-    pack_attention_rows,
-    scatter_packed_kv,
 )
 
 
@@ -169,26 +167,6 @@ def test_resolver_strides_padding_graph(capture):
             torch.testing.assert_close(hot[dst // 4, dst % 4].cpu(), host[src])
     torch.testing.assert_close(backing[:, 0].cpu(), torch.full((10, 4, 16), -17.0))
     print(json.dumps({"resolver_mtp_union_lru_compact_gather": "PASS"}), flush=True)
-    latent = torch.empty((4, 8, 1, 12), device="npu")
-    rope = torch.empty((4, 8, 1, 4), device="npu")
-    pack_attention_rows(hot, out, latent, rope, 12)
-    torch.npu.synchronize()
-    hot_cpu = hot.cpu()
-    for row in range(4):
-        for col in range(8):
-            slot = int(expected[0][row, col])
-            value = torch.zeros(16) if slot < 0 else hot_cpu[slot // 4, slot % 4]
-            torch.testing.assert_close(latent[row, col, 0].cpu(), value[:12])
-            torch.testing.assert_close(rope[row, col, 0].cpu(), value[12:])
-    new_latent = torch.arange(36, dtype=torch.float32).view(3, 1, 1, 12).npu()
-    new_rope = torch.arange(12, dtype=torch.float32).view(3, 1, 1, 4).npu()
-    slots = torch.tensor([0, -1, 2], dtype=torch.int64, device="npu")
-    valid = torch.tensor([2], dtype=torch.int32, device="npu")
-    scatter_packed_kv(new_latent, new_rope, hot, slots, valid)
-    torch.npu.synchronize()
-    torch.testing.assert_close(hot[0, 0].cpu(), torch.cat((new_latent[0].flatten().cpu(), new_rope[0].flatten().cpu())))
-    torch.testing.assert_close(hot[0, 2].cpu(), hot_cpu[0, 2])
-    print(json.dumps({"pack_scatter_strides_padding": "PASS"}), flush=True)
     if not capture:
         mapping.close()
         return

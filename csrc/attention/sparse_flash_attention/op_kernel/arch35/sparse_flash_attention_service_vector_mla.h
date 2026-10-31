@@ -246,12 +246,6 @@ SFAVectorService<TEMPLATE_ARGS>::CopyInSingleKv(LocalTensor<KV_T> kvInUb, int64_
     if (keyOffset < 0) {
         return;
     }
-    if (constInfo.dSizeVInput == 576) {
-        DataCopyExtParams params{1, 576 * sizeof(KV_T), 0, 0, 0};
-        DataCopyPadExtParams<KV_T> pad{false, 0, 0, 0};
-        DataCopyPad(kvInUb[startRow * 576], keyGm[keyOffset * 576], params, pad);
-        return;
-    }
     DataCopyExtParams intriParams;
     
     intriParams.blockCount = 1;
@@ -283,12 +277,6 @@ uint32_t SFAVectorService<TEMPLATE_ARGS>::CopyInKvSparse(
     int64_t keyOffset1 = GetkeyOffset(token1Idx, runInfo, constInfo);
     if (unlikely(keyOffset0 < 0 && keyOffset1 < 0)) {
         return 0;
-    }
-    if (constInfo.dSizeVInput == 576) {
-        // Consume the resident packed row directly; no split KV staging.
-        CopyInSingleKv(kvInUb, startRow, keyOffset0, constInfo);
-        CopyInSingleKv(kvInUb, startRow + (keyOffset0 >= 0), keyOffset1, constInfo);
-        return (keyOffset0 >= 0) + (keyOffset1 >= 0);
     }
     int64_t blkTableSrcStride =
         ((keyOffset0 > keyOffset1 ? (keyOffset0 - keyOffset1) :
@@ -802,7 +790,7 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void SFAVectorService<TEMPLATE_ARGS>:
     sharedParams.dSizeRope = 64;
     sharedParams.softmaxScale = sparseAttnSharedkvBaseParams.scaleValue;
     sharedParams.dSize = 512;
-    sharedParams.dSizeVInput = sparseAttnSharedkvBaseParams.kvRowStride;
+    sharedParams.dSizeVInput = 512;
     sharedParams.usedCoreNum = this->tilingData->singleCoreParams.usedCoreNum;
 
     // pageAttention, rope在C侧搬运时使用

@@ -57,13 +57,29 @@ def test_sparse_attention_reference(num_queries, strided, capture):
     physical[0, :3] = torch.tensor([0, 0, 1], dtype=torch.int32)
     if num_queries > 1:
         physical[-1] = -1
-    if strided:
-        backing = torch.empty((blocks, 2, block_size, latent_dim + rope_dim), device=device, dtype=source.dtype)
-        cache = backing[:, 1]
-        cache.copy_(source)
-    else:
-        cache = source.to(device)
-    query_npu, rope_npu, physical_npu = query.to(device), query_rope.to(device), physical.to(device)
+    from vllm_ascend.distributed.kv_transfer.hisparse.layout import cache_components, split_paged_cache
+
+    factor = 2 if strided else 1
+    raw = torch.zeros(blocks * factor * block_size * (latent_dim + rope_dim) * 2, dtype=torch.uint8, device=device)
+    view = split_paged_cache(
+        raw,
+        dtype=source.dtype,
+        row_width=latent_dim + rope_dim,
+        byte_offset=(factor - 1) * block_size * (latent_dim + rope_dim) * 2,
+        block_stride=factor * block_size * (latent_dim + rope_dim) * 2,
+        num_blocks=blocks,
+        block_size=block_size,
+    )
+    for component, payload in zip(
+        cache_components(view.cache), source.split((latent_dim, rope_dim), dim=-1), strict=True
+    ):
+        component.copy_(payload)
+    cache = view.attention_cache
+
+    def mapped_indices():
+        return torch.where(physical >= 0, physical // block_size * factor * block_size + physical % block_size, -1)
+
+    query_npu, rope_npu, physical_npu = query.to(device), query_rope.to(device), mapped_indices().to(device)
     forward = partial(AscendHiSparseImpl._attention_physical, impl, query_npu, rope_npu, cache, physical_npu)
 
     graph = None
@@ -82,7 +98,7 @@ def test_sparse_attention_reference(num_queries, strided, capture):
             query.neg_()
             physical[0, :5] = torch.tensor([3, 3, 8, 12, 14], dtype=torch.int32)
             query_npu.copy_(query)
-            physical_npu.copy_(physical)
+            physical_npu.copy_(mapped_indices())
             for _ in range(3):
                 graph.replay()
             actual = captured.float().cpu()

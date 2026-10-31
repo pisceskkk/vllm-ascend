@@ -13,8 +13,7 @@ import torch_npu  # noqa: F401
 @pytest.mark.parametrize("mixed", [False, True])
 @pytest.mark.parametrize("strided", [False, True])
 @pytest.mark.parametrize("resident", [False, True])
-@pytest.mark.parametrize("split", [False, True])
-def test_paged_prefill_reference(queries, capture, mixed, strided, resident, split):
+def test_paged_prefill_reference(queries, capture, mixed, strided, resident):
     if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith(("Ascend950", "Ascend910_93")):
         pytest.skip("HiSparse SFA integration requires Ascend 950 or 910_93")
     torch.npu.set_device(0)
@@ -30,12 +29,7 @@ def test_paged_prefill_reference(queries, capture, mixed, strided, resident, spl
     decode = 2 if mixed else 0
     padding = 5
     source = torch.randn(6, 128, latent + rope).bfloat16()
-    if strided:
-        backing = torch.empty(6, 2, 128, latent + rope, dtype=torch.bfloat16, device=device)
-        cache = backing[:, 1]
-        cache.copy_(source)
-    else:
-        cache = source.to(device)
+    cache = None
     query = torch.randn(decode + queries + padding, heads, latent).bfloat16()
     query_rope = torch.randn(decode + queries + padding, heads, rope).bfloat16()
     q, qr = query.to(device), query_rope.to(device)
@@ -75,17 +69,22 @@ def test_paged_prefill_reference(queries, capture, mixed, strided, resident, spl
     )
     group = SimpleNamespace(
         set_logical_topk_ready=lambda _: None,
-        stage_prefill_rows=lambda *_: (cache, table, None),
+        stage_prefill_rows=lambda *_: (
+            combine_components(tuple(c.contiguous() for c in cache_components(cache))),
+            table,
+            None,
+        ),
         physical_kv_cache=lambda _: cache,
     )
     impl = SimpleNamespace(
-        _packed_resident_supported=resident,
         index_group=group,
         index_group_index=0,
         kv_lora_rank=latent,
         qk_rope_head_dim=rope,
         scale=(latent + rope) ** -0.5,
         hisparse_cache=SimpleNamespace(
+            all_context_pages_resident=resident,
+            view=None,
             source_block_table=table,
             runtime=SimpleNamespace(host_cache=cache),
             swap_in=lambda *_, **__: gpu_indices[:decode],
@@ -102,18 +101,6 @@ def test_paged_prefill_reference(queries, capture, mixed, strided, resident, spl
         impl.hisparse_cache.all_context_pages_resident = True
         impl.hisparse_cache.block_table = resident_table
         impl.hisparse_cache.runtime.request_state_indices = states
-        impl.hisparse_cache.view = SimpleNamespace(
-            block_size=128,
-            cache=cache,
-            attention_cache=backing.view(-1, 128, latent + rope) if strided else cache,
-            attention_block_stride=256 if strided else 128,
-        )
-        if strided:
-            # cache is backing[:, 1], so add its page offset before scaling.
-            # Model the same aligned HMA layer offset as PagedCacheView.bind.
-            impl.hisparse_cache.view.attention_cache = backing.view(-1)[128 * (latent + rope) :].view(
-                -1, 128, latent + rope
-            )
 
         def unexpected_staging(*_):
             raise AssertionError("All-resident attention must skip prefill staging")
@@ -121,30 +108,33 @@ def test_paged_prefill_reference(queries, capture, mixed, strided, resident, spl
         group.stage_prefill_rows = unexpected_staging
         impl.hisparse_cache.swap_in = unexpected_staging
 
-    if split:
-        from vllm_ascend.distributed.kv_transfer.hisparse.layout import cache_components, split_paged_cache
+    from vllm_ascend.distributed.kv_transfer.hisparse.layout import (
+        cache_components,
+        combine_components,
+        split_paged_cache,
+    )
 
-        factor = 2 if strided else 1
-        raw = torch.zeros(6 * factor * 128 * (latent + rope) * 2, dtype=torch.uint8, device=device)
-        split_view = split_paged_cache(
-            raw,
-            dtype=torch.bfloat16,
-            row_width=latent + rope,
-            byte_offset=(factor - 1) * 128 * (latent + rope) * 2,
-            block_stride=factor * 128 * (latent + rope) * 2,
-            num_blocks=6,
-            block_size=128,
-        )
-        cache = split_view.cache
+    factor = 2 if strided else 1
+    raw = torch.zeros(6 * factor * 128 * (latent + rope) * 2, dtype=torch.uint8, device=device)
+    split_view = split_paged_cache(
+        raw,
+        dtype=torch.bfloat16,
+        row_width=latent + rope,
+        byte_offset=(factor - 1) * 128 * (latent + rope) * 2,
+        block_stride=factor * 128 * (latent + rope) * 2,
+        num_blocks=6,
+        block_size=128,
+    )
+    cache = split_view.cache
 
-        def update_split_payload():
-            for component, payload in zip(cache_components(cache), source.split((latent, rope), dim=-1), strict=True):
-                component.copy_(payload)
+    def update_split_payload():
+        for component, payload in zip(cache_components(cache), source.split((latent, rope), dim=-1), strict=True):
+            component.copy_(payload)
 
-        update_split_payload()
-        impl.hisparse_cache.runtime.host_cache = cache
-        if resident:
-            impl.hisparse_cache.view = split_view
+    update_split_payload()
+    impl.hisparse_cache.runtime.host_cache = cache
+    if resident:
+        impl.hisparse_cache.view = split_view
 
     def forward():
         return AscendHiSparseImpl._execute_sparse_flash_attention_process(
@@ -165,10 +155,7 @@ def test_paged_prefill_reference(queries, capture, mixed, strided, resident, spl
                 actual = forward()
             # Replay changes page payload, request boundary, context and top-k.
             source.neg_()
-            if split:
-                update_split_payload()
-            else:
-                cache.copy_(source)
+            update_split_payload()
             queries = 11
             counts = [4, 7]
             metadata.num_actual_tokens = decode + queries
@@ -214,62 +201,6 @@ def test_paged_prefill_reference(queries, capture, mixed, strided, resident, spl
         torch.npu.synchronize()
         if graph is not None:
             graph.reset()
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("heads", [1, 128])
-def test_packed_sfa_reference(dtype, heads):
-    if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith(("Ascend950", "Ascend910_93")):
-        pytest.skip("Packed SFA requires Ascend 950 or 910_93")
-    torch.npu.set_device(0)
-    from vllm_ascend.utils import bootstrap_custom_op_env
-
-    bootstrap_custom_op_env()
-    import vllm_ascend.vllm_ascend_C  # noqa: F401
-
-    torch.manual_seed(97)
-    source = torch.randn(4, 128, 1, 576).to(dtype)
-    query = torch.randn(3, heads, 512).to(dtype)
-    query_rope = torch.randn(3, heads, 64).to(dtype)
-    table = torch.tensor([[3, 1], [2, 0], [1, 3]], dtype=torch.int32)
-    indices = torch.randint(0, 256, (3, 1, 128), dtype=torch.int32)
-    indices[:, :, 1] = indices[:, :, 0]
-    packed = source.to("npu")
-    result = (
-        torch.ops._C_ascend.npu_sparse_flash_attention(
-            query=query.to("npu"),
-            key=packed,
-            value=packed,
-            sparse_indices=indices.to("npu"),
-            scale_value=576**-0.5,
-            sparse_block_size=1,
-            block_table=table.to("npu"),
-            actual_seq_lengths_query=torch.arange(1, 4, dtype=torch.int32, device="npu"),
-            actual_seq_lengths_kv=torch.full(
-                (3,),
-                128 if torch.npu.get_device_name(0).startswith("Ascend950") else 256,
-                dtype=torch.int32,
-                device="npu",
-            ),
-            query_rope=query_rope.to("npu"),
-            key_rope=packed,
-            layout_query="TND",
-            layout_kv="PA_BSND",
-            sparse_mode=3,
-            attention_mode=2,
-        )[0]
-        .float()
-        .cpu()
-    )
-    expected = torch.empty_like(query.float())
-    for row in range(3):
-        selected = indices[row, 0].long()
-        values = source[table[row, selected // 128].long(), selected % 128, 0].float()
-        logits = query[row].float() @ values[:, :512].T
-        logits += query_rope[row].float() @ values[:, 512:].T
-        expected[row] = (logits * 576**-0.5).softmax(-1) @ values[:, :512]
-    atol, rtol = (0.005, 0.025) if dtype == torch.bfloat16 else (0.001, 0.01)
-    torch.testing.assert_close(result, expected, atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize("selection_lengths", [False, True])

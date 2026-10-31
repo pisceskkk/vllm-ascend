@@ -581,7 +581,6 @@ target_link_libraries(
     PUBLIC $<$<TARGET_EXISTS:${OPHOST_NAME}_opmaster_ct_gentask_obj>:$<TARGET_OBJECTS:${OPHOST_NAME}_opmaster_ct_gentask_obj>>
     PUBLIC $<$<TARGET_EXISTS:${COMMON_NAME}_obj>:$<TARGET_OBJECTS:${COMMON_NAME}_obj>>
     PRIVATE $<$<BOOL:${BUILD_WITH_INSTALLED_DEPENDENCY_CANN_PKG}>:$<BUILD_INTERFACE:optiling>>
-    $<$<TARGET_EXISTS:opsbase>:opsbase>
 )
 else ()
 target_link_libraries(
@@ -604,7 +603,6 @@ if(BUILD_WITH_3_8_PACKAGE)
 target_link_libraries(
     cust_proto
     PUBLIC ${OPHOST_NAME}_infer_obj
-    PRIVATE $<$<TARGET_EXISTS:opsbase>:opsbase>
 )
 else()
 target_link_libraries(
